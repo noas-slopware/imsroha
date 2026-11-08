@@ -847,6 +847,32 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	find_header(msg, "CSeq", cseq, sizeof(cseq));
 	find_header(msg, "Contact", contact, sizeof(contact));
 
+	/*
+	 * A retransmission of the INVITE we are already handling (same Call-ID
+	 * and CSeq, RFC 3261 17.2.1): the network repeats it until it hears from
+	 * us, and after a suspend they all arrive at once. Answer with the
+	 * current provisional response again; it is not a new call.
+	 */
+	if (ctx->call_is_incoming && !strcmp(call_id, ctx->inc_call_id) && !strcmp(cseq, ctx->inc_cseq)) {
+		fprintf(stderr, "b2q-imsd: INVITE retransmission (Call-ID %s)\n", call_id);
+		if (ctx->call_state == IMSD_CALL_RINGING) {
+			char ringing[2048];
+			int rlen = snprintf(ringing, sizeof(ringing),
+				"SIP/2.0 180 Ringing\r\n"
+				"%s"
+				"From: %s\r\n"
+				"To: %s;tag=%s\r\n"
+				"Call-ID: %s\r\n"
+				"CSeq: %s\r\n"
+				"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
+				"Allow: INVITE, ACK, CANCEL, BYE, PRACK\r\n"
+				"Content-Length: 0\r\n\r\n",
+				via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT);
+			send_sip_msg(ctx, ringing, rlen);
+		}
+		return 0;
+	}
+
 	char caller[64] = "";
 	extract_caller_number(from, caller, sizeof(caller));
 	fprintf(stderr, "b2q-imsd: incoming VoLTE call from %s (Call-ID %s)\n", caller, call_id);
