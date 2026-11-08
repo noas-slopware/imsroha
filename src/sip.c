@@ -1092,6 +1092,14 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 			return 0;
 		}
 
+		if (imsd_inbox_seen(hex)) {
+			/* A retry of a message we already took: answer it, keep nothing. */
+			const unsigned char rp_ack[2] = { 0x02, mr };
+			send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
+			fprintf(stderr, "b2q-imsd: duplicate MT-SMS (MR 0x%02x), acked again\n", mr);
+			return 0;
+		}
+
 		r = imsd_inbox_store(hex, id);
 		if (r < 0) {
 			fprintf(stderr, "b2q-imsd: cannot store MT-SMS (MR 0x%02x): %s, sending RP-ERROR\n",
@@ -1102,6 +1110,7 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 			return 0;
 		}
 
+		imsd_inbox_remember(hex);
 		const unsigned char rp_ack[2] = { 0x02, mr };
 		send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
 		fprintf(stderr, "b2q-imsd: stored MT-SMS %s (MR 0x%02x, DCS 0x%02x, %zu bytes), sent RP-ACK\n",

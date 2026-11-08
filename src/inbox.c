@@ -2,6 +2,8 @@
 #include "inbox.h"
 
 #include <dirent.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -15,7 +17,12 @@
 #define PDU_MAX 512 /* "00" + 2 * 176 TPDU bytes fits with room to spare */
 
 static int inbox_fd = -1;
+static int state_fd = -1;
 static unsigned int inbox_seq;
+
+#define SEEN_MAX 256
+static uint64_t seen[SEEN_MAX];
+static unsigned int seen_n, seen_next;
 
 int imsd_inbox_init(void)
 {
@@ -43,9 +50,29 @@ int imsd_inbox_init(void)
 		return r;
 	}
 	inbox_fd = openat(base, INBOX_SUBDIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	close(base);
-	if (inbox_fd < 0)
-		return -errno;
+	if (inbox_fd < 0) {
+		int r = -errno;
+		close(base);
+		return r;
+	}
+	state_fd = base;
+
+	/* Reload the recent TPDU hashes, oldest first. */
+	int fd = openat(state_fd, "seen", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		FILE *f = fdopen(fd, "r");
+		char line[32];
+		while (f && fgets(line, sizeof(line), f)) {
+			seen[seen_next] = strtoull(line, NULL, 16);
+			seen_next = (seen_next + 1) % SEEN_MAX;
+			if (seen_n < SEEN_MAX)
+				seen_n++;
+		}
+		if (f)
+			fclose(f);
+		else
+			close(fd);
+	}
 
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -175,4 +202,57 @@ out:
 	free(names);
 	closedir(dir);
 	return r < 0 ? r : 0;
+}
+
+static uint64_t tpdu_hash(const char *pdu_hex)
+{
+	uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 */
+	for (const char *p = pdu_hex; *p; p++) {
+		h ^= (unsigned char)(*p | 0x20); /* hex case does not matter */
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+int imsd_inbox_seen(const char *pdu_hex)
+{
+	uint64_t h = tpdu_hash(pdu_hex);
+	for (unsigned int i = 0; i < seen_n; i++)
+		if (seen[i] == h)
+			return 1;
+	return 0;
+}
+
+void imsd_inbox_remember(const char *pdu_hex)
+{
+	uint64_t h = tpdu_hash(pdu_hex);
+
+	seen[seen_next] = h;
+	seen_next = (seen_next + 1) % SEEN_MAX;
+	if (seen_n < SEEN_MAX)
+		seen_n++;
+	if (state_fd < 0)
+		return;
+
+	/*
+	 * Rewrite the whole list (a few KiB) so the file never grows past
+	 * SEEN_MAX entries; write to a temporary and rename it into place.
+	 */
+	int fd = openat(state_fd, "seen.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return;
+	FILE *f = fdopen(fd, "w");
+	if (!f) {
+		close(fd);
+		return;
+	}
+	unsigned int start = seen_n < SEEN_MAX ? 0 : seen_next;
+	for (unsigned int i = 0; i < seen_n; i++)
+		fprintf(f, "%016" PRIx64 "\n", seen[(start + i) % SEEN_MAX]);
+	if (fflush(f) == 0 && fsync(fd) == 0) {
+		fclose(f);
+		renameat(state_fd, "seen.tmp", state_fd, "seen");
+	} else {
+		fclose(f);
+	}
 }
