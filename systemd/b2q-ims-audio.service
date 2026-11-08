@@ -1,0 +1,18 @@
+[Unit]
+Description=b2q IMS call audio (PipeWire bridge for b2q-imsd)
+# Part of the graphical session only: every other user manager (root over ssh,
+# a second login) must not start a second bridge.
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# Waits on inotify for /run/b2q-imsd/audio.sock and on the socket itself;
+# opens playback and capture only while a call has audio.
+Type=simple
+ExecStart=/usr/bin/b2q-ims-audio
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

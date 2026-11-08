@@ -1,0 +1,32 @@
+[Unit]
+Description=b2q IMS daemon (SIP over the modem's IMS PDN)
+# imsd binds its SIP socket to the address on qmapmux0.3 once, at start. The
+# bearer is Type=notify and only goes active once that address exists. It
+# Upholds= this unit and propagates its stop here, so every new PDN gets a fresh
+# imsd and a fresh REGISTER. Requisite=, not BindsTo=: starting imsd must never
+# start the bearer, or it would cut the bearer's RestartSec= short.
+After=b2q-ims-bearer.service dbus.socket
+Requisite=b2q-ims-bearer.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/b2q-imsd
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+# /var/lib/b2q-imsd/inbox: MT-SMS PDUs stored before the RP-ACK and kept
+# until ModemManager acknowledges them (AckPdu).
+StateDirectory=b2q-imsd
+StateDirectoryMode=0700
+# /run/b2q-imsd/audio.sock (root:audio 0660) for b2q-ims-audio in the user
+# session. Kept across restarts so the bridge's inotify watch stays valid.
+RuntimeDirectory=b2q-imsd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+# Speaks QMI over AF_QIPCRTR and binds to the IMS PDN, so it runs as root and
+# is not confined: no sandbox directive may hide /dev, /run or the network
+# namespace from it.
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

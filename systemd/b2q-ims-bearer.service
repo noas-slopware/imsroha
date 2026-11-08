@@ -1,0 +1,30 @@
+[Unit]
+Description=b2q IMS PDN bearer (WDS profile 4 on qmapmux0.3)
+After=b2q-vss.service
+Wants=b2q-vss.service
+Before=b2q-imsd.service
+# The modem answers Start Network with OutOfCall until it has attached, so the
+# first try at boot fails and exits nonzero. Retry every 5 s, backing off to a
+# minute, and never give up: without this bearer there are no calls and no SMS.
+StartLimitIntervalSec=0
+# b2q-imsd binds to the address of this PDN. Upholds= starts it whenever the
+# bearer is active (READY=1, not while waiting to restart), PropagatesStopTo=
+# stops it whenever the bearer goes down, crashes included. imsd only has
+# Requisite= on the bearer, so nothing on its side can start the bearer early
+# and cut RestartSec= short.
+Upholds=b2q-imsd.service
+PropagatesStopTo=b2q-imsd.service
+
+[Service]
+# READY=1 is sent once qmapmux0.3 carries the IMS address. The process exits
+# nonzero when the PDN drops, the QRTR node goes away or the link is deleted.
+Type=notify
+ExecStart=/usr/bin/b2q-ims-bearer
+Restart=on-failure
+RestartSec=5
+RestartSteps=4
+RestartMaxDelaySec=60
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

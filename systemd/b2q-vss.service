@@ -1,0 +1,15 @@
+[Unit]
+Description=b2q VSS registration ungate
+After=rmtfs.service b2q-sim-provision.service
+Wants=rmtfs.service b2q-sim-provision.service
+Before=b2q-ims-bearer.service b2q-imsd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/b2q-vss-manager
+Restart=always
+RestartSec=2
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

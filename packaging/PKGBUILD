@@ -1,0 +1,94 @@
+# Maintainer: Noa Himesaka <himesaka@noa.codes>
+# SPDX-License-Identifier: MIT
+#
+# b2q-imsd: userspace IMS daemon for the Galaxy Z Flip3 (b2q) mainline port.
+#
+# Point B2Q_IMSD_SRC at userspace/imsd and build as the unprivileged `build` user:
+#
+#   B2Q_IMSD_SRC=/home/build/imsd makepkg -s
+#
+# Depends on systemd-libs for sd-bus / sd-event, and libqmi/libqrtr-glib for QMI.
+
+pkgname=b2q-imsd
+pkgver=0.1.0
+pkgrel=14
+pkgdesc="Userspace IMS daemon: SIP signalling over the modem's IMS PDN (Galaxy Z Flip3)"
+arch=('aarch64')
+url="https://github.com/NoaHimesaka1873/linux-zflip3"
+license=('MIT')
+# vo-amrwbenc (AMR-WB encoder) is needed too; on the phone it is installed by
+# hand under /usr/lib, not from a package, so it cannot be listed here.
+depends=('systemd-libs' 'libqmi' 'libqrtr-glib' 'alsa-lib' 'opencore-amr')
+makedepends=('gcc' 'pkgconf')
+options=('!strip')
+source=()
+sha256sums=()
+
+# B2Q_IMSD_SRC wins; otherwise assume makepkg runs from packaging/ inside the tree.
+_src=${B2Q_IMSD_SRC:-$PWD/..}
+
+build() {
+	cd "$srcdir"
+
+	# Build b2q-imsd
+	cc ${CPPFLAGS} ${CFLAGS} -O2 -Wall -Wextra -o b2q-imsd \
+		"$_src/src/imsd.c" \
+		"$_src/src/aka.c" \
+		"$_src/src/sms.c" \
+		"$_src/src/sip.c" \
+		"$_src/src/dbus.c" \
+		"$_src/src/inbox.c" \
+		"$_src/src/audio.c" \
+		"$_src/src/codec.c" \
+		${LDFLAGS} $(pkg-config --cflags --libs libsystemd qmi-glib qrtr-glib) -lopencore-amrwb -lopencore-amrnb -lvo-amrwbenc
+
+	# Build b2q-ims-audio (user session: call PCM <-> PipeWire via ALSA)
+	cc ${CPPFLAGS} ${CFLAGS} -O2 -Wall -Wextra -o b2q-ims-audio \
+		"$_src/src/ims_audio.c" \
+		${LDFLAGS} $(pkg-config --cflags --libs alsa)
+
+	# Build b2q-vss-manager
+	cc ${CPPFLAGS} ${CFLAGS} -O2 -Wall -Wextra -o b2q-vss-manager \
+		"$_src/src/vss_manager.c" \
+		${LDFLAGS} $(pkg-config --cflags --libs qmi-glib qrtr-glib)
+
+	# Build b2q-ims-bearer
+	cc ${CPPFLAGS} ${CFLAGS} -O2 -Wall -Wextra -o b2q-ims-bearer \
+		"$_src/src/ims_bearer.c" \
+		${LDFLAGS} $(pkg-config --cflags --libs libsystemd qmi-glib qrtr-glib)
+}
+
+package() {
+	install -Dm755 "$srcdir/b2q-imsd" "$pkgdir/usr/bin/b2q-imsd"
+	install -Dm755 "$srcdir/b2q-vss-manager" "$pkgdir/usr/bin/b2q-vss-manager"
+	install -Dm755 "$srcdir/b2q-ims-bearer" "$pkgdir/usr/bin/b2q-ims-bearer"
+	install -Dm755 "$srcdir/b2q-ims-audio" "$pkgdir/usr/bin/b2q-ims-audio"
+	install -Dm644 "$_src/systemd/b2q-ims-audio.service" \
+		"$pkgdir/usr/lib/systemd/user/b2q-ims-audio.service"
+	# Started with every graphical session (not every user manager: root's
+	# over ssh would start a second bridge).
+	install -dm755 "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+	ln -s ../b2q-ims-audio.service "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/b2q-ims-audio.service"
+
+	install -Dm644 "$_src/systemd/b2q-vss.service" \
+		"$pkgdir/usr/lib/systemd/system/b2q-vss.service"
+	install -Dm644 "$_src/systemd/b2q-ims-bearer.service" \
+		"$pkgdir/usr/lib/systemd/system/b2q-ims-bearer.service"
+	install -Dm644 "$_src/systemd/b2q-imsd.service" \
+		"$pkgdir/usr/lib/systemd/system/b2q-imsd.service"
+	install -Dm644 "$_src/systemd/ModemManager.service.d/b2q-ims.conf" \
+		"$pkgdir/usr/lib/systemd/system/ModemManager.service.d/b2q-ims.conf"
+	install -Dm644 "$_src/systemd/org.b2q.Imsd.conf" \
+		"$pkgdir/usr/share/dbus-1/system.d/org.b2q.Imsd.conf"
+
+	install -Dm644 "$_src/IMS-VALUES.md" \
+		"$pkgdir/usr/share/doc/$pkgname/IMS-VALUES.md"
+	install -Dm644 "$_src/PHASE15-MM-BACKEND.md" \
+		"$pkgdir/usr/share/doc/$pkgname/PHASE15-MM-BACKEND.md"
+
+	_repo=$(realpath "$_src/../..")
+	if [ -f "$_repo/LICENSES/MIT.txt" ]; then
+		install -Dm644 "$_repo/LICENSES/MIT.txt" \
+			"$pkgdir/usr/share/licenses/$pkgname/MIT.txt"
+	fi
+}
