@@ -14,7 +14,7 @@ pkgver=0.1.0
 pkgrel=16
 pkgdesc="Userspace IMS daemon: SIP signalling over the modem's IMS PDN (Galaxy Z Flip3)"
 arch=('aarch64')
-url="https://github.com/NoaHimesaka1873/linux-zflip3"
+url="https://github.com/noas-slopware/linux-zflip3"
 license=('MIT')
 # vo-amrwbenc (AMR-WB encoder) is needed too; on the phone it is installed by
 # hand under /usr/lib, not from a package, so it cannot be listed here.
