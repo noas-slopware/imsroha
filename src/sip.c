@@ -913,9 +913,78 @@ int imsd_sip_send_dtmf(struct imsd_sip_ctx *ctx, const char *dtmf)
 	return 0;
 }
 
+/* ---- downlink playout ---- */
+
+static void playout_reset(struct imsd_sip_ctx *ctx, uint32_t ts, uint32_t step, int wb)
+{
+	memset(ctx->playout, 0, sizeof(ctx->playout));
+	ctx->playout_step = step;
+	ctx->playout_wb = wb;
+	ctx->playout_ts = ts - IMSD_PLAYOUT_DELAY * step;
+	ctx->playout_started = 1;
+}
+
+/* A received speech or SID frame: keep it until its 20 ms turn. */
+static void playout_put(struct imsd_sip_ctx *ctx, uint32_t ts, int wb,
+			const uint8_t *frame, size_t len)
+{
+	uint32_t step = wb ? 320 : 160;
+	int32_t ahead;
+
+	if (len > sizeof(ctx->playout[0].frame))
+		return;
+	if (!ctx->playout_started || step != ctx->playout_step) {
+		/* First frame of the call, or the far end switched AMR-WB/AMR-NB. */
+		if (ctx->playout_started)
+			ctx->playout_resyncs++;
+		playout_reset(ctx, ts, step, wb);
+	}
+	ahead = (int32_t)(ts - ctx->playout_ts);
+	if (ahead < 0) {
+		ctx->playout_late++;	/* its turn has passed */
+		return;
+	}
+	if ((uint32_t)ahead / step >= IMSD_PLAYOUT_SLOTS) {
+		/* Far ahead of playout (a long stall, or a timestamp jump). */
+		ctx->playout_resyncs++;
+		playout_reset(ctx, ts, step, wb);
+	}
+	unsigned int i = (ts / step) % IMSD_PLAYOUT_SLOTS;
+	memcpy(ctx->playout[i].frame, frame, len);
+	ctx->playout[i].len = (uint8_t)len;
+	ctx->playout[i].wb = (uint8_t)wb;
+	ctx->playout[i].ts = ts;
+	ctx->playout[i].valid = 1;
+}
+
+/* One 20 ms tick: play the frame whose turn it is, or NO_DATA if it is missing. */
+static void playout_tick(struct imsd_sip_ctx *ctx)
+{
+	static const uint8_t no_data = 0x7c; /* FT=15 NO_DATA, Q=1: same ToC for AMR and AMR-WB */
+	int16_t pcm_out[IMSD_AUDIO_FRAME];
+	const uint8_t *frame = &no_data;
+	size_t len = 1;
+
+	if (!ctx->codec_open || !ctx->playout_started)
+		return;
+	unsigned int i = (ctx->playout_ts / ctx->playout_step) % IMSD_PLAYOUT_SLOTS;
+	if (ctx->playout[i].valid && ctx->playout[i].ts == ctx->playout_ts) {
+		frame = ctx->playout[i].frame;
+		len = ctx->playout[i].len;
+	} else {
+		ctx->playout_filled++;
+	}
+	if (imsd_codec_decode(&ctx->codec, ctx->playout_wb ? IMSD_CODEC_AMRWB : IMSD_CODEC_AMRNB,
+			      frame, len, pcm_out) == 0)
+		imsd_audio_downlink(pcm_out);
+	ctx->playout[i].valid = 0;
+	ctx->playout_ts += ctx->playout_step;
+}
+
 static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 {
 	struct imsd_sip_ctx *ctx = userdata;
+	playout_tick(ctx);
 	if (ctx->rtp_fd < 0 || ctx->remote_rtp_port == 0)
 		goto reschedule;
 
@@ -1091,10 +1160,9 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		int is_wb = pt_rx == ctx->call_pt_amrwb || pt_rx == IMSD_PT_AMRWB;
 		int is_nb = pt_rx == ctx->call_pt_amr || pt_rx == IMSD_PT_AMR;
 		if (ctx->codec_open && n > 13 && (is_wb || is_nb)) {
-			int16_t pcm_out[IMSD_AUDIO_FRAME];
-			if (imsd_codec_decode(&ctx->codec, is_wb ? IMSD_CODEC_AMRWB : IMSD_CODEC_AMRNB,
-					      buf + 13, n - 13, pcm_out) == 0)
-				imsd_audio_downlink(pcm_out);
+			uint32_t ts = (uint32_t)buf[4] << 24 | (uint32_t)buf[5] << 16 |
+				      (uint32_t)buf[6] << 8 | buf[7];
+			playout_put(ctx, ts, is_wb, buf + 13, (size_t)(n - 13));
 		}
 	}
 	return 0;
@@ -1168,9 +1236,13 @@ static void imsd_rtp_stop(struct imsd_sip_ctx *ctx)
 		ctx->rtp_fd = -1;
 	}
 	if (ctx->rtp_rx_pkts > 0 || ctx->rtp_tx_pkts > 0) {
-		fprintf(stderr, "b2q-imsd: RTP session ended, rx %" PRIu64 " pkts (%" PRIu64 " bytes), tx %" PRIu64 " pkts\n",
-			ctx->rtp_rx_pkts, ctx->rtp_rx_bytes, ctx->rtp_tx_pkts);
+		fprintf(stderr, "b2q-imsd: RTP session ended, rx %" PRIu64 " pkts (%" PRIu64 " bytes), tx %" PRIu64 " pkts; "
+			"playout: %" PRIu64 " frames filled, %" PRIu64 " late, %" PRIu64 " resyncs\n",
+			ctx->rtp_rx_pkts, ctx->rtp_rx_bytes, ctx->rtp_tx_pkts,
+			ctx->playout_filled, ctx->playout_late, ctx->playout_resyncs);
 	}
+	ctx->playout_started = 0;
+	ctx->playout_filled = ctx->playout_late = ctx->playout_resyncs = 0;
 }
 
 /*

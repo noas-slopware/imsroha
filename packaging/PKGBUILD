@@ -11,7 +11,7 @@
 
 pkgname=b2q-imsd
 pkgver=0.1.0
-pkgrel=19
+pkgrel=20
 pkgdesc="Userspace IMS daemon: SIP signalling over the modem's IMS PDN (Galaxy Z Flip3)"
 arch=('aarch64')
 url="https://github.com/noas-slopware/linux-zflip3"

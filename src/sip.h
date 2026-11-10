@@ -39,6 +39,11 @@ enum imsd_call_state {
 	IMSD_CALL_TERMINATED = 5,
 };
 
+/* 16 slots of 20 ms: 320 ms of reordering room */
+#define IMSD_PLAYOUT_SLOTS 16
+/* Frames played behind the newest arrival: 60 ms of jitter absorbed */
+#define IMSD_PLAYOUT_DELAY 3
+
 struct imsd_sip_ctx {
 	int fd;
 	sd_event *event;
@@ -142,6 +147,27 @@ struct imsd_sip_ctx {
 	/* AMR-WB / AMR-NB codec state while a call has audio */
 	struct imsd_codec_state codec;
 	int codec_open;
+
+	/*
+	 * Downlink playout. Received frames wait in slots keyed by their RTP
+	 * timestamp, and the 20 ms RTP timer decodes exactly one frame per tick,
+	 * a few frames behind the newest arrival. A slot that is empty when its
+	 * turn comes (DTX between SID frames, a lost or late packet) is decoded
+	 * as NO_DATA, so the decoder produces comfort noise or conceals the gap
+	 * and the PCM stream never runs dry.
+	 */
+	struct {
+		uint8_t frame[64];
+		uint8_t len;
+		uint8_t wb;
+		uint8_t valid;
+		uint32_t ts;
+	} playout[IMSD_PLAYOUT_SLOTS];
+	int playout_started;
+	uint32_t playout_ts;	/* RTP timestamp of the next frame to play */
+	uint32_t playout_step;	/* RTP ticks per frame of the codec in use */
+	int playout_wb;
+	uint64_t playout_late, playout_filled, playout_resyncs;
 };
 
 int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus);
