@@ -1,0 +1,77 @@
+From: Noa Himesaka <himesaka@noa.codes>
+Subject: [PATCH] port-qmi: reset only the default mux link on IPA
+
+The IPA data path carries more than ModemManager's default PDN. On b2q the
+IMS bearer keeps profile 4 on mux id 3 as qmapmux0.3, on the same rmnet_ipa0
+parent. The internal reset brought the parent down and deleted every link
+found on it, so every ModemManager restart destroyed the IMS link and
+b2q-imsd deregistered.
+
+For the ipa net driver, skip the parent link reset and delete only
+qmapmux0.0, the default link ModemManager recreates. A missing link is not
+fatal: on the first setup there is nothing to delete.
+
+The data format setup still runs after the link callback completes, with the
+same QmiDevice, so WDA and DPM negotiation are unchanged.
+
+Signed-off-by: Noa Himesaka <himesaka@noa.codes>
+---
+ src/mm-port-qmi.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
+index 80bde14..e01fba6 100644
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -958,6 +958,26 @@ delete_all_links_ready (QmiDevice    *device,
+     g_object_unref (task);
+ }
+ 
++static void
++delete_default_link_ready (QmiDevice    *device,
++                           GAsyncResult *res,
++                           GTask        *task)
++{
++    MMPortQmi *self;
++    GError    *error = NULL;
++
++    self = g_task_get_source_object (task);
++
++    /* the default link may not exist on the first setup, not fatal */
++    if (!qmi_device_delete_link_finish (device, res, &error)) {
++        mm_obj_dbg (self, "couldn't delete the default mux link: %s", error->message);
++        g_clear_error (&error);
++    }
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
+ static void
+ net_link_down_ready (MMPortNet    *data,
+                      GAsyncResult *res,
+@@ -1004,6 +1024,24 @@ internal_reset (MMPortQmi           *self,
+     ctx->device = g_object_ref (device);
+     g_task_set_task_data (task, ctx, (GDestroyNotify) internal_reset_context_free);
+ 
++    /*
++     * The IPA data path is shared with other PDNs: the IMS bearer keeps its
++     * own mux link (qmapmux0.3) on rmnet_ipa0. Bringing the parent down or
++     * deleting every link would tear that PDN down with it. Only remove the
++     * default link that ModemManager owns and is about to recreate.
++     */
++    if (g_strcmp0 (self->priv->net_driver, "ipa") == 0) {
++        mm_obj_dbg (self, "deleting the default mux link in data interface '%s'",
++                    mm_port_get_device (ctx->data));
++        qmi_device_delete_link (ctx->device,
++                                "qmapmux0.0",
++                                QMI_DEVICE_MUX_ID_UNBOUND,
++                                NULL,
++                                (GAsyncReadyCallback) delete_default_link_ready,
++                                task);
++        return;
++    }
++
+     /* mhi_net has a custom default MTU set by the kernel driver */
+     if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
+         mtu = MHI_NET_MTU_DEFAULT;
