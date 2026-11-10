@@ -199,18 +199,30 @@ static int b64_encode(const unsigned char *in, size_t in_len, char *out, size_t 
 
 static int find_header(const char *msg, const char *header_name, char *out_val, size_t max_val)
 {
-	char target[64];
-	snprintf(target, sizeof(target), "\n%s:", header_name);
-	const char *p = strcasestr(msg, target + 1);
-	if (!p)
-		p = strcasestr(msg, target);
-	if (!p)
-		return -ENOENT;
-
-	p = strchr(p, ':');
-	if (!p)
-		return -ENOENT;
-	p++;
+	/*
+	 * Only at the start of a header line, and only in the header block: an
+	 * unanchored search finds "Expires:" inside "Min-Expires:" or
+	 * "Session-Expires:", and "To:" inside "Referred-To:".
+	 */
+	size_t name_len = strlen(header_name);
+	const char *p = msg;
+	for (;;) {
+		const char *nl = strchr(p, '\n');
+		if (!nl)
+			return -ENOENT;
+		p = nl + 1;
+		if (*p == '\r' || *p == '\n' || !*p)
+			return -ENOENT; /* blank line: end of headers */
+		if (strncasecmp(p, header_name, name_len) != 0)
+			continue;
+		const char *q = p + name_len;
+		while (*q == ' ' || *q == '\t')
+			q++;
+		if (*q == ':') {
+			p = q + 1;
+			break;
+		}
+	}
 	while (*p == ' ' || *p == '\t') p++;
 
 	const char *end = strstr(p, "\r\n");
