@@ -23,6 +23,14 @@ Patches, in order:
   call: it forwards the digits to `org.b2q.Imsd.SendDtmf`, which sends them as RFC 4733
   `telephone-event` packets. Without it ModemManager answers every `SendDtmf` with
   "Sending dtmf is not supported by this modem".
+- `0005-port-qmi-keep-the-IPA-QMAP-data-path-when-another-PDN.patch` is option 4 of
+  `PLAN-IMS-COEXISTENCE.md`. While `rmnet_ipa0` carries a link ModemManager does not
+  own (the IMS PDN's `qmapmux0.3`), a restarted ModemManager neither opens the DPM port
+  nor sets the WDA data format: both reset the endpoint under the IMS PDN (DPM Open Port
+  puts it back to raw-ip without aggregation, visible at every boot). It keeps
+  mux-rmnet, raw-ip and QMAPv5, which the first instance negotiated, and deletes only
+  its own `qmapmux0.0`. At boot nothing else is on `rmnet_ipa0` yet, so the full
+  setup runs as before.
 
 ## What 0002 tried, and why it is not applied
 

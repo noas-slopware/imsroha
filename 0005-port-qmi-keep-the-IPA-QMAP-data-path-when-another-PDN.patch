@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 03:51:37 +0900
+Subject: [PATCH] port-qmi: keep the IPA QMAP data path when another PDN uses
+ it
+
+On IPA the modem's QMAP data path can carry PDNs that ModemManager does
+not own: on the Galaxy Z Flip3, b2q-ims-bearer keeps the IMS PDN on its
+own mux link of rmnet_ipa0. When ModemManager restarts, the port open
+query opens the DPM port again, which puts the endpoint back to raw-ip
+without aggregation, and the first multiplexed connect deletes every
+link on rmnet_ipa0 and sets the WDA data format again. The IMS PDN goes
+down with it, and with it still up the WDA setup fails ("No more data
+format combinations supported").
+
+While rmnet_ipa0 has a link other than ModemManager's own qmapmux0.0,
+the QMAP setup the first instance negotiated is in force: skip DPM Open
+Port and WDA Set Data Format, keep mux-rmnet, raw-ip and QMAPv5, and
+delete only qmapmux0.0 before the bearer adds it again. At boot no such
+link exists yet and the full setup runs as before.
+
+Signed-off-by: Noa Himesaka <himesaka@noa.codes>
+Assisted-by: Claude:claude-opus-5-5
+---
+ src/mm-port-qmi.c | 91 +++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
+index 80bde14..504984b 100644
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -904,6 +904,43 @@ mm_port_qmi_cleanup_link (MMPortQmi           *self,
+ 
+ /*****************************************************************************/
+ 
++/* The mux link ModemManager creates for its first bearer */
++#define IPA_DEFAULT_LINK "qmapmux0.0"
++
++/*
++ * On IPA the modem's QMAP data path is shared with PDNs ModemManager does
++ * not own: on the Galaxy Z Flip3, b2q-ims-bearer keeps the IMS PDN on its
++ * own mux link of rmnet_ipa0. A DPM Open Port puts the endpoint back to
++ * raw-ip without aggregation, a WDA Set Data Format with that PDN up is not
++ * taken, and the full reset deletes every link, so a ModemManager restart
++ * cannot set the data path up again without tearing that PDN down. While
++ * such a link exists the QMAP setup is in force (only ModemManager sets it
++ * up, before the modem attaches) and is kept as it is.
++ */
++static gboolean
++ipa_qmap_in_use (MMPortQmi *self)
++{
++    g_autoptr(GDir)  dir = NULL;
++    const gchar     *name;
++
++    if (g_strcmp0 (self->priv->net_driver, "ipa") != 0 || !self->priv->net_sysfs_path)
++        return FALSE;
++
++    dir = g_dir_open (self->priv->net_sysfs_path, 0, NULL);
++    if (!dir)
++        return FALSE;
++
++    while ((name = g_dir_read_name (dir))) {
++        if (g_str_has_prefix (name, "upper_") &&
++            g_strcmp0 (name + strlen ("upper_"), IPA_DEFAULT_LINK) != 0) {
++            mm_obj_dbg (self, "QMAP data path in use by %s", name + strlen ("upper_"));
++            return TRUE;
++        }
++    }
++
++    return FALSE;
++}
++
+ typedef struct {
+     QmiDevice *device;
+     MMPort    *data;
+@@ -958,6 +995,26 @@ delete_all_links_ready (QmiDevice    *device,
+     g_object_unref (task);
+ }
+ 
++static void
++delete_default_link_ready (QmiDevice    *device,
++                           GAsyncResult *res,
++                           GTask        *task)
++{
++    MMPortQmi *self;
++    GError    *error = NULL;
++
++    self = g_task_get_source_object (task);
++
++    /* a previous instance may not have left one */
++    if (!qmi_device_delete_link_finish (device, res, &error)) {
++        mm_obj_dbg (self, "couldn't delete the default mux link: %s", error->message);
++        g_clear_error (&error);
++    }
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
+ static void
+ net_link_down_ready (MMPortNet    *data,
+                      GAsyncResult *res,
+@@ -1004,6 +1061,19 @@ internal_reset (MMPortQmi           *self,
+     ctx->device = g_object_ref (device);
+     g_task_set_task_data (task, ctx, (GDestroyNotify) internal_reset_context_free);
+ 
++    /* only ModemManager's own link goes, the parent stays up */
++    if (ipa_qmap_in_use (self)) {
++        mm_obj_dbg (self, "deleting only the default mux link in data interface '%s'",
++                    mm_port_get_device (ctx->data));
++        qmi_device_delete_link (ctx->device,
++                                IPA_DEFAULT_LINK,
++                                QMI_DEVICE_MUX_ID_UNBOUND,
++                                NULL,
++                                (GAsyncReadyCallback) delete_default_link_ready,
++                                task);
++        return;
++    }
++
+     /* mhi_net has a custom default MTU set by the kernel driver */
+     if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
+         mtu = MHI_NET_MTU_DEFAULT;
+@@ -1290,6 +1360,7 @@ typedef struct {
+     guint32                        wda_dl_dap_max_datagrams_current;
+     guint32                        wda_dl_dap_max_size_current;
+     gboolean                       wda_dap_supported;
++    gboolean                       keep_qmap;
+ } InternalSetupDataFormatContext;
+ 
+ static void
+@@ -1924,7 +1995,8 @@ internal_setup_data_format_context_step (GTask *task)
+ 
+         case INTERNAL_SETUP_DATA_FORMAT_STEP_ALLOCATE_DPM_CLIENT:
+             /* Only allocate new DPM client on first loop */
+-            if ((g_strcmp0 (self->priv->net_driver, "ipa") == 0) && (ctx->data_format_combination_i < 0)) {
++            if ((g_strcmp0 (self->priv->net_driver, "ipa") == 0) && (ctx->data_format_combination_i < 0) &&
++                !ctx->keep_qmap) {
+                 g_assert (!ctx->dpm);
+                 qmi_device_allocate_client (ctx->device,
+                                             QMI_SERVICE_DPM,
+@@ -1940,7 +2012,7 @@ internal_setup_data_format_context_step (GTask *task)
+ 
+         case INTERNAL_SETUP_DATA_FORMAT_STEP_DPM_OPEN:
+             /* Only for IPA based setups, open dpm port */
+-            if (g_strcmp0 (self->priv->net_driver, "ipa") == 0) {
++            if ((g_strcmp0 (self->priv->net_driver, "ipa") == 0) && !ctx->keep_qmap) {
+                 dpm_open_port (task);
+                 return;
+             }
+@@ -1973,6 +2045,19 @@ internal_setup_data_format_context_step (GTask *task)
+         case INTERNAL_SETUP_DATA_FORMAT_STEP_QUERY_DONE: {
+             g_autofree gchar *kernel_data_modes_str = NULL;
+ 
++            if (ctx->keep_qmap) {
++                /* what the first instance negotiated, see ipa_qmap_in_use() */
++                mm_obj_dbg (self, "keeping the QMAP data path in use: mux-rmnet, raw-ip, qmapv5");
++                ctx->kernel_data_modes_current = MM_PORT_QMI_KERNEL_DATA_MODE_MUX_RMNET;
++                ctx->wda_llp_current = QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP;
++                ctx->wda_ul_dap_current = QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5;
++                ctx->wda_dl_dap_current = QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5;
++                ctx->wda_dap_supported = TRUE;
++                g_task_return_boolean (task, TRUE);
++                g_object_unref (task);
++                return;
++            }
++
+             kernel_data_modes_str = mm_port_qmi_kernel_data_mode_build_string_from_mask (ctx->kernel_data_modes_current);
+             mm_obj_dbg (self, "current data format setup:");
+             mm_obj_dbg (self, "    kernel data modes: %s", kernel_data_modes_str);
+@@ -2081,6 +2166,8 @@ internal_setup_data_format (MMPortQmi                      *self,
+     if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_QRTR)
+         ctx->use_endpoint = TRUE;
+ 
++    ctx->keep_qmap = ipa_qmap_in_use (self);
++
+     g_task_set_task_data (task, ctx, (GDestroyNotify) internal_setup_data_format_context_free);
+ 
+     internal_setup_data_format_context_step (task);
