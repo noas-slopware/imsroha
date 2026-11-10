@@ -8,6 +8,20 @@ static GMainLoop *loop;
 static QmiDevice *g_dev;
 static QmiClient *g_client;
 static guint8 g_cid;
+static int exit_code;
+
+static void quit_fail(const char *why) {
+    g_printerr("b2q-vss-manager: %s\n", why);
+    exit_code = 1;
+    if (loop)
+        g_main_loop_quit(loop);
+}
+
+static void on_device_removed(QmiDevice *dev, gpointer user_data) {
+    (void)dev;
+    (void)user_data;
+    quit_fail("QMI device removed (modem reset)");
+}
 
 static void dump_hex(const char *prefix, const guint8 *data, gsize len) {
     g_print("%s (%lu bytes): ", prefix, (unsigned long)len);
@@ -130,7 +144,7 @@ static void client_ready(QmiDevice *device, GAsyncResult *res, gpointer user_dat
     if (!g_client) {
         g_print("Alloc failed: %s\n", error ? error->message : "?");
         if (error) g_error_free(error);
-        g_main_loop_quit(loop);
+        quit_fail("failed to allocate VSS client");
         return;
     }
     g_cid = qmi_client_get_cid(g_client);
@@ -163,23 +177,36 @@ static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data)
     if (!qmi_device_open_finish(device, res, &error)) {
         g_print("Open failed: %s\n", error ? error->message : "?");
         if (error) g_error_free(error);
-        g_main_loop_quit(loop);
+        quit_fail("failed to open QMI device");
         return;
     }
     g_dev = device;
     g_signal_connect(g_dev, "indication", G_CALLBACK(on_indication), NULL);
+    g_signal_connect(g_dev, QMI_DEVICE_SIGNAL_REMOVED, G_CALLBACK(on_device_removed), NULL);
     g_print("QmiDevice open ok, indication signal connected\n");
     qmi_device_allocate_client(device, (QmiService)227, QMI_CID_NONE, 10, NULL, (GAsyncReadyCallback)client_ready, NULL);
 }
 
 static void device_ready(GObject *unused, GAsyncResult *res, gpointer user_data) {
     QmiDevice *dev = qmi_device_new_from_node_finish(res, NULL);
+    if (!dev) {
+        quit_fail("qmi_device_new_from_node failed");
+        return;
+    }
     qmi_device_open(dev, QMI_DEVICE_OPEN_FLAGS_EXPECT_INDICATIONS, 10, NULL, (GAsyncReadyCallback)open_ready, NULL);
 }
 
 static void bus_ready(GObject *unused, GAsyncResult *res, gpointer user_data) {
     QrtrBus *bus = qrtr_bus_new_finish(res, NULL);
+    if (!bus) {
+        quit_fail("qrtr_bus_new failed");
+        return;
+    }
     QrtrNode *node = qrtr_bus_peek_node(bus, 0);
+    if (!node) {
+        quit_fail("modem QRTR node 0 not found");
+        return;
+    }
     qmi_device_new_from_node(node, NULL, (GAsyncReadyCallback)device_ready, NULL);
 }
 
@@ -187,5 +214,5 @@ int main() {
     loop = g_main_loop_new(NULL, FALSE);
     qrtr_bus_new(3000, NULL, (GAsyncReadyCallback)bus_ready, NULL);
     g_main_loop_run(loop);
-    return 0;
+    return exit_code;
 }

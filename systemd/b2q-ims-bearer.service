@@ -22,8 +22,8 @@ Type=notify
 ExecStart=/usr/bin/b2q-ims-bearer
 Restart=on-failure
 RestartSec=5
-RestartSteps=4
-RestartMaxDelaySec=60
+RestartSteps=2
+RestartMaxDelaySec=15
 LimitNOFILE=8192
 
 [Install]

@@ -6,6 +6,7 @@ Before=b2q-ims-bearer.service b2q-imsd.service
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/lib/b2q/sim-provision
 ExecStart=/usr/bin/b2q-vss-manager
 Restart=always
 RestartSec=2
