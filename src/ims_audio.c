@@ -9,7 +9,8 @@
  * call audio. Nothing is opened between calls.
  *
  * Event-driven: one poll() over the socket, the capture PCM, and an inotify
- * watch that waits for the socket to appear. No timers.
+ * watch that waits for the socket to appear. The only timeout is the short
+ * PCM open retry right after a call starts (see try_open()).
  */
 
 #define _GNU_SOURCE
@@ -24,6 +25,7 @@
 #include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RATE 16000
@@ -58,7 +60,7 @@ static void on_term(int sig)
 	quit = 1;
 }
 
-static snd_pcm_t *open_pcm(snd_pcm_stream_t dir)
+static snd_pcm_t *open_pcm_once(snd_pcm_stream_t dir, int *last_err)
 {
 	snd_pcm_t *pcm = NULL;
 	int r = snd_pcm_open(&pcm, pcm_name, dir, SND_PCM_NONBLOCK);
@@ -66,8 +68,7 @@ static snd_pcm_t *open_pcm(snd_pcm_stream_t dir)
 		r = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
 				       1, RATE, 1, LATENCY_US);
 	if (r < 0) {
-		fprintf(stderr, "b2q-ims-audio: cannot open %s %s: %s\n", pcm_name,
-			dir == SND_PCM_STREAM_PLAYBACK ? "playback" : "capture", snd_strerror(r));
+		*last_err = r;
 		if (pcm)
 			snd_pcm_close(pcm);
 		return NULL;
@@ -75,20 +76,58 @@ static snd_pcm_t *open_pcm(snd_pcm_stream_t dir)
 	return pcm;
 }
 
+/*
+ * The card profile switches to Voice Call at the same moment as the
+ * call-start signal, and the old PipeWire node can disappear before the new
+ * one exists. A single open at that instant fails with ENOENT and leaves the
+ * direction dead for the whole call. So a failed open is retried from the
+ * poll() loop, every OPEN_RETRY_MS for up to OPEN_RETRIES tries (2 s), while
+ * downlink frames keep flowing; between calls nothing is retried.
+ */
+#define OPEN_RETRY_MS 50
+#define OPEN_RETRIES 40
+
 static int in_call;
+static int open_tries;
+static int open_err;
+static int64_t open_next_ms;
+
+static int64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int open_pending(void)
+{
+	return in_call && (!play || !cap) && open_tries < OPEN_RETRIES;
+}
+
+static void try_open(void)
+{
+	if (!play)
+		play = open_pcm_once(SND_PCM_STREAM_PLAYBACK, &open_err);
+	if (!cap) {
+		cap = open_pcm_once(SND_PCM_STREAM_CAPTURE, &open_err);
+		if (cap)
+			snd_pcm_start(cap);
+	}
+	open_tries++;
+	open_next_ms = now_ms() + OPEN_RETRY_MS;
+	if (play && cap)
+		fprintf(stderr, "b2q-ims-audio: call audio on (playback ok, capture ok%s)\n",
+			open_tries > 1 ? ", after retrying" : "");
+	else if (!open_pending())
+		fprintf(stderr, "b2q-ims-audio: call audio on (playback %s, capture %s): %s %s\n",
+			play ? "ok" : "none", cap ? "ok" : "none", pcm_name, snd_strerror(open_err));
+}
 
 static void call_start(void)
 {
 	in_call = 1;
-	if (!play)
-		play = open_pcm(SND_PCM_STREAM_PLAYBACK);
-	if (!cap) {
-		cap = open_pcm(SND_PCM_STREAM_CAPTURE);
-		if (cap)
-			snd_pcm_start(cap);
-	}
-	fprintf(stderr, "b2q-ims-audio: call audio on (playback %s, capture %s)\n",
-		play ? "ok" : "none", cap ? "ok" : "none");
+	open_tries = 0;
+	try_open();
 }
 
 static void call_end(void)
@@ -96,6 +135,7 @@ static void call_end(void)
 	if (!in_call)
 		return;
 	in_call = 0;
+	open_tries = 0;
 	if (play) {
 		snd_pcm_drop(play);
 		snd_pcm_close(play);
@@ -214,10 +254,21 @@ static void serve(void)
 			if (n > 0)
 				nfds += n;
 		}
-		if (poll(fds, nfds, -1) < 0) {
+		/* Downlink frames arrive every 20 ms, so retry on a deadline, not on idle. */
+		int timeout = -1;
+		if (open_pending()) {
+			int64_t left = open_next_ms - now_ms();
+			timeout = left > 0 ? (int)left : 0;
+		}
+		int r = poll(fds, nfds, timeout);
+		if (r < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
+		}
+		if (open_pending() && now_ms() >= open_next_ms) {
+			try_open();
+			continue;
 		}
 
 		if (fds[0].revents & (POLLHUP | POLLERR))
