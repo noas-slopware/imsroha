@@ -330,9 +330,13 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 	ctx->call_pt_amrwb = 0;
 	ctx->call_pt_amr = 0;
 	ctx->call_pt_dtmf = 0;
+	ctx->call_pt_dtmf_wb = 0;
+	ctx->call_pt_dtmf_nb = 0;
 	ctx->call_octet_aligned = 0;
 	ctx->call_has_wb = 0;
 	ctx->call_has_nb = 0;
+	ctx->call_has_dtmf_wb = 0;
+	ctx->call_has_dtmf_nb = 0;
 
 	const char *p = sdp;
 	while (p && *p) {
@@ -347,6 +351,15 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 				ctx->call_pt_amrwb = pt;
 			} else if (strncasecmp(sp, "AMR", 3) == 0 && strncasecmp(sp, "AMR-WB", 6) != 0) {
 				ctx->call_pt_amr = pt;
+			} else if (strncasecmp(sp, "telephone-event/16000", 21) == 0) {
+				ctx->call_pt_dtmf_wb = pt;
+				ctx->call_has_dtmf_wb = 1;
+				ctx->call_pt_dtmf = pt;
+			} else if (strncasecmp(sp, "telephone-event/8000", 20) == 0) {
+				ctx->call_pt_dtmf_nb = pt;
+				ctx->call_has_dtmf_nb = 1;
+				if (!ctx->call_pt_dtmf)
+					ctx->call_pt_dtmf = pt;
 			} else if (strncasecmp(sp, "telephone-event", 15) == 0) {
 				ctx->call_pt_dtmf = pt;
 			}
@@ -361,13 +374,104 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 
 	ctx->call_has_wb = ctx->call_pt_amrwb > 0;
 	ctx->call_has_nb = ctx->call_pt_amr > 0;
-	if (ctx->call_pt_amrwb <= 0) ctx->call_pt_amrwb = 106;
-	if (ctx->call_pt_amr <= 0) ctx->call_pt_amr = 104;
-	if (ctx->call_pt_dtmf <= 0) ctx->call_pt_dtmf = 96;
+	if (ctx->call_pt_amrwb <= 0) ctx->call_pt_amrwb = IMSD_PT_AMRWB;
+	if (ctx->call_pt_amr <= 0) ctx->call_pt_amr = IMSD_PT_AMR;
+	if (ctx->call_pt_dtmf_wb <= 0) ctx->call_pt_dtmf_wb = IMSD_PT_DTMF_WB;
+	if (ctx->call_pt_dtmf_nb <= 0) ctx->call_pt_dtmf_nb = IMSD_PT_DTMF;
+	if (ctx->call_pt_dtmf <= 0) ctx->call_pt_dtmf = ctx->call_has_wb ? ctx->call_pt_dtmf_wb : ctx->call_pt_dtmf_nb;
 
-	fprintf(stderr, "b2q-imsd: remote SDP codecs: AMR-WB %s, AMR %s, DTMF PT %d, octet-align=%d\n",
+	fprintf(stderr, "b2q-imsd: remote SDP codecs: AMR-WB %s, AMR %s, DTMF PT %d (wb %d, nb %d), octet-align=%d\n",
 		ctx->call_has_wb ? "yes" : "no", ctx->call_has_nb ? "yes" : "no",
-		ctx->call_pt_dtmf, ctx->call_octet_aligned);
+		ctx->call_pt_dtmf, ctx->call_pt_dtmf_wb, ctx->call_pt_dtmf_nb, ctx->call_octet_aligned);
+}
+
+/* Whether an SDP offer lists AMR-WB or AMR, the only codecs we can speak. */
+static int sdp_has_amr(const char *sdp)
+{
+	struct imsd_sip_ctx probe;
+	memset(&probe, 0, sizeof(probe));
+	parse_sdp_codecs(sdp, &probe);
+	return probe.call_has_wb || probe.call_has_nb;
+}
+
+/* A new call gets a new SDP session id; every later body bumps the version. */
+static void sdp_new_session(struct imsd_sip_ctx *ctx)
+{
+	ctx->sdp_sess_id = (uint64_t)time(NULL);
+	ctx->sdp_sess_ver = ctx->sdp_sess_id;
+}
+
+/*
+ * Our SDP body. As an offer (answer = 0) it lists everything we speak under
+ * our own payload types, ordered like the stock profile: AMR-WB, AMR, DTMF WB,
+ * DTMF NB. telephone-event must run at the speech codec's clock (RFC 4733
+ * 2.1), so AMR-WB needs a telephone-event/16000 next to it: with only /8000
+ * offered, an answerer that keeps DTMF can only pick AMR-NB (what LG U+
+ * answered with).
+ *
+ * As an answer (answer = 1) to the offer parse_sdp_codecs() just read, it
+ * lists only the formats that offer carried, under the offer's payload type
+ * numbers (RFC 3264 6.1). LG U+ and KT offer AMR-WB as 100 and AMR as 96;
+ * answering with our own 106/104 is a mismatch, and the network drops the
+ * call right after the ACK. This holds for the initial INVITE and for every
+ * re-INVITE or UPDATE in the dialog.
+ *
+ * Returns the body length, or -ENOTSUP if the offer has no AMR at all.
+ */
+static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int answer)
+{
+	int amrwb = IMSD_PT_AMRWB, amr = IMSD_PT_AMR;
+	int dtmf_wb = IMSD_PT_DTMF_WB, dtmf_nb = IMSD_PT_DTMF;
+
+	if (answer) {
+		amrwb = ctx->call_has_wb ? ctx->call_pt_amrwb : 0;
+		amr = ctx->call_has_nb ? ctx->call_pt_amr : 0;
+		dtmf_wb = ctx->call_has_dtmf_wb ? ctx->call_pt_dtmf_wb : 0;
+		dtmf_nb = ctx->call_has_dtmf_nb ? ctx->call_pt_dtmf_nb : 0;
+		if (!amrwb && !amr)
+			return -ENOTSUP;
+	}
+
+	char pts[64] = "";
+	size_t pts_len = 0;
+	const int list[] = { amrwb, amr, dtmf_wb, dtmf_nb };
+	for (size_t i = 0; i < sizeof(list) / sizeof(list[0]); i++)
+		if (list[i])
+			pts_len += snprintf(pts + pts_len, sizeof(pts) - pts_len, " %d", list[i]);
+
+	unsigned long long ver = (unsigned long long)ctx->sdp_sess_ver++;
+	size_t len = (size_t)snprintf(sdp, size,
+		"v=0\r\n"
+		"o=- %llu %llu IN IP6 %s\r\n"
+		"s=-\r\n"
+		"c=IN IP6 %s\r\n"
+		"t=0 0\r\n"
+		"m=audio 40000 RTP/AVP%s\r\n"
+		"b=AS:41\r\n",
+		(unsigned long long)ctx->sdp_sess_id, ver, ctx->local_ip, ctx->local_ip, pts);
+	if (amrwb && len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=rtpmap:%d AMR-WB/16000/1\r\n"
+			"a=fmtp:%d octet-align=1;mode-set=0,1,2\r\n", amrwb, amrwb);
+	if (amr && len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=rtpmap:%d AMR/8000/1\r\n"
+			"a=fmtp:%d octet-align=1;mode-set=0,2,4,7\r\n", amr, amr);
+	if (dtmf_wb && len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=rtpmap:%d telephone-event/16000\r\n"
+			"a=fmtp:%d 0-15\r\n", dtmf_wb, dtmf_wb);
+	if (dtmf_nb && len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=rtpmap:%d telephone-event/8000\r\n"
+			"a=fmtp:%d 0-15\r\n", dtmf_nb, dtmf_nb);
+	if (len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=ptime:20\r\n"
+			"a=sendrecv\r\n");
+	if (len >= size)
+		return -ENOSPC;
+	return (int)len;
 }
 
 static int get_ims_ipv6(char *buf, size_t len)
@@ -407,6 +511,49 @@ static int send_sip_msg(struct imsd_sip_ctx *ctx, const void *buf, size_t len)
 		return -errno;
 	}
 	return 0;
+}
+
+/* FNV-1a over a string, continuing from h. */
+static uint32_t fnv1a(uint32_t h, const char *str)
+{
+	for (; *str; str++) {
+		h ^= (unsigned char)*str;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/*
+ * A bodiless response that echoes the request's Via lines (as find_all_vias()
+ * returns them), From, To, Call-ID and CSeq. A To without a tag gets one, as
+ * every final response needs (RFC 3261 8.2.6.2). The tag is derived from the
+ * request's Call-ID, From and CSeq, so a retransmission of the same request
+ * gets the same tag without keeping a transaction around.
+ */
+static void send_simple_response(struct imsd_sip_ctx *ctx, const char *status,
+				 const char *vias, const char *from, const char *to,
+				 const char *call_id, const char *cseq)
+{
+	char tag[24] = "";
+	if (!strcasestr(to, ";tag=")) {
+		uint32_t h = fnv1a(2166136261u, call_id);
+		h = fnv1a(h, from);
+		h = fnv1a(h, cseq);
+		snprintf(tag, sizeof(tag), ";tag=b2q%08x", h);
+	}
+
+	char resp[2048];
+	int len = snprintf(resp, sizeof(resp),
+		"SIP/2.0 %s\r\n"
+		"%s"
+		"From: %s\r\n"
+		"To: %s%s\r\n"
+		"Call-ID: %s\r\n"
+		"CSeq: %s\r\n"
+		"Content-Length: 0\r\n\r\n",
+		status, vias, from, to, tag, call_id, cseq);
+	if (len > 0 && (size_t)len < sizeof(resp))
+		send_sip_msg(ctx, resp, (size_t)len);
 }
 
 static void schedule_reg_retry(struct imsd_sip_ctx *ctx);
@@ -710,6 +857,62 @@ static void imsd_audio_stop(struct imsd_sip_ctx *ctx)
 	}
 }
 
+static int dtmf_char_to_event(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c == '*')
+		return 10;
+	if (c == '#')
+		return 11;
+	if (c >= 'A' && c <= 'D')
+		return 12 + (c - 'A');
+	if (c >= 'a' && c <= 'd')
+		return 12 + (c - 'a');
+	return -1;
+}
+
+/*
+ * Send what the far end's SDP accepts: AMR-WB if it lists it, else AMR-NB.
+ * An interconnect answer can drop AMR-WB even when early media used it.
+ */
+static enum imsd_codec active_codec(const struct imsd_sip_ctx *ctx)
+{
+	return (ctx->call_has_wb || !ctx->call_has_nb) ? IMSD_CODEC_AMRWB : IMSD_CODEC_AMRNB;
+}
+
+/*
+ * The telephone-event payload type for the speech codec in use, or -1. It
+ * must run at that codec's clock (RFC 4733 2.1) and be one the far end's SDP
+ * listed; an event under a payload type it never agreed to is noise to it.
+ */
+static int dtmf_pt(const struct imsd_sip_ctx *ctx, enum imsd_codec codec)
+{
+	if (codec == IMSD_CODEC_AMRNB)
+		return ctx->call_has_dtmf_nb ? ctx->call_pt_dtmf_nb : -1;
+	return ctx->call_has_dtmf_wb ? ctx->call_pt_dtmf_wb : -1;
+}
+
+int imsd_sip_send_dtmf(struct imsd_sip_ctx *ctx, const char *dtmf)
+{
+	if (!ctx || !dtmf || !dtmf[0])
+		return -EINVAL;
+	if (dtmf_pt(ctx, active_codec(ctx)) < 0)
+		return -ENOTSUP;
+
+	size_t n = strlen(dtmf);
+	for (size_t i = 0; i < n; i++)
+		if (dtmf_char_to_event(dtmf[i]) < 0)
+			return -EINVAL;
+	if (ctx->dtmf_q_len + n > sizeof(ctx->dtmf_queue))
+		return -ENOSPC;
+
+	memcpy(ctx->dtmf_queue + ctx->dtmf_q_len, dtmf, n);
+	ctx->dtmf_q_len += n;
+	fprintf(stderr, "b2q-imsd: queued DTMF \"%s\" (queue len %zu)\n", dtmf, ctx->dtmf_q_len);
+	return 0;
+}
+
 static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 {
 	struct imsd_sip_ctx *ctx = userdata;
@@ -725,11 +928,80 @@ static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 	size_t pkt_len = 12 + 1;
 	int16_t pcm_in[IMSD_AUDIO_FRAME];
 
-	/*
-	 * Send what the far end's SDP accepts: AMR-WB if it lists it, else AMR-NB.
-	 * An interconnect answer can drop AMR-WB even when early media used it.
-	 */
-	enum imsd_codec codec = (ctx->call_has_wb || !ctx->call_has_nb) ? IMSD_CODEC_AMRWB : IMSD_CODEC_AMRNB;
+	enum imsd_codec codec = active_codec(ctx);
+	uint16_t step_ticks = (uint16_t)imsd_codec_ticks(codec);
+	int pt_dtmf = dtmf_pt(ctx, codec);
+
+	if (pt_dtmf < 0 && (ctx->dtmf_q_len || ctx->dtmf_active_event >= 0)) {
+		/* A re-INVITE or UPDATE dropped telephone-event mid-sequence. */
+		fprintf(stderr, "b2q-imsd: telephone-event no longer negotiated, dropping %zu queued DTMF\n",
+			ctx->dtmf_q_len);
+		ctx->dtmf_q_len = 0;
+		ctx->dtmf_active_event = -1;
+	}
+
+	if (ctx->dtmf_gap_frames > 0) {
+		ctx->dtmf_gap_frames--;
+	} else if (ctx->dtmf_active_event < 0 && ctx->dtmf_q_len > 0) {
+		ctx->dtmf_active_event = dtmf_char_to_event(ctx->dtmf_queue[0]);
+		memmove(ctx->dtmf_queue, ctx->dtmf_queue + 1, --ctx->dtmf_q_len);
+		ctx->dtmf_duration = 0;
+		ctx->dtmf_end_sent = 0;
+		ctx->dtmf_start_ts = ctx->rtp_tx_ts;
+	}
+
+	if (ctx->dtmf_active_event >= 0) {
+		/* Drain uplink PCM so the user-session socket does not back up during DTMF. */
+		(void)imsd_audio_uplink(pcm_in);
+
+		int first_pkt = (ctx->dtmf_duration == 0 && ctx->dtmf_end_sent == 0);
+		uint16_t max_dur = step_ticks * 5; /* 100 ms tone */
+		int is_end = 0;
+
+		if (ctx->dtmf_duration < max_dur) {
+			ctx->dtmf_duration += step_ticks;
+		} else {
+			is_end = 1;
+			ctx->dtmf_end_sent++;
+		}
+
+		pkt[0] = 0x80;
+		pkt[1] = (uint8_t)((first_pkt ? 0x80 : 0x00) | (pt_dtmf & 0x7f));
+		pkt[2] = (ctx->rtp_tx_seq >> 8) & 0xff;
+		pkt[3] = ctx->rtp_tx_seq & 0xff;
+		pkt[4] = (ctx->dtmf_start_ts >> 24) & 0xff;
+		pkt[5] = (ctx->dtmf_start_ts >> 16) & 0xff;
+		pkt[6] = (ctx->dtmf_start_ts >> 8) & 0xff;
+		pkt[7] = ctx->dtmf_start_ts & 0xff;
+		pkt[8] = 0x12;
+		pkt[9] = 0x34;
+		pkt[10] = 0x56;
+		pkt[11] = 0x78;
+		/* RFC 4733 2.3: event (8b), E|R|volume (8b), duration (16b) */
+		pkt[12] = (uint8_t)ctx->dtmf_active_event;
+		pkt[13] = (uint8_t)((is_end ? 0x80 : 0x00) | 10);
+		pkt[14] = (ctx->dtmf_duration >> 8) & 0xff;
+		pkt[15] = ctx->dtmf_duration & 0xff;
+		pkt_len = 16;
+
+		ctx->rtp_tx_seq++;
+		ctx->rtp_tx_ts += step_ticks;
+		ctx->rtp_tx_pkts++;
+
+		sendto(ctx->rtp_fd, pkt, pkt_len, 0,
+		       (struct sockaddr *)&ctx->remote_rtp_addr, sizeof(ctx->remote_rtp_addr));
+
+		if (first_pkt || ctx->dtmf_end_sent == 3) {
+			fprintf(stderr, "b2q-imsd: DTMF event %d %s (pt %d, dur %u)\n",
+				ctx->dtmf_active_event, is_end ? "end" : "start",
+				pt_dtmf, ctx->dtmf_duration);
+		}
+		if (ctx->dtmf_end_sent >= 3) {
+			ctx->dtmf_active_event = -1;
+			ctx->dtmf_gap_frames = 2; /* 40 ms inter-digit silence */
+		}
+		goto reschedule;
+	}
 
 	pkt[0] = 0x80; /* V=2, P=0, X=0, CC=0 */
 	pkt[1] = (uint8_t)(codec == IMSD_CODEC_AMRNB ? ctx->call_pt_amr : ctx->call_pt_amrwb);
@@ -869,6 +1141,11 @@ static void imsd_rtp_start(struct imsd_sip_ctx *ctx)
 		ctx->rtp_tx_seq = 1000;
 		ctx->rtp_tx_ts = 160000;
 		ctx->rtp_tx_pkts = 0;
+		ctx->dtmf_q_len = 0;
+		ctx->dtmf_active_event = -1;
+		ctx->dtmf_duration = 0;
+		ctx->dtmf_end_sent = 0;
+		ctx->dtmf_gap_frames = 0;
 		sd_event_add_time(ctx->event, &ctx->rtp_tx_timer, CLOCK_MONOTONIC,
 				  now_usec + 20000, 1000, on_rtp_tx_timer, ctx);
 		fprintf(stderr, "b2q-imsd: started RTP TX timer (20ms) for uplink audio\n");
@@ -973,7 +1250,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 				"Call-ID: %s\r\n"
 				"CSeq: %s\r\n"
 				"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
-				"Allow: INVITE, ACK, CANCEL, BYE, PRACK\r\n"
+				"Allow: " IMSD_ALLOW "\r\n"
 				"Content-Length: 0\r\n\r\n",
 				via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT);
 			send_sip_msg(ctx, ringing, rlen);
@@ -981,11 +1258,88 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 		return 0;
 	}
 
+	const char *active_cid = ctx->call_is_incoming ? ctx->inc_call_id : ctx->call_id;
+	if (ctx->call_state == IMSD_CALL_ACTIVE && active_cid[0] && !strcmp(call_id, active_cid)) {
+		fprintf(stderr, "b2q-imsd: in-dialog re-INVITE (Call-ID %s, CSeq %s)\n", call_id, cseq);
+		const char *body = strstr(msg, "\r\n\r\n");
+		int has_offer = body && body[4];
+		char sdp[1024];
+		int sdp_len;
+		if (has_offer) {
+			/* Check the offer before it replaces the session we have. */
+			if (!sdp_has_amr(body + 4)) {
+				fprintf(stderr, "b2q-imsd: re-INVITE offers no AMR, keeping the session\n");
+				send_simple_response(ctx, "488 Not Acceptable Here", via, from, to, call_id, cseq);
+				return 0;
+			}
+			char remote_ip[INET6_ADDRSTRLEN] = "";
+			uint16_t remote_port = 0;
+			if (parse_sdp_media(body + 4, remote_ip, sizeof(remote_ip), &remote_port) == 0)
+				setup_remote_rtp(ctx, remote_ip, remote_port);
+			parse_sdp_codecs(body + 4, ctx);
+			sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), 1);
+		} else {
+			/* An offerless re-INVITE: the 200 OK carries our offer, the ACK the answer. */
+			sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), 0);
+		}
+		if (sdp_len < 0) {
+			send_simple_response(ctx, "500 Server Internal Error", via, from, to, call_id, cseq);
+			return 0;
+		}
+		char to_with_tag[320];
+		if (strcasestr(to, ";tag="))
+			snprintf(to_with_tag, sizeof(to_with_tag), "%s", to);
+		else
+			snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", to,
+				 ctx->call_is_incoming ? ctx->call_to_tag : ctx->call_from_tag);
+		char se_hdr[128] = "", se_val[64] = "";
+		if (find_header(msg, "Session-Expires", se_val, sizeof(se_val)) == 0 && se_val[0])
+			snprintf(se_hdr, sizeof(se_hdr), "Session-Expires: %s\r\nSupported: timer\r\n", se_val);
+		char resp[3072];
+		int len = snprintf(resp, sizeof(resp),
+			"SIP/2.0 200 OK\r\n"
+			"%s"
+			"From: %s\r\n"
+			"To: %s\r\n"
+			"Call-ID: %s\r\n"
+			"CSeq: %s\r\n"
+			"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
+			"Allow: " IMSD_ALLOW "\r\n"
+			"%s"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: %d\r\n\r\n"
+			"%s",
+			via, from, to_with_tag, call_id, cseq,
+			ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, se_hdr, sdp_len, sdp);
+		send_sip_msg(ctx, resp, len);
+		return 0;
+	}
+
+	/*
+	 * A second call while one is in progress. There is no call waiting, and
+	 * taking it would overwrite the first call's dialog state.
+	 */
+	if (ctx->call_state != IMSD_CALL_IDLE && ctx->call_state != IMSD_CALL_TERMINATED) {
+		fprintf(stderr, "b2q-imsd: busy, rejecting INVITE (Call-ID %s)\n", call_id);
+		send_simple_response(ctx, "486 Busy Here", via, from, to, call_id, cseq);
+		return 0;
+	}
+
+	const char *offer = strstr(msg, "\r\n\r\n");
+	if (offer && offer[4]) {
+		if (!sdp_has_amr(offer + 4)) {
+			fprintf(stderr, "b2q-imsd: INVITE offers no AMR, rejecting (Call-ID %s)\n", call_id);
+			send_simple_response(ctx, "488 Not Acceptable Here", via, from, to, call_id, cseq);
+			return 0;
+		}
+	}
+
 	char caller[64] = "";
 	extract_caller_number(from, caller, sizeof(caller));
 	fprintf(stderr, "b2q-imsd: incoming VoLTE call from %s (Call-ID %s)\n", caller, call_id);
 	fprintf(stderr, "b2q-imsd: incoming INVITE message:\n%s\n", msg);
 
+	sdp_new_session(ctx);
 	snprintf(ctx->inc_via, sizeof(ctx->inc_via), "%s", via);
 	snprintf(ctx->inc_from, sizeof(ctx->inc_from), "%s", from);
 	snprintf(ctx->inc_to, sizeof(ctx->inc_to), "%s", to);
@@ -993,9 +1347,15 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	snprintf(ctx->inc_cseq, sizeof(ctx->inc_cseq), "%s", cseq);
 	snprintf(ctx->inc_contact, sizeof(ctx->inc_contact), "%s", contact);
 
-	/* Parse remote SDP */
+	/* Parse remote SDP. Without one, our 200 OK offers and the ACK answers. */
 	const char *body = strstr(msg, "\r\n\r\n");
-	if (body) {
+	ctx->inc_offerless = !(body && body[4]);
+	if (ctx->inc_offerless) {
+		ctx->call_pt_amrwb = IMSD_PT_AMRWB;
+		ctx->call_pt_amr = IMSD_PT_AMR;
+		ctx->call_has_wb = ctx->call_has_nb = 1;
+		ctx->call_has_dtmf_wb = ctx->call_has_dtmf_nb = 0;
+	} else {
 		char remote_ip[INET6_ADDRSTRLEN] = "";
 		uint16_t remote_port = 0;
 		if (parse_sdp_media(body + 4, remote_ip, sizeof(remote_ip), &remote_port) == 0) {
@@ -1032,7 +1392,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 		"Call-ID: %s\r\n"
 		"CSeq: %s\r\n"
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
-		"Allow: INVITE, ACK, CANCEL, BYE, PRACK\r\n"
+		"Allow: " IMSD_ALLOW "\r\n"
 		"Content-Length: 0\r\n\r\n",
 		via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT);
 	send_sip_msg(ctx, ringing, rlen);
@@ -1053,6 +1413,33 @@ static int handle_incoming_cancel(struct imsd_sip_ctx *ctx, const char *msg, siz
 	find_header(msg, "To", to, sizeof(to));
 	find_header(msg, "Call-ID", call_id, sizeof(call_id));
 	find_header(msg, "CSeq", cseq, sizeof(cseq));
+
+	if (!ctx->call_is_incoming || ctx->call_state == IMSD_CALL_IDLE ||
+	    ctx->call_state == IMSD_CALL_TERMINATED || strcmp(call_id, ctx->inc_call_id) != 0) {
+		fprintf(stderr, "b2q-imsd: ignoring CANCEL for unknown Call-ID %s\n", call_id);
+		char err_resp[2048];
+		int err_len = snprintf(err_resp, sizeof(err_resp),
+			"SIP/2.0 481 Call/Transaction Does Not Exist\r\n"
+			"%s"
+			"From: %s\r\n"
+			"To: %s\r\n"
+			"Call-ID: %s\r\n"
+			"CSeq: %s\r\n"
+			"Content-Length: 0\r\n\r\n",
+			cancel_via, from, to, call_id, cseq);
+		send_sip_msg(ctx, err_resp, err_len);
+		return 0;
+	}
+
+	/*
+	 * The INVITE already got its 200 OK: the CANCEL crossed it and has no
+	 * effect on the call (RFC 3261 9.2). The caller ends it with a BYE.
+	 */
+	if (ctx->call_state != IMSD_CALL_RINGING) {
+		fprintf(stderr, "b2q-imsd: CANCEL after the call was answered, ignoring (Call-ID %s)\n", call_id);
+		send_simple_response(ctx, "200 OK", cancel_via, from, to, call_id, cseq);
+		return 0;
+	}
 
 	fprintf(stderr, "b2q-imsd: caller cancelled incoming call (Call-ID %s)\n", call_id);
 
@@ -1161,10 +1548,10 @@ static void send_rp_reply(struct imsd_sip_ctx *ctx, const char *via, const char 
 			  const char *to, const char *tag, const char *call_id, const char *cseq,
 			  const unsigned char *rp, size_t rp_len)
 {
-	unsigned char full[1024];
+	unsigned char full[2048];
 	int len = snprintf((char *)full, sizeof(full),
 		"SIP/2.0 200 OK\r\n"
-		"Via: %s\r\n"
+		"%s"
 		"From: %s\r\n"
 		"To: %s;tag=%s\r\n"
 		"Call-ID: %s\r\n"
@@ -1181,8 +1568,8 @@ static void send_rp_reply(struct imsd_sip_ctx *ctx, const char *via, const char 
 
 static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, size_t msg_len)
 {
-	char via[256] = "", from[256] = "", to[256] = "", call_id[128] = "", cseq[64] = "";
-	find_header(msg, "Via", via, sizeof(via));
+	char via[1024] = "", from[256] = "", to[256] = "", call_id[128] = "", cseq[64] = "";
+	find_all_vias(msg, via, sizeof(via));
 	find_header(msg, "From", from, sizeof(from));
 	find_header(msg, "To", to, sizeof(to));
 	find_header(msg, "Call-ID", call_id, sizeof(call_id));
@@ -1254,10 +1641,10 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 	}
 
 	/* Send standard 200 OK for other MESSAGE requests (e.g. carrier RP-ACK) */
-	char ok_resp[1024];
+	char ok_resp[2048];
 	int ok_len = snprintf(ok_resp, sizeof(ok_resp),
 		"SIP/2.0 200 OK\r\n"
-		"Via: %s\r\n"
+		"%s"
 		"From: %s\r\n"
 		"To: %s;tag=%s\r\n"
 		"Call-ID: %s\r\n"
@@ -1511,22 +1898,60 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		handle_incoming_cancel(ctx, buf, (size_t)n);
 	} else if (strncmp(buf, "ACK ", 4) == 0) {
 		fprintf(stderr, "b2q-imsd: received ACK for incoming call dialog\n");
+		/* After an offerless INVITE or re-INVITE the ACK carries the answer. */
+		char ack_cid[128] = "";
+		find_header(buf, "Call-ID", ack_cid, sizeof(ack_cid));
+		const char *active_cid = ctx->call_is_incoming ? ctx->inc_call_id : ctx->call_id;
+		const char *body = strstr(buf, "\r\n\r\n");
+		if (ctx->call_state == IMSD_CALL_ACTIVE && active_cid[0] && !strcmp(ack_cid, active_cid) &&
+		    body && body[4]) {
+			char remote_ip[INET6_ADDRSTRLEN] = "";
+			uint16_t remote_port = 0;
+			if (parse_sdp_media(body + 4, remote_ip, sizeof(remote_ip), &remote_port) == 0)
+				setup_remote_rtp(ctx, remote_ip, remote_port);
+			parse_sdp_codecs(body + 4, ctx);
+			ctx->inc_offerless = 0;
+		}
 	} else if (strncmp(buf, "MESSAGE ", 8) == 0) {
 		handle_incoming_message(ctx, buf, (size_t)n);
 	} else if (strncmp(buf, "BYE ", 4) == 0) {
-		char via[256] = "", from[256] = "", to[256] = "", call_id[128] = "", cseq[64] = "";
-		find_header(buf, "Via", via, sizeof(via));
+		char via[1024] = "", from[256] = "", to[256] = "", call_id[128] = "", cseq[64] = "";
+		find_all_vias(buf, via, sizeof(via));
 		find_header(buf, "From", from, sizeof(from));
 		find_header(buf, "To", to, sizeof(to));
 		find_header(buf, "Call-ID", call_id, sizeof(call_id));
 		find_header(buf, "CSeq", cseq, sizeof(cseq));
+		const char *active_cid = ctx->call_is_incoming ? ctx->inc_call_id : ctx->call_id;
+		int same_dialog = active_cid[0] && strcmp(call_id, active_cid) == 0;
+		if (same_dialog && ctx->call_state == IMSD_CALL_TERMINATED) {
+			/* Our 200 OK got lost and the BYE came again: answer it again. */
+			fprintf(stderr, "b2q-imsd: BYE retransmission (Call-ID %s)\n", call_id);
+			send_simple_response(ctx, "200 OK", via, from, to, call_id, cseq);
+			return 0;
+		}
+		if (ctx->call_state == IMSD_CALL_IDLE || ctx->call_state == IMSD_CALL_TERMINATED ||
+		    !same_dialog) {
+			fprintf(stderr, "b2q-imsd: ignoring BYE for inactive/mismatched Call-ID %s\n", call_id);
+			char err_resp[2048];
+			int err_len = snprintf(err_resp, sizeof(err_resp),
+				"SIP/2.0 481 Call/Transaction Does Not Exist\r\n"
+				"%s"
+				"From: %s\r\n"
+				"To: %s\r\n"
+				"Call-ID: %s\r\n"
+				"CSeq: %s\r\n"
+				"Content-Length: 0\r\n\r\n",
+				via, from, to, call_id, cseq);
+			send_sip_msg(ctx, err_resp, err_len);
+			return 0;
+		}
 		char reason[160] = "";
 		find_header(buf, "Reason", reason, sizeof(reason));
 		fprintf(stderr, "b2q-imsd: remote hung up (BYE)%s%s\n", reason[0] ? ", Reason: " : "", reason);
-		char ok_resp[1024];
+		char ok_resp[2048];
 		int ok_len = snprintf(ok_resp, sizeof(ok_resp),
 			"SIP/2.0 200 OK\r\n"
-			"Via: %s\r\n"
+			"%s"
 			"From: %s\r\n"
 			"To: %s\r\n"
 			"Call-ID: %s\r\n"
@@ -1537,6 +1962,105 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		ctx->call_state = IMSD_CALL_TERMINATED;
 		imsd_rtp_stop(ctx);
 		imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 6, 0);
+	} else if (strncmp(buf, "UPDATE ", 7) == 0 ||
+		   strncmp(buf, "OPTIONS ", 8) == 0 ||
+		   strncmp(buf, "INFO ", 5) == 0 ||
+		   strncmp(buf, "NOTIFY ", 7) == 0 ||
+		   strncmp(buf, "PRACK ", 6) == 0) {
+		char via[1024] = "", from[256] = "", to[256] = "", call_id[128] = "", cseq[64] = "";
+		find_all_vias(buf, via, sizeof(via));
+		find_header(buf, "From", from, sizeof(from));
+		find_header(buf, "To", to, sizeof(to));
+		find_header(buf, "Call-ID", call_id, sizeof(call_id));
+		find_header(buf, "CSeq", cseq, sizeof(cseq));
+
+		/*
+		 * UPDATE, INFO and PRACK only exist inside a dialog (RFC 3311, 6086,
+		 * 3262). One for a call we do not have must not touch the RTP
+		 * session of the one we do.
+		 */
+		int in_dialog_only = strncmp(buf, "UPDATE ", 7) == 0 ||
+				     strncmp(buf, "INFO ", 5) == 0 ||
+				     strncmp(buf, "PRACK ", 6) == 0;
+		const char *active_cid = ctx->call_is_incoming ? ctx->inc_call_id : ctx->call_id;
+		if (in_dialog_only &&
+		    (ctx->call_state == IMSD_CALL_IDLE || ctx->call_state == IMSD_CALL_TERMINATED ||
+		     !active_cid[0] || strcmp(call_id, active_cid) != 0)) {
+			fprintf(stderr, "b2q-imsd: in-dialog request for unknown Call-ID %s\n", call_id);
+			send_simple_response(ctx, "481 Call/Transaction Does Not Exist", via, from, to, call_id, cseq);
+			return 0;
+		}
+
+		char to_with_tag[320];
+		if (strcasestr(to, ";tag=")) {
+			snprintf(to_with_tag, sizeof(to_with_tag), "%s", to);
+		} else {
+			const char *tag = (ctx->call_state != IMSD_CALL_IDLE && ctx->call_state != IMSD_CALL_TERMINATED)
+				? (ctx->call_is_incoming ? ctx->call_to_tag : ctx->call_from_tag)
+				: ctx->reg_from_tag;
+			snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", to, tag[0] ? tag : "b2q");
+		}
+
+		char se_hdr[128] = "", se_val[64] = "";
+		if (find_header(buf, "Session-Expires", se_val, sizeof(se_val)) == 0 && se_val[0])
+			snprintf(se_hdr, sizeof(se_hdr), "Session-Expires: %s\r\nSupported: timer\r\n", se_val);
+
+		const char *body = strstr(buf, "\r\n\r\n");
+		if (strncmp(buf, "UPDATE ", 7) == 0 && body && body[4]) {
+			/* Check the offer before it replaces the session we have. */
+			if (!sdp_has_amr(body + 4)) {
+				fprintf(stderr, "b2q-imsd: UPDATE offers no AMR, keeping the session\n");
+				send_simple_response(ctx, "488 Not Acceptable Here", via, from, to, call_id, cseq);
+				return 0;
+			}
+			char remote_ip[INET6_ADDRSTRLEN] = "";
+			uint16_t remote_port = 0;
+			if (parse_sdp_media(body + 4, remote_ip, sizeof(remote_ip), &remote_port) == 0)
+				setup_remote_rtp(ctx, remote_ip, remote_port);
+			parse_sdp_codecs(body + 4, ctx);
+
+			char sdp[1024];
+			int sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), 1);
+			if (sdp_len < 0) {
+				send_simple_response(ctx, "500 Server Internal Error", via, from, to, call_id, cseq);
+				return 0;
+			}
+			char ok_resp[3072];
+			int ok_len = snprintf(ok_resp, sizeof(ok_resp),
+				"SIP/2.0 200 OK\r\n"
+				"%s"
+				"From: %s\r\n"
+				"To: %s\r\n"
+				"Call-ID: %s\r\n"
+				"CSeq: %s\r\n"
+				"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
+				"Allow: " IMSD_ALLOW "\r\n"
+				"%s"
+				"Content-Type: application/sdp\r\n"
+				"Content-Length: %d\r\n\r\n"
+				"%s",
+				via, from, to_with_tag, call_id, cseq,
+				ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, se_hdr, sdp_len, sdp);
+			send_sip_msg(ctx, ok_resp, ok_len);
+			fprintf(stderr, "b2q-imsd: answered UPDATE with SDP (CSeq %s)\n", cseq);
+		} else {
+			char ok_resp[2048];
+			int ok_len = snprintf(ok_resp, sizeof(ok_resp),
+				"SIP/2.0 200 OK\r\n"
+				"%s"
+				"From: %s\r\n"
+				"To: %s\r\n"
+				"Call-ID: %s\r\n"
+				"CSeq: %s\r\n"
+				"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
+				"Allow: " IMSD_ALLOW "\r\n"
+				"%s"
+				"Content-Length: 0\r\n\r\n",
+				via, from, to_with_tag, call_id, cseq,
+				ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, se_hdr);
+			send_sip_msg(ctx, ok_resp, ok_len);
+			fprintf(stderr, "b2q-imsd: answered in-dialog/request with 200 OK (CSeq %s)\n", cseq);
+		}
 	}
 
 	return 0;
@@ -1667,43 +2191,16 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 	rand_hex(branch, 8);
 	snprintf(ctx->call_branch, sizeof(ctx->call_branch), "z9hG4bK%s", branch);
 
-	/*
-	 * Fixed payload types, never the previous call's. telephone-event must
-	 * run at the speech codec's clock (RFC 4733 2.1), so AMR-WB needs a
-	 * telephone-event/16000 next to it: with only /8000 offered, an answerer
-	 * that keeps DTMF can only pick AMR-NB (what LG U+ answered with).
-	 * Ordered like the stock profile: AMR-WB, AMR, DTMF WB, DTMF NB.
-	 */
+	/* Fixed payload types in our offer, never the previous call's. */
 	ctx->call_pt_amrwb = IMSD_PT_AMRWB;
 	ctx->call_pt_amr = IMSD_PT_AMR;
 	ctx->call_has_wb = ctx->call_has_nb = 1;
+	/* No DTMF until the answer says which telephone-event clocks it kept. */
+	ctx->call_has_dtmf_wb = ctx->call_has_dtmf_nb = 0;
+	sdp_new_session(ctx);
 
 	char sdp[1024];
-	time_t now = time(NULL);
-	int sdp_len = snprintf(sdp, sizeof(sdp),
-		"v=0\r\n"
-		"o=- %lu %lu IN IP6 %s\r\n"
-		"s=-\r\n"
-		"c=IN IP6 %s\r\n"
-		"t=0 0\r\n"
-		"m=audio 40000 RTP/AVP %d %d %d %d\r\n"
-		"b=AS:41\r\n"
-		"a=rtpmap:%d AMR-WB/16000/1\r\n"
-		"a=fmtp:%d octet-align=1;mode-set=0,1,2\r\n"
-		"a=rtpmap:%d AMR/8000/1\r\n"
-		"a=fmtp:%d octet-align=1;mode-set=0,2,4,7\r\n"
-		"a=rtpmap:%d telephone-event/16000\r\n"
-		"a=fmtp:%d 0-15\r\n"
-		"a=rtpmap:%d telephone-event/8000\r\n"
-		"a=fmtp:%d 0-15\r\n"
-		"a=ptime:20\r\n"
-		"a=sendrecv\r\n",
-		(unsigned long)now, (unsigned long)now, ctx->local_ip, ctx->local_ip,
-		IMSD_PT_AMRWB, IMSD_PT_AMR, IMSD_PT_DTMF_WB, IMSD_PT_DTMF,
-		IMSD_PT_AMRWB, IMSD_PT_AMRWB,
-		IMSD_PT_AMR, IMSD_PT_AMR,
-		IMSD_PT_DTMF_WB, IMSD_PT_DTMF_WB,
-		IMSD_PT_DTMF, IMSD_PT_DTMF);
+	int sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), 0);
 
 	char clean_dest[64];
 	size_t c_idx = 0;
@@ -1776,7 +2273,7 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 		"User-Agent: " IMSD_USER_AGENT "\r\n"
 		"P-Early-Media: supported\r\n"
 		"Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";require;explicit\r\n"
-		"Allow: INVITE, ACK, CANCEL, BYE, PRACK\r\n"
+		"Allow: " IMSD_ALLOW "\r\n"
 		"Supported: 100rel, timer\r\n"
 		"Session-Expires: 1800\r\n"
 		"Content-Type: application/sdp\r\n"
@@ -1797,43 +2294,11 @@ int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
 		return -EINVAL;
 
 
-	/*
-	 * Fixed payload types, never the previous call's. telephone-event must
-	 * run at the speech codec's clock (RFC 4733 2.1), so AMR-WB needs a
-	 * telephone-event/16000 next to it: with only /8000 offered, an answerer
-	 * that keeps DTMF can only pick AMR-NB (what LG U+ answered with).
-	 * Ordered like the stock profile: AMR-WB, AMR, DTMF WB, DTMF NB.
-	 */
-	ctx->call_pt_amrwb = IMSD_PT_AMRWB;
-	ctx->call_pt_amr = IMSD_PT_AMR;
-	ctx->call_has_wb = ctx->call_has_nb = 1;
-
+	/* Answer with the INVITE's own payload types (see build_local_sdp()). */
 	char sdp[1024];
-	time_t now = time(NULL);
-	int sdp_len = snprintf(sdp, sizeof(sdp),
-		"v=0\r\n"
-		"o=- %lu %lu IN IP6 %s\r\n"
-		"s=-\r\n"
-		"c=IN IP6 %s\r\n"
-		"t=0 0\r\n"
-		"m=audio 40000 RTP/AVP %d %d %d %d\r\n"
-		"b=AS:41\r\n"
-		"a=rtpmap:%d AMR-WB/16000/1\r\n"
-		"a=fmtp:%d octet-align=1;mode-set=0,1,2\r\n"
-		"a=rtpmap:%d AMR/8000/1\r\n"
-		"a=fmtp:%d octet-align=1;mode-set=0,2,4,7\r\n"
-		"a=rtpmap:%d telephone-event/16000\r\n"
-		"a=fmtp:%d 0-15\r\n"
-		"a=rtpmap:%d telephone-event/8000\r\n"
-		"a=fmtp:%d 0-15\r\n"
-		"a=ptime:20\r\n"
-		"a=sendrecv\r\n",
-		(unsigned long)now, (unsigned long)now, ctx->local_ip, ctx->local_ip,
-		IMSD_PT_AMRWB, IMSD_PT_AMR, IMSD_PT_DTMF_WB, IMSD_PT_DTMF,
-		IMSD_PT_AMRWB, IMSD_PT_AMRWB,
-		IMSD_PT_AMR, IMSD_PT_AMR,
-		IMSD_PT_DTMF_WB, IMSD_PT_DTMF_WB,
-		IMSD_PT_DTMF, IMSD_PT_DTMF);
+	int sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), !ctx->inc_offerless);
+	if (sdp_len < 0)
+		return sdp_len;
 
 	char resp[3072];
 	int len = snprintf(resp, sizeof(resp),
@@ -1844,7 +2309,7 @@ int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
 		"Call-ID: %s\r\n"
 		"CSeq: %s\r\n"
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
-		"Allow: INVITE, ACK, CANCEL, BYE, PRACK\r\n"
+		"Allow: " IMSD_ALLOW "\r\n"
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: %d\r\n\r\n"
 		"%s",

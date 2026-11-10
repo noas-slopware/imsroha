@@ -27,6 +27,8 @@
 #define IMSD_PT_DTMF_WB 107
 #define IMSD_PT_DTMF 101
 #define IMSD_USER_AGENT "TTA-VoLTE/1.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LUC"
+/* Methods we answer; every Allow header we send lists the same set. */
+#define IMSD_ALLOW "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO"
 
 enum imsd_call_state {
 	IMSD_CALL_IDLE = 0,
@@ -84,6 +86,8 @@ struct imsd_sip_ctx {
 	char inc_call_id[128];
 	char inc_cseq[64];
 	char inc_contact[256];
+	/* The INVITE had no SDP: our 200 OK is the offer, the ACK the answer. */
+	int inc_offerless;
 
 	/* RTP socket */
 	int rtp_fd;
@@ -98,7 +102,25 @@ struct imsd_sip_ctx {
 	int call_has_wb;
 	int call_has_nb;
 	int call_pt_dtmf;
+	int call_pt_dtmf_wb;
+	int call_pt_dtmf_nb;
+	/* Whether the last SDP actually offered each telephone-event clock. */
+	int call_has_dtmf_wb;
+	int call_has_dtmf_nb;
 	int call_octet_aligned;
+
+	/* Our SDP origin: one session id per call, version bumped per body (RFC 3264 8). */
+	uint64_t sdp_sess_id;
+	uint64_t sdp_sess_ver;
+
+	/* DTMF (RFC 4733 telephone-event) queue */
+	char dtmf_queue[64];
+	size_t dtmf_q_len;
+	int dtmf_active_event;
+	uint16_t dtmf_duration;
+	int dtmf_end_sent;
+	int dtmf_gap_frames;
+	uint32_t dtmf_start_ts;
 
 	/* Remote RTP endpoint */
 	char remote_rtp_ip[INET6_ADDRSTRLEN];
@@ -130,3 +152,4 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint32_t *out_call_id);
 int imsd_sip_answer_call(struct imsd_sip_ctx *ctx);
 int imsd_sip_hangup(struct imsd_sip_ctx *ctx);
+int imsd_sip_send_dtmf(struct imsd_sip_ctx *ctx, const char *dtmf);

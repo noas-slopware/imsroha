@@ -105,6 +105,29 @@ static int method_answer_call(sd_bus_message *m, void *userdata,
 	return sd_bus_reply_method_return(m, "");
 }
 
+static int method_send_dtmf(sd_bus_message *m, void *userdata,
+			    sd_bus_error *ret_error)
+{
+	uint32_t call_id = 0;
+	const char *dtmf = NULL;
+	int r;
+	(void)userdata;
+
+	r = sd_bus_message_read(m, "us", &call_id, &dtmf);
+	if (r < 0)
+		return r;
+
+	if (call_id != sip_ctx.active_call_id ||
+	    (sip_ctx.call_state != IMSD_CALL_ACTIVE && sip_ctx.call_state != IMSD_CALL_EARLY_MEDIA))
+		return sd_bus_error_setf(ret_error, SD_BUS_ERROR_FAILED,
+					 "call %u is not active", call_id);
+
+	r = imsd_sip_send_dtmf(&sip_ctx, dtmf);
+	if (r < 0)
+		return sd_bus_error_set_errnof(ret_error, -r, "failed to send DTMF: %m");
+	return sd_bus_reply_method_return(m, "");
+}
+
 static int append_pending(const char *id, const char *pdu_hex, void *userdata)
 {
 	return sd_bus_message_append(userdata, "(ss)", id, pdu_hex);
@@ -157,6 +180,7 @@ static const sd_bus_vtable imsd_vtable[] = {
 	SD_BUS_METHOD("CreateCall", "s", "u", method_place_call, 0),
 	SD_BUS_METHOD("AnswerCall", "u", "", method_answer_call, 0),
 	SD_BUS_METHOD("HangupCall", "u", "", method_hangup_call, 0),
+	SD_BUS_METHOD("SendDtmf", "us", "", method_send_dtmf, 0),
 	/* Privileged: they hand out and delete the user's messages. Only root
 	 * (ModemManager) may call them. */
 	SD_BUS_METHOD("GetPendingPdus", "", "a(ss)", method_get_pending_pdus, 0),
