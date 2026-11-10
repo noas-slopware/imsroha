@@ -14,22 +14,24 @@ down with it, and with it still up the WDA setup fails ("No more data
 format combinations supported").
 
 While rmnet_ipa0 has a link other than ModemManager's own qmapmux0.0,
-the QMAP setup the first instance negotiated is in force: skip DPM Open
-Port and WDA Set Data Format, keep mux-rmnet, raw-ip and QMAPv5, and
-delete only qmapmux0.0 before the bearer adds it again. At boot no such
-link exists yet and the full setup runs as before.
+the port open query and the setup read the data format without opening
+the DPM port. If the modem already runs raw-ip with QMAP aggregation (an
+earlier instance set it up), keep it and delete only qmapmux0.0 before
+the bearer adds it again. Otherwise, as at boot when the other PDN may
+come up before ModemManager's first connect, open the DPM port and run
+the full setup as before.
 
 Signed-off-by: Noa Himesaka <himesaka@noa.codes>
 Assisted-by: Claude:claude-opus-5-5
 ---
- src/mm-port-qmi.c | 91 +++++++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 89 insertions(+), 2 deletions(-)
+ src/mm-port-qmi.c | 109 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 107 insertions(+), 2 deletions(-)
 
 diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
-index 80bde14..504984b 100644
+index 80bde14..1e137c5 100644
 --- a/src/mm-port-qmi.c
 +++ b/src/mm-port-qmi.c
-@@ -904,6 +904,43 @@ mm_port_qmi_cleanup_link (MMPortQmi           *self,
+@@ -904,6 +904,46 @@ mm_port_qmi_cleanup_link (MMPortQmi           *self,
  
  /*****************************************************************************/
  
@@ -42,9 +44,12 @@ index 80bde14..504984b 100644
 + * own mux link of rmnet_ipa0. A DPM Open Port puts the endpoint back to
 + * raw-ip without aggregation, a WDA Set Data Format with that PDN up is not
 + * taken, and the full reset deletes every link, so a ModemManager restart
-+ * cannot set the data path up again without tearing that PDN down. While
-+ * such a link exists the QMAP setup is in force (only ModemManager sets it
-+ * up, before the modem attaches) and is kept as it is.
++ * cannot set the data path up again without tearing that PDN down.
++ *
++ * While such a link exists, the port open query does not open the DPM port
++ * and reads the data format as the modem has it. Only if that is already
++ * QMAP (an earlier instance set it up) is it kept as it is; otherwise, as
++ * at boot when the other PDN came up first, the full setup runs.
 + */
 +static gboolean
 +ipa_qmap_in_use (MMPortQmi *self)
@@ -73,7 +78,7 @@ index 80bde14..504984b 100644
  typedef struct {
      QmiDevice *device;
      MMPort    *data;
-@@ -958,6 +995,26 @@ delete_all_links_ready (QmiDevice    *device,
+@@ -958,6 +998,26 @@ delete_all_links_ready (QmiDevice    *device,
      g_object_unref (task);
  }
  
@@ -100,12 +105,14 @@ index 80bde14..504984b 100644
  static void
  net_link_down_ready (MMPortNet    *data,
                       GAsyncResult *res,
-@@ -1004,6 +1061,19 @@ internal_reset (MMPortQmi           *self,
+@@ -1004,6 +1064,21 @@ internal_reset (MMPortQmi           *self,
      ctx->device = g_object_ref (device);
      g_task_set_task_data (task, ctx, (GDestroyNotify) internal_reset_context_free);
  
 +    /* only ModemManager's own link goes, the parent stays up */
-+    if (ipa_qmap_in_use (self)) {
++    if (ipa_qmap_in_use (self) &&
++        (self->priv->llp == QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP) &&
++        MM_PORT_QMI_DAP_IS_SUPPORTED_QMAP (self->priv->dap)) {
 +        mm_obj_dbg (self, "deleting only the default mux link in data interface '%s'",
 +                    mm_port_get_device (ctx->data));
 +        qmi_device_delete_link (ctx->device,
@@ -120,7 +127,7 @@ index 80bde14..504984b 100644
      /* mhi_net has a custom default MTU set by the kernel driver */
      if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
          mtu = MHI_NET_MTU_DEFAULT;
-@@ -1290,6 +1360,7 @@ typedef struct {
+@@ -1290,6 +1365,7 @@ typedef struct {
      guint32                        wda_dl_dap_max_datagrams_current;
      guint32                        wda_dl_dap_max_size_current;
      gboolean                       wda_dap_supported;
@@ -128,7 +135,7 @@ index 80bde14..504984b 100644
  } InternalSetupDataFormatContext;
  
  static void
-@@ -1924,7 +1995,8 @@ internal_setup_data_format_context_step (GTask *task)
+@@ -1924,7 +2000,8 @@ internal_setup_data_format_context_step (GTask *task)
  
          case INTERNAL_SETUP_DATA_FORMAT_STEP_ALLOCATE_DPM_CLIENT:
              /* Only allocate new DPM client on first loop */
@@ -138,7 +145,7 @@ index 80bde14..504984b 100644
                  g_assert (!ctx->dpm);
                  qmi_device_allocate_client (ctx->device,
                                              QMI_SERVICE_DPM,
-@@ -1940,7 +2012,7 @@ internal_setup_data_format_context_step (GTask *task)
+@@ -1940,7 +2017,7 @@ internal_setup_data_format_context_step (GTask *task)
  
          case INTERNAL_SETUP_DATA_FORMAT_STEP_DPM_OPEN:
              /* Only for IPA based setups, open dpm port */
@@ -147,27 +154,40 @@ index 80bde14..504984b 100644
                  dpm_open_port (task);
                  return;
              }
-@@ -1973,6 +2045,19 @@ internal_setup_data_format_context_step (GTask *task)
+@@ -1973,6 +2050,32 @@ internal_setup_data_format_context_step (GTask *task)
          case INTERNAL_SETUP_DATA_FORMAT_STEP_QUERY_DONE: {
              g_autofree gchar *kernel_data_modes_str = NULL;
  
 +            if (ctx->keep_qmap) {
-+                /* what the first instance negotiated, see ipa_qmap_in_use() */
-+                mm_obj_dbg (self, "keeping the QMAP data path in use: mux-rmnet, raw-ip, qmapv5");
-+                ctx->kernel_data_modes_current = MM_PORT_QMI_KERNEL_DATA_MODE_MUX_RMNET;
-+                ctx->wda_llp_current = QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP;
-+                ctx->wda_ul_dap_current = QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5;
-+                ctx->wda_dl_dap_current = QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5;
-+                ctx->wda_dap_supported = TRUE;
-+                g_task_return_boolean (task, TRUE);
-+                g_object_unref (task);
-+                return;
++                if ((ctx->kernel_data_modes_current & MM_PORT_QMI_KERNEL_DATA_MODE_MUX_RMNET) &&
++                    (ctx->wda_llp_current == QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP) &&
++                    MM_PORT_QMI_DAP_IS_SUPPORTED_QMAP (ctx->wda_ul_dap_current) &&
++                    (ctx->wda_ul_dap_current == ctx->wda_dl_dap_current)) {
++                    /* see ipa_qmap_in_use() */
++                    mm_obj_dbg (self, "keeping the QMAP data path in use: %s, %s",
++                                qmi_wda_link_layer_protocol_get_string (ctx->wda_llp_current),
++                                qmi_wda_data_aggregation_protocol_get_string (ctx->wda_dl_dap_current));
++                    ctx->kernel_data_modes_current = MM_PORT_QMI_KERNEL_DATA_MODE_MUX_RMNET;
++                    g_task_return_boolean (task, TRUE);
++                    g_object_unref (task);
++                    return;
++                }
++
++                mm_obj_dbg (self, "QMAP data path not set up yet: full setup");
++                ctx->keep_qmap = FALSE;
++                if (ctx->action != MM_PORT_QMI_SETUP_DATA_FORMAT_ACTION_QUERY) {
++                    /* open the DPM port as usual and read the format again */
++                    ctx->wda_llp_current = QMI_WDA_LINK_LAYER_PROTOCOL_UNKNOWN;
++                    ctx->step = INTERNAL_SETUP_DATA_FORMAT_STEP_ALLOCATE_DPM_CLIENT;
++                    internal_setup_data_format_context_step (task);
++                    return;
++                }
 +            }
 +
              kernel_data_modes_str = mm_port_qmi_kernel_data_mode_build_string_from_mask (ctx->kernel_data_modes_current);
              mm_obj_dbg (self, "current data format setup:");
              mm_obj_dbg (self, "    kernel data modes: %s", kernel_data_modes_str);
-@@ -2081,6 +2166,8 @@ internal_setup_data_format (MMPortQmi                      *self,
+@@ -2081,6 +2184,8 @@ internal_setup_data_format (MMPortQmi                      *self,
      if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_QRTR)
          ctx->use_endpoint = TRUE;
  

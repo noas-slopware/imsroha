@@ -25,12 +25,14 @@ Patches, in order:
   "Sending dtmf is not supported by this modem".
 - `0005-port-qmi-keep-the-IPA-QMAP-data-path-when-another-PDN.patch` is option 4 of
   `PLAN-IMS-COEXISTENCE.md`. While `rmnet_ipa0` carries a link ModemManager does not
-  own (the IMS PDN's `qmapmux0.3`), a restarted ModemManager neither opens the DPM port
-  nor sets the WDA data format: both reset the endpoint under the IMS PDN (DPM Open Port
-  puts it back to raw-ip without aggregation, visible at every boot). It keeps
-  mux-rmnet, raw-ip and QMAPv5, which the first instance negotiated, and deletes only
-  its own `qmapmux0.0`. At boot nothing else is on `rmnet_ipa0` yet, so the full
-  setup runs as before.
+  own (the IMS PDN's `qmapmux0.3`), ModemManager reads the data format without opening
+  the DPM port (DPM Open Port puts the endpoint back to raw-ip without aggregation,
+  visible at every boot). If the modem already runs raw-ip with QMAP aggregation, it
+  keeps that and deletes only its own `qmapmux0.0`; otherwise it runs the full setup as
+  before. The first version (1.24.2-12) kept the path whenever the IMS link existed: on a
+  boot where `b2q-ims-bearer` came up before ModemManager's first connect, the modem was
+  never switched to QMAP, rmnet dropped every downlink packet, and IMS did not register
+  (2026-11-11 04:05-04:12).
 
 ## What 0002 tried, and why it is not applied
 
