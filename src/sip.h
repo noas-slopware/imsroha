@@ -55,9 +55,13 @@ struct imsd_sip_ctx {
 	char reg_call_id[64];
 	char reg_from_tag[16];
 	uint32_t reg_expires;
+	/* Min-Expires from a 423 to REGISTER, 0 until one arrives. */
+	uint32_t reg_min_expires;
 	char reg_service_route[256];
 	char reg_associated_uri[256];
 	sd_event_source *reg_timer;
+	sd_event_source *reg_retry_timer;
+	int reg_retry_count;
 
 	/* Call state */
 	int call_state;

@@ -409,6 +409,18 @@ static int send_sip_msg(struct imsd_sip_ctx *ctx, const void *buf, size_t len)
 	return 0;
 }
 
+static void schedule_reg_retry(struct imsd_sip_ctx *ctx);
+
+/*
+ * The Expires we ask for. 600000 s unless the registrar answered 423 Interval
+ * Too Brief with a larger Min-Expires (RFC 3261 10.2.8), which then sticks.
+ */
+#define IMSD_REG_EXPIRES 600000u
+static uint32_t reg_req_expires(const struct imsd_sip_ctx *ctx)
+{
+	return ctx->reg_min_expires > IMSD_REG_EXPIRES ? ctx->reg_min_expires : IMSD_REG_EXPIRES;
+}
+
 int imsd_sip_register(struct imsd_sip_ctx *ctx)
 {
 	char branch[32];
@@ -425,17 +437,19 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";+g.3gpp.smsip\r\n"
 		"Authorization: Digest username=\"%s\", realm=\"" IMSD_DOMAIN "\", nonce=\"\", uri=\"sip:" IMSD_DOMAIN "\", response=\"\"\r\n"
 		"Max-Forwards: 70\r\n"
-		"Expires: 600000\r\n"
+		"Expires: %u\r\n"
 		"Supported: path\r\n"
 		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
 		"User-Agent: " IMSD_USER_AGENT "\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, ctx->impi);
+		ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, ctx->impi,
+		reg_req_expires(ctx));
 
 	/* A refresh keeps the account usable; only the first REGISTER is "registering". */
 	if (ctx->reg_state != IMSD_UP)
 		ctx->reg_state = IMSD_REGISTERING;
 	fprintf(stderr, "b2q-imsd: sending REGISTER (CSeq %u)...\n", ctx->reg_cseq - 1);
+	schedule_reg_retry(ctx);
 	return send_sip_msg(ctx, req, len);
 }
 
@@ -545,14 +559,96 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";+g.3gpp.smsip\r\n"
 		"%s"
 		"Max-Forwards: 70\r\n"
-		"Expires: 600000\r\n"
+		"Expires: %u\r\n"
 		"Supported: path\r\n"
 		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
 		"User-Agent: " IMSD_USER_AGENT "\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, auth_line);
+		ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, auth_line,
+		reg_req_expires(ctx));
 
+	schedule_reg_retry(ctx);
 	return send_sip_msg(ctx, req, len);
+}
+
+static int on_reg_retry_timer(sd_event_source *s, uint64_t usec, void *userdata)
+{
+	(void)s; (void)usec;
+	struct imsd_sip_ctx *ctx = userdata;
+	ctx->reg_retry_count++;
+	fprintf(stderr, "b2q-imsd: REGISTER timed out (retry #%d), resending...\n", ctx->reg_retry_count);
+	imsd_sip_register(ctx);
+	return 0;
+}
+
+static void arm_reg_retry(struct imsd_sip_ctx *ctx, uint64_t delay_sec)
+{
+	uint64_t now_usec = 0;
+	sd_event_now(ctx->event, CLOCK_BOOTTIME, &now_usec);
+	uint64_t next_usec = now_usec + delay_sec * 1000000ULL;
+
+	if (ctx->reg_retry_timer) {
+		sd_event_source_set_time(ctx->reg_retry_timer, next_usec);
+		sd_event_source_set_enabled(ctx->reg_retry_timer, SD_EVENT_ONESHOT);
+	} else {
+		sd_event_add_time(ctx->event, &ctx->reg_retry_timer, CLOCK_BOOTTIME,
+				  next_usec, 500000ULL, on_reg_retry_timer, ctx);
+	}
+}
+
+/* Resend a REGISTER that got no answer: 4, 8, 16, then every 30 s. */
+static void schedule_reg_retry(struct imsd_sip_ctx *ctx)
+{
+	uint64_t delay_sec = 4ULL << (ctx->reg_retry_count < 3 ? ctx->reg_retry_count : 3);
+	arm_reg_retry(ctx, delay_sec > 30 ? 30 : delay_sec);
+}
+
+/*
+ * A final error to REGISTER (401 is the AKA challenge and handled apart).
+ * The no-answer retry would resend it every 30 s forever; a network that
+ * says no gets a growing back-off instead, 30 s doubling up to 15 min, or the
+ * Retry-After it asks for (RFC 3261 20.33). Registration is never given up
+ * for good: after a modem reset the P-CSCF can refuse a stale binding for a
+ * while and then accept a fresh one.
+ */
+static void handle_register_rejected(struct imsd_sip_ctx *ctx, const char *msg, int status_code)
+{
+	if (status_code == 423) {
+		/* Too short an Expires: ask again at once with the registrar's minimum. */
+		char min_exp[32] = "";
+		unsigned long me = 0;
+		if (find_header(msg, "Min-Expires", min_exp, sizeof(min_exp)) == 0)
+			me = strtoul(min_exp, NULL, 10);
+		if (me > reg_req_expires(ctx) && me <= UINT32_MAX) {
+			ctx->reg_min_expires = (uint32_t)me;
+			fprintf(stderr, "b2q-imsd: REGISTER 423, retrying with Expires %u\n",
+				ctx->reg_min_expires);
+			imsd_sip_register(ctx);
+			return;
+		}
+		/* No usable Min-Expires: an answer we cannot satisfy, back off like any other. */
+	}
+
+	uint64_t delay_sec = 30ULL << (ctx->reg_retry_count < 5 ? ctx->reg_retry_count : 5);
+	if (delay_sec > 900)
+		delay_sec = 900;
+
+	char retry_after[32] = "";
+	if (find_header(msg, "Retry-After", retry_after, sizeof(retry_after)) == 0) {
+		unsigned long ra = strtoul(retry_after, NULL, 10);
+		if (ra > 0 && ra <= 3600)
+			delay_sec = ra;
+	}
+	fprintf(stderr, "b2q-imsd: REGISTER rejected (SIP %d), next attempt in %" PRIu64 " s\n",
+		status_code, delay_sec);
+	arm_reg_retry(ctx, delay_sec);
+}
+
+static void cancel_reg_retry(struct imsd_sip_ctx *ctx)
+{
+	ctx->reg_retry_count = 0;
+	if (ctx->reg_retry_timer)
+		sd_event_source_set_enabled(ctx->reg_retry_timer, SD_EVENT_OFF);
 }
 
 static int on_reg_timer(sd_event_source *s, uint64_t usec, void *userdata)
@@ -567,14 +663,14 @@ static int on_reg_timer(sd_event_source *s, uint64_t usec, void *userdata)
 static void schedule_reg_refresh(struct imsd_sip_ctx *ctx, uint32_t expires)
 {
 	uint64_t now_usec = 0;
-	sd_event_now(ctx->event, CLOCK_MONOTONIC, &now_usec);
+	sd_event_now(ctx->event, CLOCK_BOOTTIME, &now_usec);
 	uint64_t refresh_interval_usec = (uint64_t)(expires > 120 ? expires / 2 : 60) * 1000000ULL;
 
 	if (ctx->reg_timer) {
 		sd_event_source_set_time(ctx->reg_timer, now_usec + refresh_interval_usec);
 		sd_event_source_set_enabled(ctx->reg_timer, SD_EVENT_ONESHOT);
 	} else {
-		sd_event_add_time(ctx->event, &ctx->reg_timer, CLOCK_MONOTONIC,
+		sd_event_add_time(ctx->event, &ctx->reg_timer, CLOCK_BOOTTIME,
 				  now_usec + refresh_interval_usec, 1000000ULL,
 				  on_reg_timer, ctx);
 	}
@@ -1248,6 +1344,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			char cseq[64] = "";
 			find_header(buf, "CSeq", cseq, sizeof(cseq));
 			if (strstr(cseq, "REGISTER")) {
+				cancel_reg_retry(ctx);
 				char exp_str[32] = "10800";
 				find_header(buf, "Expires", exp_str, sizeof(exp_str));
 				ctx->reg_expires = (uint32_t)atoi(exp_str);
@@ -1405,6 +1502,8 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				imsd_rtp_stop(ctx);
 				imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 6, 0);
 			}
+			if (strstr(cseq, "REGISTER"))
+				handle_register_rejected(ctx, buf, status_code);
 		}
 	} else if (strncmp(buf, "INVITE ", 7) == 0) {
 		handle_incoming_invite(ctx, buf, (size_t)n);
@@ -1957,6 +2056,10 @@ void imsd_sip_destroy(struct imsd_sip_ctx *ctx)
 	if (ctx->reg_timer) {
 		sd_event_source_unref(ctx->reg_timer);
 		ctx->reg_timer = NULL;
+	}
+	if (ctx->reg_retry_timer) {
+		sd_event_source_unref(ctx->reg_retry_timer);
+		ctx->reg_retry_timer = NULL;
 	}
 	if (ctx->fd >= 0) {
 		close(ctx->fd);
