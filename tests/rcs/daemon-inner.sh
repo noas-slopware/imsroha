@@ -23,7 +23,7 @@ conns() { grep -c '^connect' "$t/acs.log" || true; }
 
 conf() { # rcs-section-lines...
 	{
-		printf '[device]\nmodel=SM-F711N\noperator=LGU\nbuild=b2q-imsd-0.1\nvendor=SEC\n'
+		printf '[device]\nmodel=SM-F711N\noperator=LGU\nvendor=SEC\n'
 		printf '[carrier]\nrcs-acs-url=http://localhost:18080\nrcs-acs-https-url=https://localhost:18443\n'
 		printf 'enable=true\n'
 		for l in "$@"; do printf '%s\n' "$l"; done
@@ -68,7 +68,7 @@ cat "$t/net.result"
 grep -q "network: done" "$t/net.result" || bad "the network did not get both IMDNs"
 reg=$(grep -A14 '^sip-in REGISTER' "$t/net.log" | head -30)
 for want in "Contact: <sip:+821099999999@127.0.0.1:" ';transport=tls>;+sip.instance="<urn:gsma:imei:35999999-999999-0>";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcse.dp"' \
-	"User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU" \
+	"User-Agent: TTA-RCS/2.4 SM-F711N/IMSroha-0.2.0 Device_Type/RCS_Android_Phone LGU" \
 	'Authorization: Digest username="+821099999999@rcs.test",realm="rcs.test",uri="sip:rcs.test",nonce="",response=""' \
 	"Expires: 600000" "From: <sip:+821099999999@rcs.test>"; do
 	printf '%s\n' "$reg" | grep -qF -- "$want" || bad "REGISTER lacks: $want"

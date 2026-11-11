@@ -135,7 +135,7 @@ static void device_defaults(struct imsroha_device *dev)
 	dev->route_priority = 1042;
 	snprintf(dev->model, sizeof(dev->model), "imsroha");
 	snprintf(dev->operator_, sizeof(dev->operator_), "OMD");
-	snprintf(dev->build, sizeof(dev->build), "imsroha-%s", IMSROHA_VERSION);
+	snprintf(dev->build, sizeof(dev->build), "IMSroha-%s", IMSROHA_VERSION);
 }
 
 static void device_from(GKeyFile *kf, struct imsroha_device *dev)

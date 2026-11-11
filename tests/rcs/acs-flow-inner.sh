@@ -14,7 +14,6 @@ conf() { # scenario
 [device]
 model=SM-F711N
 operator=LGU
-build=b2q-imsd-0.1
 vendor=SEC
 [rcs]
 enable=true

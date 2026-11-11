@@ -81,7 +81,10 @@ static void defaults(struct rcs_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
 	snprintf(cfg->client_vendor, sizeof(cfg->client_vendor), "IMSR");
-	snprintf(cfg->client_version, sizeof(cfg->client_version), "RCSLinux-0.2");
+	/* R9 6.3.1.1.1: Platform-Major.Minor, from imsroha's own version */
+	unsigned major = 0, minor = 0;
+	sscanf(IMSROHA_VERSION, "%u.%u", &major, &minor);
+	snprintf(cfg->client_version, sizeof(cfg->client_version), "RCSLinux-%u.%u", major, minor);
 	cfg->default_sms_app = 1;
 	cfg->assume_mobile = 1;
 	cfg->otp_timeout = 300;

@@ -237,7 +237,7 @@ carrier sets one), `app` (repeated), `default_sms_app`, and after a 511 or when
 |---|---|
 | `terminal_model`, `terminal_sw_version` | `[device] model`, `build` |
 | `terminal_vendor` | `[device] vendor` (`SEC` for Samsung, as stock) |
-| `client_vendor`, `client_version` | `[rcs] client-vendor` (≤ 4 characters, default `IMSR`), `client-version` (`Platform-Major.Minor`, default `RCSLinux-0.2`). Stock sends `SEC` and `RCSAndr-6.0`; which one the ACS accepts is the open question above |
+| `client_vendor`, `client_version` | `[rcs] client-vendor` (≤ 4 characters, default `IMSR`), `client-version` (`Platform-Major.Minor`, default `RCSLinux-` and imsroha's major.minor). Stock sends `SEC` and `RCSAndr-6.0`; which one the ACS accepts is the open question above |
 | `rcs_profile`, `provisioning_version`, `app` | carrier (`rcs-profile`, `rcs-provisioning-version`, `rcs-app`) |
 | `default_sms_app` | `[rcs] default-sms-app` (1: the RCS client is the SMS app, as with Spacebar) |
 | `IMSI`, `IMEI` | the SIM over QMI UIM, the modem over QMI DMS |
