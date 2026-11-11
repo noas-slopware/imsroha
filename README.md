@@ -13,7 +13,7 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 
 | carrier | PLMN | state |
 |---|---|---|
-| LG U+ | 450 06 | IMSroha on the Galaxy Z Flip3 since 2026-11-11: registers with TTAK.KO-06.0357/R6 sec-agree (IPsec), SMS and VoLTE both ways. The reg event is refused (489 "REG EVENT OFF"); the PCO carries no P-CSCF, the profile's is used. Before, as `b2q-imsd`, without IPsec: `tests/lguplus-recorded.conf` reproduces that byte for byte |
+| LG U+ | 450 06 | **tested, working** on the Galaxy Z Flip3 (2026-11-11): registers with TTAK.KO-06.0357/R6 sec-agree (IPsec ESP, `hmac-sha-1-96`/`aes-cbc`), SMS and VoLTE calls both ways, DTMF. LG U+ refuses the reg event (489 "REG EVENT OFF") and puts no P-CSCF in the PCO; the profile's is used |
 | KT | 450 08 | profile from the stock Samsung firmware; has never registered |
 | SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
@@ -23,8 +23,9 @@ standard) asks for: sec-agree with IPsec ESP (TS 33.203) with no way around it, 
 reg event subscription, `+sip.instance`, its SDP offer, its session timer and its
 User-Agent. `docs/korea-tta.md` goes through R6 and where imsroha stands.
 
-Hardware it has run on: the Galaxy Z Flip3 (SM8350, IPA, QRTR) in
-[linux-zflip3](https://github.com/noas-slopware/linux-zflip3). Nothing in the code
+Tested on: the Galaxy Z Flip3 (SM8350, IPA, QRTR) in
+[linux-zflip3](https://github.com/noas-slopware/linux-zflip3), on LG U+, where it is
+the phone's IMS stack. Nothing in the code
 is tied to it any more. The modem is found as a QRTR node or a QMI device, the data
 path from the netdev's driver (`ipa`, `mhi_net`, `qmi_wwan`, `bam-dmux`), and the IMS
 profile by its APN.
