@@ -50,6 +50,11 @@ int main(void)
 	g_unlink(path);
 	g_rmdir(sub);
 	g_rmdir(dir);
+	g_free(opath);
+	g_free(other);
+	g_free(path);
+	g_free(sub);
+	g_free(dir);
 	printf("ok\n");
 	return 0;
 }
