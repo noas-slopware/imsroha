@@ -338,6 +338,9 @@ static void open_channel_ready(QmiClientUim *client, GAsyncResult *res, gpointer
 				qmi_message_uim_open_logical_channel_output_unref(out);
 			/* Within run_ctx()'s 10 s: 12 tries, 500 ms apart. */
 			if (++ctx->open_tries < 12) {
+				if (ctx->open_tries == 1)
+					fprintf(stderr, "imsroha: the card's logical channels are busy (%s), "
+						"trying again\n", err->message);
 				g_clear_error(&err);
 				g_timeout_add(500, open_channel_again, ctx);
 				return;
