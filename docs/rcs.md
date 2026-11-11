@@ -53,6 +53,17 @@ All three carriers have the same shape. From `res/raw/imsprofile.json`
 The generic part works on any UP carrier with its own ACS. Jibe carriers are out: Jibe
 only provisions Google Messages.
 
+**Opt-in (Noa, 2026-11-11).** RCS is off unless the configuration turns it on: an
+`[rcs]` section with `enable=true` in `/etc/imsroha/imsroha.conf`, default false, and
+nothing in `data/carriers.conf` switches it on. While it is off, imsroha never contacts
+the ACS: that request carries the IMSI and IMEI and can change the line's RCS state at
+the carrier. It also opens no TLS registration and exposes no RCS interface, so
+VoLTE/SMS behave exactly as today. Stock leaves it to the user too
+(`rcs_default_enabled` -1). Turning it off again sends the ACS the
+"disabled by user" rcs_state, as stock does (`OpMode.DISABLE_RCS_BY_USER`), so the
+carrier falls back to SMS for this number. Spacebar's RCS transport stays inert while no
+provider is on the bus.
+
 1. **Autoconfig client.** RCC.14 HTTP then HTTPS, the parameters above, the OTP SMS
    through ModemManager's binary SMS on the configured port, and storing the XML
    (version, validity, SIP server, credentials, the FT HTTP content server). Per-carrier
