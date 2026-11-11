@@ -77,28 +77,49 @@ static int ready_fd(int timeout_ms)
 	return -1;
 }
 
-/* Everything the UE sent since the last call, each message framed. */
+static void print_msg(int fd, const char *buf, ssize_t n)
+{
+	printf("----- %zd bytes%s\n", n, fd == pcscf_ps ? " (to port-s)" : fd == pcscf_pc ? " (to port-c)" : "");
+	for (ssize_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)buf[i];
+		if (c == '\n' || c == '\r' || (c >= 0x20 && c < 0x7f))
+			putchar(c);
+		else
+			printf("\\x%02x", c);
+	}
+	printf("\n");
+}
+
+/*
+ * Everything the UE sent since the last call, each message framed. Messages
+ * to different ports race each other (whether both are already queued when
+ * poll() looks depends on timing), so they are printed per socket, in the
+ * order unprotected, port-s, port-c, and in arrival order within each.
+ */
 static void drain(const char *label)
 {
-	char buf[8192];
+	enum { MAXMSG = 32 };
+	static char bufs[MAXMSG][8192];
+	ssize_t lens[MAXMSG];
+	int fds[MAXMSG];
+	int count = 0;
+
 	printf("===== step %d: %s\n", ++step, label);
-	for (;;) {
+	while (count < MAXMSG) {
 		int fd = ready_fd(50);
 		if (fd < 0)
 			break;
-		ssize_t n = recv(fd, buf, sizeof(buf), 0);
+		ssize_t n = recv(fd, bufs[count], sizeof(bufs[count]), 0);
 		if (n <= 0)
 			break;
-		printf("----- %zd bytes%s\n", n, fd == pcscf_ps ? " (to port-s)" : fd == pcscf_pc ? " (to port-c)" : "");
-		for (ssize_t i = 0; i < n; i++) {
-			unsigned char c = (unsigned char)buf[i];
-			if (c == '\n' || c == '\r' || (c >= 0x20 && c < 0x7f))
-				putchar(c);
-			else
-				printf("\\x%02x", c);
-		}
-		printf("\n");
+		fds[count] = fd;
+		lens[count++] = n;
 	}
+	const int order[3] = { pcscf_fd, pcscf_ps, pcscf_pc };
+	for (int o = 0; o < 3; o++)
+		for (int i = 0; i < count; i++)
+			if (fds[i] == order[o] && order[o] >= 0)
+				print_msg(fds[i], bufs[i], lens[i]);
 	fflush(stdout);
 }
 
