@@ -1,0 +1,99 @@
+From bfbe1f48b7bd944e513718105625852cc2d471c2 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 22:05:46 +0900
+Subject: [PATCH] app: decode attachment images for the screen's pixels
+
+Qt Quick multiplies Image.sourceSize by the device pixel ratio only for
+scalable formats (SVG, PDF) and image providers (qquickimagebase.cpp,
+updateDevicePixelRatio()); a JPEG or PNG is decoded at sourceSize as
+given. The message bubble, the attachment preview, the fullscreen view
+and the chat list avatar all set sourceSize in logical pixels, so on a
+scaled display a photo was decoded at 1/scale of the pixels it covers
+and then stretched: at scale 2.6 a 1248x1972 photo became 290 pixels
+wide in a 750-pixel bubble.
+
+Decode at the logical size times Screen.devicePixelRatio and give the
+image its logical size explicitly, so the layout is unchanged; an image
+smaller than the space keeps the size it had.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/contents/ui/ChatsPage.qml      |  3 ++-
+ src/contents/ui/FullscreenPage.qml |  9 +++++++--
+ src/contents/ui/MessagesPage.qml   | 19 +++++++++++++++----
+ 3 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/src/contents/ui/ChatsPage.qml b/src/contents/ui/ChatsPage.qml
+index 8781f44..15fcf5f 100644
+--- a/src/contents/ui/ChatsPage.qml
++++ b/src/contents/ui/ChatsPage.qml
+@@ -217,7 +217,8 @@ Kirigami.ScrollablePage {
+                             id: image
+                             source: delegateRoot.image ? "file://" + ChatListModel.attachmentsFolder(delegateRoot.phoneNumberList) + "/" + delegateRoot.image.fileName : ""
+                             fillMode: Image.PreserveAspectCrop
+-                            sourceSize.height: Kirigami.Units.iconSizes.smallMedium * 4
++                            // shown at the preferred size below, decoded for the screen's pixels
++                            sourceSize.height: Math.round(Kirigami.Units.iconSizes.smallMedium * 4 * Screen.devicePixelRatio)
+                             Layout.preferredWidth: delegateRoot.image ? Kirigami.Units.iconSizes.smallMedium * 2 : 0
+                             Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium * 2
+                             asynchronous: true
+diff --git a/src/contents/ui/FullscreenPage.qml b/src/contents/ui/FullscreenPage.qml
+index 479a78e..c46a16f 100644
+--- a/src/contents/ui/FullscreenPage.qml
++++ b/src/contents/ui/FullscreenPage.qml
+@@ -69,8 +69,13 @@ Kirigami.ScrollablePage {
+                     id: image
+                     source: isImage ? filePath : ""
+                     fillMode: Image.PreserveAspectFit
+-                    sourceSize.width: Math.round(page.width) - Kirigami.Units.largeSpacing * 2
+-                    height: Math.min(root.height * 0.8, image.implicitHeight)
++                    // Decoded for the screen's pixels, shown at the logical size: Qt scales
++                    // sourceSize by the device pixel ratio only for SVG/PDF.
++                    readonly property real maxWidth: Math.round(page.width) - Kirigami.Units.largeSpacing * 2
++                    sourceSize.width: Math.round(maxWidth * Screen.devicePixelRatio)
++                    width: Math.min(maxWidth, implicitWidth)
++                    height: Math.min(root.height * 0.8,
++                                     implicitWidth > 0 ? implicitHeight * width / implicitWidth : 0)
+                     cache: false
+ 
+                     MouseArea {
+diff --git a/src/contents/ui/MessagesPage.qml b/src/contents/ui/MessagesPage.qml
+index 32bff82..b1c7a00 100644
+--- a/src/contents/ui/MessagesPage.qml
++++ b/src/contents/ui/MessagesPage.qml
+@@ -530,8 +530,15 @@ Kirigami.ScrollablePage {
+                                 id: image
+                                 source: isImage ? filePath : ""
+                                 fillMode: Image.PreserveAspectFit
+-                                sourceSize.width: Math.round(delegateParent.width * 0.7)
+-                                height: Math.min(Math.max(msgPage.width / 2, msgPage.height) * 0.5, image.implicitHeight)
++                                // Decode for the screen's pixels: Qt scales sourceSize by the
++                                // device pixel ratio only for SVG/PDF, so a photo decoded at
++                                // the logical width looked blurry on a scaled display. The
++                                // shown size stays the logical one.
++                                readonly property real maxWidth: Math.round(delegateParent.width * 0.7)
++                                sourceSize.width: Math.round(maxWidth * Screen.devicePixelRatio)
++                                width: Math.min(maxWidth, implicitWidth)
++                                height: Math.min(Math.max(msgPage.width / 2, msgPage.height) * 0.5,
++                                                 implicitWidth > 0 ? implicitHeight * width / implicitWidth : 0)
+                                 asynchronous: listView.async
+                                 onStatusChanged: if (status == Image.Ready) content.height = undefined
+                                 cache: false
+@@ -1037,8 +1044,12 @@ Kirigami.ScrollablePage {
+                                 id: attachImg
+                                 anchors.centerIn: parent
+                                 source: isImage ? filePath : ""
+-                                sourceSize.height: Kirigami.Units.gridUnit * 8
+-                                width: Math.min(flow.width - Kirigami.Units.largeSpacing * 2, implicitWidth)
++                                // Decoded for the screen's pixels, shown at the logical size
++                                // (see the message image above).
++                                sourceSize.height: Math.round(Kirigami.Units.gridUnit * 8 * Screen.devicePixelRatio)
++                                height: Math.min(Kirigami.Units.gridUnit * 8, implicitHeight)
++                                width: Math.min(flow.width - Kirigami.Units.largeSpacing * 2,
++                                                implicitHeight > 0 ? implicitWidth * height / implicitHeight : 0)
+                                 cache: false
+                                 fillMode: Image.PreserveAspectCrop
+ 
+-- 
+2.56.0
+

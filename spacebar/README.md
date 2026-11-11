@@ -28,5 +28,10 @@ Patches, in order:
   attachments like MMS parts; sending uses RCS when the peer has ft-http and falls
   back to MMS. Needs `[rcs] download-dir=` set to a directory the user owns.
 
+- `0008-app-decode-attachment-images-for-the-screen-s-pixels.patch`: attachment images
+  are decoded for the screen's pixels. Qt scales `Image.sourceSize` by the device pixel
+  ratio only for SVG/PDF, so photos were decoded at the logical size and looked blurry
+  on a scaled display (2.6 on the Galaxy Z Flip3). Not IMS-specific; for upstream.
+
 0004-0007 are inert without imsroha-rcs on the bus. Build: `cd spacebar && makepkg -sC`
 (`-C`: 0004 creates a file, so a stale `src/` makes `prepare()` fail).
