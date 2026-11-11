@@ -1961,12 +1961,24 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 		 * ModemManager: MMS notifications arrive that way.
 		 */
 		int port = imsd_sms_app_port(hex);
+		/*
+		 * The RCS OTP of a carrier that sends it as a plain SMS
+		 * (rcs-otp-type=text) is for imsroha-rcs as well, when it runs:
+		 * out on PortPduReceived with port 0, not to the messaging app.
+		 */
+		if (port < 0 && ctx->cfg.rcs_enabled && ctx->cfg.car.rcs_otp_regex[0] &&
+		    imsd_sms_text_matches(hex, ctx->cfg.car.rcs_otp_regex))
+			port = 0;
 		if (port >= 0) {
 			imsd_inbox_remember(hex);
 			const unsigned char rp_ack[2] = { 0x02, mr };
 			send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
-			fprintf(stderr, "imsroha: MT-SMS for application port %d (MR 0x%02x, %zu bytes), "
-				"sent RP-ACK, not for ModemManager\n", port, mr, tpdu_len);
+			if (port)
+				fprintf(stderr, "imsroha: MT-SMS for application port %d (MR 0x%02x, %zu bytes), "
+					"sent RP-ACK, not for ModemManager\n", port, mr, tpdu_len);
+			else
+				fprintf(stderr, "imsroha: MT-SMS with the RCS OTP (MR 0x%02x), sent RP-ACK, "
+					"for imsroha-rcs, not ModemManager\n", mr);
 			imsd_emit_port_pdu_received(ctx->bus, (uint16_t)port, hex);
 			return 0;
 		}

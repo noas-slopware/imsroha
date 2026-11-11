@@ -26,3 +26,6 @@ int sms_parse_deliver_hex(const char *hex, struct sms_deliver *out);
  * handles), or not an SMS-DELIVER it can read.
  */
 int imsd_sms_app_port(const char *hex);
+
+/* Whether a single-part SMS-DELIVER's text matches regex (caseless). */
+int imsd_sms_text_matches(const char *hex, const char *regex);

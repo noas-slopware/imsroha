@@ -176,3 +176,11 @@ int imsd_sms_app_port(const char *hex)
 		return -1;
 	return d.dest_port;
 }
+
+int imsd_sms_text_matches(const char *hex, const char *regex)
+{
+	struct sms_deliver d;
+	if (!regex || !*regex || sms_parse_deliver_hex(hex, &d) < 0 || d.concatenated)
+		return 0;
+	return g_regex_match_simple(regex, d.text, G_REGEX_CASELESS, 0);
+}

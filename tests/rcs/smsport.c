@@ -52,5 +52,10 @@ int main(void)
 	const char *vvm = "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "0a"
 			  "060504157b0000" "010203";
 	expect("8-bit port SMS is for an application (5499)", imsd_sms_app_port(vvm) == 5499);
+
+	/* rcs-otp-type=text: the plain SMS matching rcs-otp-regex. */
+	expect("text OTP regex matches", imsd_sms_text_matches(plain, "^HELLO"));
+	expect("other text does not match", !imsd_sms_text_matches(plain, "verification code"));
+	expect("no regex, no match", !imsd_sms_text_matches(plain, ""));
 	return fails ? 1 : 0;
 }

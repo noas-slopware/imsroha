@@ -209,6 +209,12 @@ static void carrier_from(GKeyFile *kf, const char *g, struct imsroha_carrier *ca
 	get_str(kf, g, "uicc-version", car->uicc_version, sizeof(car->uicc_version));
 	get_str(kf, g, "operator-code", car->operator_code, sizeof(car->operator_code));
 	get_bool(kf, g, "sms-over-ip", &car->sms_over_ip);
+	char otp_type[16] = "";
+	get_str(kf, g, "rcs-otp-type", otp_type, sizeof(otp_type));
+	if (!strcmp(otp_type, "text"))
+		get_str(kf, g, "rcs-otp-regex", car->rcs_otp_regex, sizeof(car->rcs_otp_regex));
+	else if (otp_type[0])
+		car->rcs_otp_regex[0] = '\0';
 	char rp[16] = "";
 	get_str(kf, g, "sms-rp-ack", rp, sizeof(rp));
 	if (!strcmp(rp, "response"))
@@ -276,9 +282,11 @@ int imsroha_config_load(struct imsroha_config *cfg, const char *mcc, const char 
 	if (carriers)
 		g_key_file_free(carriers);
 
+	cfg->rcs_enabled = 0;
 	GKeyFile *local = load_keyfile(conf_path(), &err);
 	if (local) {
 		carrier_from(local, "carrier", &cfg->car);
+		get_bool(local, "rcs", "enable", &cfg->rcs_enabled);
 		g_key_file_free(local);
 	}
 	return err;

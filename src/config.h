@@ -71,11 +71,14 @@ struct imsroha_carrier {
 	char sms_psi[128];          /* MO-SMS Request-URI (TS 24.341 5.3.1.2), "" = the destination */
 	int reg_event;              /* SUBSCRIBE to the reg event package (TS 24.229 5.1.1.3) */
 	int sip_instance;           /* +sip.instance with the IMEI URN in Contact (TS 24.229 5.1.1.2) */
+	/* RCS's OTP as a plain SMS (rcs-otp-type=text): rcs-otp-regex, "" otherwise */
+	char rcs_otp_regex[160];
 };
 
 struct imsroha_config {
 	struct imsroha_device dev;
 	struct imsroha_carrier car;
+	int rcs_enabled;            /* [rcs] enable=true in imsroha.conf: imsroha-rcs runs */
 };
 
 /* Device section only: what imsroha-bearer and the VSS helper need. */

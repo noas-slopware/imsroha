@@ -47,7 +47,9 @@ REGISTER. The MT-SMS inbox (`/var/lib/imsroha/inbox`) holds a message from befor
 RP-ACK until ModemManager has it (`AckPdu`). An MT-SMS with application port
 addressing (TS 23.040 9.2.3.24.4/5: RCS's OTP and configuration requests, visual
 voicemail) is for an application, as on Android: it goes out on `PortPduReceived`
-only and never reaches ModemManager or a messaging app. WAP push (MMS notifications)
+only and never reaches ModemManager or a messaging app. So does the RCS OTP of a
+carrier that sends it as plain text (`rcs-otp-type=text`), when `[rcs] enable=true`
+(port 0). WAP push (MMS notifications)
 stays with ModemManager. Both SMS signals are delivered to root only.
 
 ## Configuration
