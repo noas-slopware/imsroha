@@ -135,3 +135,187 @@ The cheapest test is one ACS run (HTTP over the phone's LG U+ data, then HTTPS) 
 truthful terminal fields and imsroha's own client fields; it needs Noa's go. If it
 answers with a config, the rest is protocol work with public specs (RCC.07, RCC.14,
 RCC.71, OMA CPM) plus TTAK.KO-06.0410. If it refuses, the response says on what.
+
+## Design: imsroha-rcs
+
+Written 2026-11-11, before the code. Everything below was built and tested on loopback
+only; no request has gone to a carrier.
+
+### Components
+
+RCS is its own executable, `imsroha-rcs` (unit `imsroha-rcs.service`), next to
+`imsroha-bearer` and `imsroha-vss-samsung`. `imsroha` and `src/sip.c` do not change: the
+VoLTE binary does not link a TLS library, and its golden tests stay byte for byte the
+same. `imsroha-rcs` is GLib/GIO (GDBus, GSocketClient, GTlsClientConnection from
+glib-networking, GMarkup); the SIM and modem reads reuse `src/aka.c` and `src/imei.c`.
+
+| file | does |
+|---|---|
+| `src/rcs/rcs_config.c` | `[rcs]` of `imsroha.conf`, the `rcs-*` keys of the carrier profile (overridable in `[carrier]`), `[device]` |
+| `src/rcs/acs.c` | autoconfig: the requests (one pure builder, golden-tested), the responses (TTAK.KO-06.0410/R9 table 6-2), the XML, the per-IMSI state |
+| `src/rcs/http.c` | HTTP/1.1 GET over GIO, plain or TLS, written by hand so every byte on the wire is ours (no library headers, no redirects followed) |
+| `src/rcs/net.c` | every RCS socket: optional `SO_BINDTODEVICE` to the internet PDN's netdev, never the IMS netdev |
+| `src/rcs/smsport.c` | SMS-DELIVER TPDUs: the application port (TS 23.040 9.2.3.24.4) and the text |
+| `src/rcs/sipua.c` | a second SIP user agent: TLS, NAPTR/SRV, Digest, REGISTER, OPTIONS, INVITE/MESSAGE/BYE for chat |
+| `src/rcs/msrp.c` | MSRP (RFC 4975) over TLS, as the active end |
+| `src/rcs/cpim.c` | CPIM (RFC 3862), IMDN (RFC 5438), isComposing (RFC 3994) |
+| `src/rcs/rcsd.c` | the daemon: state machine, OTP from SMS, D-Bus service |
+
+### Opt-in, and what "off" means
+
+- `enable=` is read only from `[rcs]` in `/etc/imsroha/imsroha.conf`. Default false.
+  `carriers.conf` and `[carrier]` have no key that turns RCS on; `rcs-*` keys there only
+  describe how the carrier does it.
+- Off and never on: `imsroha-rcs` exits 0 before it opens anything. No SIM read, no
+  socket, no D-Bus name, no file in `/var/lib/imsroha/rcs`.
+- Off after it was on: stock sends the ACS `rcs_state=-4` ("사용자가 명확히
+  device/client에서 RCS를 disable한 경우", R9 table 6-1) when the user turns RCS off, so
+  the carrier routes this number back to SMS. `imsroha-rcs` does the same, once, and
+  only when the state for this IMSI says the ACS has answered us before with a
+  configuration (version > 0) and the -4 has not been sent yet. It never sends it when
+  there is no state, when the version is -1 or -2, or when it was already sent. Then it
+  deregisters nothing (it is not registered) and exits.
+- On: autoconfig, then registration, then the D-Bus interface appears. VoLTE and SMS do
+  not change in any case: RCS is a separate registration on another PDN (R9 A.3.1 a:
+  "VoLTE Registration에 영향을 주어서는 안된다").
+
+### Network
+
+RCS runs on the internet PDN or Wi-Fi (stock `rcs_network_type` "internet,wifi"; R9
+6.4.3: Wi-Fi when connected, else the LTE internet APN). Every RCS socket goes through
+`net.c`:
+
+- `[rcs] interface=` binds sockets to that netdev (`SO_BINDTODEVICE`), for example
+  ModemManager's bearer interface, so the first HTTP GET leaves through the carrier
+  even with Wi-Fi up (network-based authentication only works there).
+  `interface-ipv4=` binds IPv4 sockets elsewhere (LG U+'s internet PDN is IPv6-only with
+  CLAT: `qmapmux0.0` for IPv6, `clat0` for IPv4). Unset, the routing table decides.
+- `[device] ims-netdev` (imsroha0) is refused as `interface`, and nothing binds to the IMS
+  address, so policy table 1042 never sees RCS traffic.
+- Names resolve through the system resolver; NAPTR goes through `res_query`.
+
+### Autoconfig (RCC.14, R9 6.3)
+
+1. HTTP GET to `rcs-acs-url` with no parameters. On the carrier's network the ACS knows
+   the subscriber from the bearer and answers 200 with a cookie; anywhere else 511.
+2. HTTPS GET to the same host with the parameters below and the cookie, if any.
+3. 200 with a full XML: done. 200 with no version/validity but a cookie: the ACS has
+   sent an OTP by SMS; wait for it (binary SMS to `rcs-otp-port`, or a text SMS when
+   `rcs-otp-type=text`) and send `GET /?OTP=<otp>` with the cookie.
+4. Store and act on VERS (table 6-2):
+
+| answer | imsroha-rcs |
+|---|---|
+| version > 0, full XML | store, register, next autoconfig after `validity` seconds |
+| same version, VERS only | keep the stored XML, next run after `validity` |
+| version 0, validity 0 | remove the XML; retry on the next start |
+| version 0, validity > 0 | remove the XML; retry after `validity` |
+| version -1, validity -1 | remove the XML, mark the IMSI `permanent`: no request of any kind for this IMSI again (only a new SIM, or deleting the state by hand) |
+| version -2 | RCS disabled by the carrier: remove the XML, no registration, retry on the next start |
+| version -3 | dormant: keep the XML, do not register |
+| 403 | remove the XML, version 0, retry on the next start |
+| 500, other errors, unreachable | keep what we have, retry 20 min, 1, 2, 4, 8 h (R9 6.3.1.2.3), then on the next start |
+| 503 + Retry-After | retry after Retry-After |
+| 511 on the HTTPS GET | drop the token, start over once with MSISDN and the OTP flow |
+
+A network-initiated SMS to the port whose text is `<IMSI>-rcscfg` or `<IMPI>-rcscfg`
+(R9 6.3.1.1.2) starts a run (the second with version 0).
+
+Parameters of the HTTPS GET, in this order: `vers`, `rcs_state`, `IMSI`, `IMEI`,
+`terminal_model`, `terminal_vendor`, `terminal_sw_version`, `client_vendor`,
+`client_version`, `rcs_profile`, `provisioning_version`, `rcs_version` (only when the
+carrier sets one), `app` (repeated), `default_sms_app`, and after a 511 or when
+`[rcs] assume-mobile=false`: `msisdn`, `SMS_port`, `token`. The values:
+
+| parameter | from |
+|---|---|
+| `terminal_model`, `terminal_sw_version` | `[device] model`, `build` |
+| `terminal_vendor` | `[device] vendor` (`SEC` for Samsung, as stock) |
+| `client_vendor`, `client_version` | `[rcs] client-vendor` (≤ 4 characters, default `IMSR`), `client-version` (`Platform-Major.Minor`, default `RCSLinux-0.2`). Stock sends `SEC` and `RCSAndr-6.0`; which one the ACS accepts is the open question above |
+| `rcs_profile`, `provisioning_version`, `app` | carrier (`rcs-profile`, `rcs-provisioning-version`, `rcs-app`) |
+| `default_sms_app` | `[rcs] default-sms-app` (1: the RCS client is the SMS app, as with Spacebar) |
+| `IMSI`, `IMEI` | the SIM over QMI UIM, the modem over QMI DMS |
+| `msisdn` | `[rcs] msisdn`, else ModemManager's `OwnNumbers` |
+
+State per IMSI in `/var/lib/imsroha/rcs/<IMSI>/`: `state` (version, validity, token,
+next run, rcs_state, last HTTP status, `permanent`, `disable-sent`) and `config.xml`.
+
+### Registration (R9 6.4, A.3-A.5)
+
+A second, independent SIP UA. From the XML: `Private_User_Identity`,
+`Public_User_Identity`, `Home_network_domain_name`, `LBO_P-CSCF_Address` (FQDN or IP,
+optional port), `Ext/GSMA` `AuthType`/`Realm`/`UserName`/`UserPwd`, `psSignalling`
+(SIPoTLS). The P-CSCF comes from the ACS, never from the PCO (A.3.1 b). NAPTR, then SRV
+`_sips._tcp`, then the name at `rcs-sip-port` (9672). TLS with server certificate
+validation against the system store (`[rcs] ca-file=` for a private CA).
+
+- Contact: the feature tags of what is implemented, nothing else: ICSI
+  `urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session` (chat) and `+sip.instance`.
+  File transfer, geolocation, chatbot and presence tags are added with those features.
+- Digest (MD5, qop=auth) with the ACS credentials, or AKA through the ISIM.
+- 403: rerun autoconfig once; a second 403 stops RCS until restart (A.5 b).
+- Re-REGISTER at 600 s before expiry or half of short expiries. The TLS connection
+  stays open with kernel TCP keepalive; nothing runs on a timer while idle.
+- User-Agent: `rcs-user-agent` (stock: `TTA-RCS/2.4 <model>/<sw>
+  Device_Type/RCS_Android_Phone <operator>`; R9 8.1's ABNF says `TTA-RCS/1.0`).
+
+### Messaging
+
+- 1-to-1 chat is a CPM session (R9 7.2): INVITE with
+  `Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`,
+  SDP `m=message` with `a=accept-types:message/cpim application/im-iscomposing+xml`,
+  `a=accept-wrapped-types:text/plain message/imdn+xml`, `a=setup:active`. imsroha-rcs
+  always opens the MSRP connection (R9: "We always have the client establish the
+  connection to the server"), for MO and MT sessions alike.
+- Messages: `message/cpim` around `text/plain`, with `imdn.Message-ID`, `DateTime`,
+  `imdn.Disposition-Notification: positive-delivery, display`.
+- Received messages: a delivered IMDN at once; displayed when the app says the user
+  saw it (`MarkDisplayed`). IMDNs go in the session when one is up, else in a SIP
+  MESSAGE (RCC.07 3.2.4).
+- isComposing (RFC 3994) in the session, not CPIM-wrapped (R9 7.2.3), unless the
+  carrier says `rcs-iscomposing-cpim=true`.
+- Idle sessions end after `TimerIdle`; the next message opens a new one.
+- Standalone messaging (pager mode) is "X" in R9 table 7-1, so Korea gets none. It is
+  implemented for receiving (a MESSAGE with CPIM is a chat message) and for IMDNs.
+
+### D-Bus: `codes.noa.IMSroha.Rcs`
+
+Bus name `codes.noa.IMSroha.Rcs`, object `/codes/noa/IMSroha/Rcs`, interface
+`codes.noa.IMSroha.Rcs`. It exists only while RCS is enabled. Numbers are E.164
+(`+8210...`) or national; imsroha-rcs normalises them with `country-code`.
+
+```
+property  s State           "configuring" | "waiting-otp" | "registering" | "registered"
+                            | "unregistered" | "disabled-by-network"
+method    SendMessage(s number, s text) -> (s message_id)
+method    SetComposing(s number, b active)
+method    MarkDisplayed(s number, s message_id)
+method    GetCapabilities(s number) -> (a{sv} caps)   "chat": b, "ft-http": b, "known": b
+signal    MessageReceived(s number, s message_id, s text, x timestamp_ms)
+signal    MessageStatusChanged(s message_id, s status)   "sent" | "delivered" | "displayed" | "failed"
+signal    ComposingChanged(s number, b active)
+signal    StateChanged(s state)
+```
+
+`SendMessage` returns when the message is handed to the session; "sent" follows the
+MSRP 200, "failed" an error or a session that could not be set up, so the app can fall
+back to SMS. Group chat (`CreateGroup`, `SendGroupMessage`, the conference event
+package) and file transfer (`SendFile`, HTTP upload to `ftHTTPCSURI`) come later on the
+same interface.
+
+### Carrier data (`carriers.conf`, `rcs-*`)
+
+`rcs-acs-url`, `rcs-otp-port`, `rcs-otp-type`, `rcs-otp-regex`, `rcs-profile`,
+`rcs-provisioning-version`, `rcs-version`, `rcs-app`, `rcs-user-agent`,
+`rcs-http-user-agent`, `rcs-sip-port`, `rcs-iscomposing-cpim`, `rcs-standalone`. The
+three Korean carriers get stock's values (globalsettings.json `SKT_KR`, `KT_KR`,
+`LGU+_KR`; imsprofile.json `SKT RCS`, `KT RCS`, `LGU RCS`).
+
+### Generic and Korean
+
+Generic (GSMA UP, RCC.07/RCC.14, OMA CPM): the whole flow above, the XML, SIP/TLS,
+MSRP, CPIM, IMDN, isComposing. Korean, all as data or behind a carrier key: the ACS URL,
+the OTP port and its UCS-2 text, `-rcscfg` requests, the TTA User-Agent, isComposing
+without CPIM, no standalone messaging, and the chapter 8 additions (reply, reaction,
+cancel; not implemented yet: CPIM headers in the `Extended-RCS <http://www.tta.or.kr>`
+namespace, ignored when received as RFC 3862 says).
