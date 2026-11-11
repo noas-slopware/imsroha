@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <glib.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -204,11 +205,30 @@ out:
 	return r < 0 ? r : 0;
 }
 
+/*
+ * A retransmission is the same message even when the SMSC's queue changed
+ * in between: TP-MMS ("more messages to send") and TP-LP in the first TPDU
+ * octet follow the SMSC's state, not the message (TS 23.040 9.2.3.2,
+ * 9.2.3.28). A message sent again after its RP-ACK was lost came back with
+ * another TP-MMS and was stored twice. Those two bits are left out.
+ */
 static uint64_t tpdu_hash(const char *pdu_hex)
 {
 	uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 */
-	for (const char *p = pdu_hex; *p; p++) {
-		h ^= (unsigned char)(*p | 0x20); /* hex case does not matter */
+	/* "00" (no SMSC address, as imsroha stores it) then the TPDU: */
+	size_t first = 0;
+	unsigned int sca = 0;
+	if (sscanf(pdu_hex, "%2x", &sca) == 1)
+		first = 2 + 2 * (size_t)sca; /* hex offset of the first TPDU octet */
+	size_t len = strlen(pdu_hex);
+	for (size_t i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)(pdu_hex[i] | 0x20); /* hex case does not matter */
+		if (i == first + 1 && g_ascii_isxdigit(c)) {
+			/* low nibble of the first octet: bit 2 TP-MMS, bit 3 TP-LP */
+			unsigned int v = (unsigned int)g_ascii_xdigit_value((char)c) & ~0x0cu;
+			c = (unsigned char)"0123456789abcdef"[v];
+		}
+		h ^= c;
 		h *= 0x100000001b3ULL;
 	}
 	return h;
