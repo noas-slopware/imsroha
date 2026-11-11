@@ -1,0 +1,936 @@
+From 9abed8c957f2c1a6cd551de950af426034e02d8d Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 23:56:41 +0900
+Subject: [PATCH] daemon, app: resend chatbot responses as they went; fetch
+ failed pictures again
+
+A suggestion response is kept as it went: the response JSON (as before)
+and now the imdn.Message-ID it answers (a new inReplyTo column). Resend
+on a failed one (the long-press menu) sends exactly that again through
+SendSuggestionResponse (resendSuggestionResponse on the daemon), never as
+text and never as SMS or MMS; when the bot cannot be reached it stays
+failed. A suggested action's response is stored too, so that it can go
+again, but the conversation lists it only while it is failed (RCC.07 shows
+nothing for an action); a failed one that comes after the bot's next
+message goes in its place by time.
+
+In a chatbot's conversation (by SIP URI, or a number a bot wrote from)
+nothing RCS was chosen for becomes SMS or MMS: a refused or failed text,
+a refused file and a failed upload are failed messages, to be sent again.
+What the conversation would send as SMS anyway (no chat capability, R9
+7.7.3.1) still goes as SMS.
+
+A picture that did not come (card media, thumbnails, open rich card
+images, bot icons) shows "Image failed to load, tap to retry", and is
+fetched again on demand only: when it is shown again (at most every 30 s,
+and not after 3 failures in a row), always when tapped, and once when the
+network comes back (QNetworkInformation reachability, from Qt Network;
+without a backend, the other two). Nothing runs in between.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ daemon/channellogger.cpp                      | 137 ++++++++++++++----
+ daemon/channellogger.h                        |  10 ++
+ daemon/org.kde.spacebar.Daemon.xml            |   3 +
+ lib/database/database.cpp                     |  22 ++-
+ lib/database/database.h                       |  15 +-
+ lib/database/migrations.qrc                   |   2 +
+ .../2026-11-13-000000_inreplyto/down.sql      |   3 +
+ .../2026-11-13-000000_inreplyto/up.sql        |   5 +
+ src/contents/ui/ChatsPage.qml                 |   7 +
+ src/contents/ui/MessagesPage.qml              |   8 +
+ src/contents/ui/RichImage.qml                 |  54 ++++++-
+ src/messagemodel.cpp                          |  31 +++-
+ src/messagemodel.h                            |   8 +-
+ src/richmedia.cpp                             |  96 ++++++++++--
+ src/richmedia.h                               |  32 +++-
+ 15 files changed, 367 insertions(+), 66 deletions(-)
+ create mode 100644 lib/database/migrations/2026-11-13-000000_inreplyto/down.sql
+ create mode 100644 lib/database/migrations/2026-11-13-000000_inreplyto/up.sql
+
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index 6cc8eff..f91ebc4 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -580,6 +580,7 @@ ChannelLogger::sendMessageTask(const PhoneNumberList phoneNumberList, const QStr
+     QString result;
+     // RCS file transfer: one recipient who takes files, and only files
+     std::optional<QString> rcsResult;
++    bool rcsFiles = false;
+     if (phoneNumberList.size() == 1 && !files.isEmpty() && m_rcs.isRegistered()
+         && std::all_of(files.cbegin(),
+                        files.cend(),
+@@ -588,12 +589,18 @@ ChannelLogger::sendMessageTask(const PhoneNumberList phoneNumberList, const QStr
+                            return info.isAbsolute() && info.isFile() && info.size() > 0;
+                        })
+         && co_await m_rcs.canSendFile(phoneNumberList.first().toE164())) {
++        rcsFiles = true;
+         rcsResult = co_await sendFilesRCS(phoneNumberList, id, text, files);
+     }
++    bool chatbot = false;
++    if (!rcsResult && rcsFiles) {
++        chatbot = co_await isChatbotConversation(phoneNumberList);
++    }
+     if (rcsResult) {
+         result = *rcsResult;
+-    } else if (isChatbotUri(phoneNumberList)) {
+-        // A chatbot by SIP URI: chat, and no SMS or MMS to fall back to.
++    } else if (isChatbotUri(phoneNumberList) || chatbot) {
++        // A chatbot by SIP URI: chat, and no SMS or MMS to fall back to. Nor
++        // in a chatbot's conversation once RCS was chosen and refused.
+         if (files.isEmpty()) {
+             result = co_await sendMessageRCS(phoneNumberList.first(), id, text);
+         } else {
+@@ -675,7 +682,12 @@ QCoro::Task<QString> ChannelLogger::sendMessageRCS(const PhoneNumber &phoneNumbe
+     updateMessage(message);
+ 
+     const auto rcsId = co_await m_rcs.send(phoneNumber.toE164(), text);
+-    if (!rcsId && isChatbotUri(message.phoneNumberList)) {
++    bool chatbot = false;
++    if (!rcsId) {
++        chatbot = co_await isChatbotConversation(message.phoneNumberList);
++    }
++    if (chatbot) {
++        // a chatbot's conversation: failed, to be sent again over RCS
+         co_await m_database.updateMessageDeliveryState(id, MessageState::Failed);
+         message.deliveryStatus = MessageState::Failed;
+         updateMessage(message);
+@@ -713,6 +725,24 @@ ChannelLogger::sendFilesRCS(const PhoneNumberList &phoneNumberList, const QStrin
+             if (first) {
+                 co_return std::nullopt;
+             }
++            const bool chatbot = co_await isChatbotConversation(phoneNumberList);
++            if (chatbot) {
++                // a chatbot's conversation: no MMS; a failed message to send again
++                Message failed;
++                failed.id = Database::generateRandomId();
++                failed.phoneNumberList = phoneNumberList;
++                failed.datetime = QDateTime::currentDateTime();
++                failed.read = true;
++                failed.sentByMe = true;
++                failed.deliveryStatus = MessageState::Failed;
++                failed.transport = SL("rcs");
++                const QJsonObject kept = storeAttachment(phoneNumberList, path, QString(), false);
++                failed.attachments = kept.isEmpty() ? QString() : attachmentJson(kept);
++                failed.text = kept.isEmpty() ? QFileInfo(path).fileName() : QString();
++                co_await addMessage(failed);
++                updateMessage(failed);
++                continue;
++            }
+             // Some went already: this one goes as MMS of its own.
+             co_await sendMessageMMS(phoneNumberList, Database::generateRandomId(), QString(), {file}, QFileInfo(path).size());
+             continue;
+@@ -839,8 +869,10 @@ ChannelLogger::sendSuggestionResponseTask(const PhoneNumberList phoneNumberList,
+     }
+     const QJsonObject raw = QJsonDocument::fromJson(suggestion.toUtf8()).object();
+     const QString response = RichMessage::responseJson(raw);
+-    // RCC.07 3.6.10.6.2.1: a suggested reply shows as a message we sent.
+-    const bool shown = RichMessage::isReply(raw) && !id.isEmpty();
++    if (response.isEmpty()) {
++        // an action without postback data: nothing goes back
++        co_return;
++    }
+ 
+     QString inReplyToMessageId;
+     if (!inReplyTo.isEmpty()) {
+@@ -850,40 +882,73 @@ ChannelLogger::sendSuggestionResponseTask(const PhoneNumberList phoneNumberList,
+         }
+     }
+ 
++    // Kept as it goes, to go again exactly so when it failed. RCC.07
++    // 3.6.10.6.2.1: a suggested reply shows as a message we sent, under the
++    // app's id. An action's response is not shown (the conversation lists
++    // it only once it failed).
+     Message message;
+-    if (shown) {
+-        message.id = id;
+-        message.phoneNumberList = phoneNumberList;
+-        message.text = RichMessage::displayText(raw);
+-        message.datetime = QDateTime::currentDateTime();
+-        message.read = true;
+-        message.sentByMe = true;
+-        message.deliveryStatus = MessageState::Pending;
+-        message.transport = SL("rcs");
+-        message.richContentType = BOT_RESPONSE_TYPE;
+-        message.richBody = response;
+-        co_await addMessage(message);
++    message.id = id.isEmpty() ? Database::generateRandomId() : id;
++    message.phoneNumberList = phoneNumberList;
++    message.text = RichMessage::displayText(raw);
++    message.datetime = QDateTime::currentDateTime();
++    message.read = true;
++    message.sentByMe = true;
++    message.deliveryStatus = MessageState::Pending;
++    message.transport = SL("rcs");
++    message.richContentType = BOT_RESPONSE_TYPE;
++    message.richBody = response;
++    message.inReplyTo = inReplyToMessageId;
++    co_await addMessage(message);
++    if (!message.isHiddenResponse()) {
+         updateMessage(message);
+     }
+-    if (response.isEmpty()) {
+-        // an action without postback data: nothing goes back
+-        co_return;
+-    }
++    co_await sendSuggestionResponseRow(message);
++}
++
++void ChannelLogger::resendSuggestionResponse(const QString &id)
++{
++    resendSuggestionResponseTask(id);
++}
+ 
+-    const auto rcsId = co_await m_rcs.sendSuggestionResponse(phoneNumberList.first().toE164(), inReplyToMessageId, response);
+-    if (!shown) {
++QCoro::Task<void> ChannelLogger::resendSuggestionResponseTask(const QString id)
++{
++    const auto found = co_await m_database.messagesForNumber(PhoneNumberList(), id);
++    if (found.empty() || found.front().richContentType != BOT_RESPONSE_TYPE || !found.front().sentByMe) {
+         co_return;
+     }
++    Message message = found.front();
++    co_await m_database.updateMessageDeliveryState(id, MessageState::Pending);
++    message.deliveryStatus = MessageState::Pending;
++    updateMessage(message);
++    co_await sendSuggestionResponseRow(message);
++}
++
++QCoro::Task<void> ChannelLogger::sendSuggestionResponseRow(Message message)
++{
++    // the same response to the same message, over RCS or not at all: as SMS
++    // the bot would get the label without its postback (R9 7.7.3.1)
++    const auto rcsId = co_await m_rcs.sendSuggestionResponse(message.phoneNumberList.first().toE164(), message.inReplyTo, message.richBody);
+     if (rcsId) {
+-        co_await m_database.updateMessageSent(id, *rcsId, QString());
++        co_await m_database.updateMessageSent(message.id, *rcsId, QString());
+     } else {
+-        // never as SMS: the bot would get the label without its postback
+-        co_await m_database.updateMessageDeliveryState(id, MessageState::Failed);
++        co_await m_database.updateMessageDeliveryState(message.id, MessageState::Failed);
+         message.deliveryStatus = MessageState::Failed;
+         updateMessage(message);
+     }
+ }
+ 
++QCoro::Task<bool> ChannelLogger::isChatbotConversation(const PhoneNumberList phoneNumberList)
++{
++    if (isChatbotUri(phoneNumberList)) {
++        co_return true;
++    }
++    if (phoneNumberList.size() != 1) {
++        co_return false;
++    }
++    const QString botId = co_await m_database.botIdForNumber(phoneNumberList);
++    co_return !botId.isEmpty();
++}
++
+ QString ChannelLogger::botInfo(const QString &numbers)
+ {
+     const PhoneNumberList phoneNumberList(numbers);
+@@ -933,7 +998,12 @@ QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString messageId, const
+     if (found.empty()) {
+         co_return;
+     }
+-    const Message message = found.front();
++    Message message = found.front();
++    // (co_await outside the conditions below: GCC 16 fails on it there)
++    bool chatbot = false;
++    if (status == SL("failed")) {
++        chatbot = co_await isChatbotConversation(message.phoneNumberList);
++    }
+     if (status == SL("sent")) {
+         co_await m_database.updateMessageDeliveryState(*id, MessageState::Sent);
+     } else if (status == SL("delivered")) {
+@@ -941,10 +1011,12 @@ QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString messageId, const
+         co_await m_database.updateMessageDeliveryReport(messageId);
+     } else if (status == SL("displayed")) {
+         co_await m_database.updateMessageReadReport(messageId, message.phoneNumberList.first());
+-    } else if (status == SL("failed") && (!message.richContentType.isEmpty() || isChatbotUri(message.phoneNumberList))) {
+-        // A suggested reply, or anything to a chatbot by SIP URI: these do
+-        // not go as SMS (R9 7.7.3.1), they failed.
++    } else if (status == SL("failed") && (!message.richContentType.isEmpty() || chatbot)) {
++        // A suggestion response, or anything in a chatbot's conversation:
++        // these do not become SMS or MMS (R9 7.7.3.1), they failed, to be
++        // sent again over RCS.
+         co_await m_database.updateMessageDeliveryState(*id, MessageState::Failed);
++        message.deliveryStatus = MessageState::Failed;
+     } else if (status == SL("failed") && message.deliveryStatus != MessageState::Sent && !message.attachments.isEmpty()) {
+         // A file that did not go (the upload failed): it goes as MMS, which
+         // stores the attachments its own way.
+@@ -970,7 +1042,10 @@ QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString messageId, const
+         co_await sendMessageSMS(message.phoneNumberList.first(), *id, message.text, false);
+         co_return;
+     }
+-    updateMessage(message);
++    // an action's response the conversation does not show
++    if (!message.isHiddenResponse()) {
++        updateMessage(message);
++    }
+ }
+ 
+ QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, bool addToDatabase)
+diff --git a/daemon/channellogger.h b/daemon/channellogger.h
+index dc7cde9..2d578a5 100644
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -55,6 +55,11 @@ public:
+      * comes with botInfoChanged.
+      */
+     Q_SCRIPTABLE QString botInfo(const QString &numbers);
++    /*
++     * A suggestion response that failed (our id), sent again as it went,
++     * over RCS only. It stays failed when the bot cannot be reached.
++     */
++    Q_SCRIPTABLE void resendSuggestionResponse(const QString &id);
+     Q_SCRIPTABLE void syncSettings();
+     Q_SCRIPTABLE QString ownNumber();
+     Q_SCRIPTABLE QString countryCode();
+@@ -120,6 +125,11 @@ private:
+                                         const QString botId,
+                                         const QDateTime time);
+     QCoro::Task<void> sendSuggestionResponseTask(const PhoneNumberList phoneNumberList, const QString id, const QString inReplyTo, const QString suggestion);
++    QCoro::Task<void> resendSuggestionResponseTask(const QString id);
++    QCoro::Task<void> sendSuggestionResponseRow(Message message);
++    // a chatbot's conversation (by SIP URI, or one a bot wrote to): what
++    // RCS does not take there fails, it does not become SMS or MMS
++    QCoro::Task<bool> isChatbotConversation(const PhoneNumberList phoneNumberList);
+     QCoro::Task<void> refreshBotInfo(const QString phoneNumber, const QString botId, bool onlyWhenStale);
+     QCoro::Task<QString>
+     sendMessageMMS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files, const qint64 totalSize);
+diff --git a/daemon/org.kde.spacebar.Daemon.xml b/daemon/org.kde.spacebar.Daemon.xml
+index 620362f..42837dc 100644
+--- a/daemon/org.kde.spacebar.Daemon.xml
++++ b/daemon/org.kde.spacebar.Daemon.xml
+@@ -53,6 +53,9 @@
+       <arg name="inReplyTo" type="s" direction="in"/>
+       <arg name="suggestion" type="s" direction="in"/>
+     </method>
++    <method name="resendSuggestionResponse">
++      <arg name="id" type="s" direction="in"/>
++    </method>
+     <method name="botInfo">
+       <arg type="s" direction="out"/>
+       <arg name="numbers" type="s" direction="in"/>
+diff --git a/lib/database/database.cpp b/lib/database/database.cpp
+index 62b1867..65c3aaf 100644
+--- a/lib/database/database.cpp
++++ b/lib/database/database.cpp
+@@ -79,12 +79,16 @@ QCoro::Task<std::vector<Message>> Database::messagesForNumber(const PhoneNumberL
+             richContentType,
+             richBody,
+             suggestions,
+-            botId
++            botId,
++            inReplyTo
+         FROM Messages
+     )");
+ 
+     if (id.isEmpty()) {
+-        sql.append(SL("WHERE phoneNumber == ? ORDER BY time DESC"));
++        // A suggested action's response is not shown as a message (RCC.07
++        // 3.6.10.6.2.2), unless it failed: then it is there to be sent again.
++        sql.append(SL("WHERE phoneNumber == ? AND NOT (sentByMe == True AND richContentType IS NOT NULL AND richBody LIKE '{\"response\":{\"action\"%' AND delivered != ?) "
++                      "ORDER BY time DESC"));
+ 
+         if (limit == 0) {
+             sql.append(SL(" LIMIT 30"));
+@@ -94,7 +98,7 @@ QCoro::Task<std::vector<Message>> Database::messagesForNumber(const PhoneNumberL
+             sql.append(SL(" LIMIT -1 OFFSET 30"));
+         }
+ 
+-        co_return co_await m_database->getResults<Message>(sql, phoneNumberList.toString());
++        co_return co_await m_database->getResults<Message>(sql, phoneNumberList.toString(), MessageState::Failed);
+     } else {
+         sql.append(SL("WHERE id == ?"));
+         co_return co_await m_database->getResults<Message>(sql, id);
+@@ -316,8 +320,9 @@ QCoro::Task<> Database::addMessage(const Message &message)
+             richContentType,
+             richBody,
+             suggestions,
+-            botId)
+-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++            botId,
++            inReplyTo)
++        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         )"),
+                                  message.id,
+                                  message.phoneNumberList.toString(),
+@@ -340,7 +345,8 @@ QCoro::Task<> Database::addMessage(const Message &message)
+                                  message.richContentType.isEmpty() ? QVariant() : message.richContentType,
+                                  message.richBody.isEmpty() ? QVariant() : message.richBody,
+                                  message.suggestions.isEmpty() ? QVariant() : message.suggestions,
+-                                 message.botId.isEmpty() ? QVariant() : message.botId);
++                                 message.botId.isEmpty() ? QVariant() : message.botId,
++                                 message.inReplyTo.isEmpty() ? QVariant() : message.inReplyTo);
+ }
+ 
+ QCoro::Task<> Database::deleteMessage(const QString &id)
+@@ -616,7 +622,8 @@ Message Message::fromSql(ColumnTypes &&tuple)
+           richContentType,
+           richBody,
+           suggestions,
+-          botId] = tuple;
++          botId,
++          inReplyTo] = tuple;
+ 
+     Message message;
+     message.id = id, message.phoneNumberList = PhoneNumberList(phoneNumberList);
+@@ -641,5 +648,6 @@ Message Message::fromSql(ColumnTypes &&tuple)
+     message.richBody = richBody;
+     message.suggestions = suggestions;
+     message.botId = botId;
++    message.inReplyTo = inReplyTo;
+     return message;
+ }
+diff --git a/lib/database/database.h b/lib/database/database.h
+index 88fe179..6a1dcce 100644
+--- a/lib/database/database.h
++++ b/lib/database/database.h
+@@ -46,7 +46,7 @@ Q_DECLARE_METATYPE(StringMapList)
+ 
+ struct Message {
+     using ColumnTypes =
+-        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString, QString, QString, QString, QString, QString>;
++        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString, QString, QString, QString, QString, QString, QString>;
+ 
+     static Message fromSql(ColumnTypes &&tuple);
+ 
+@@ -80,9 +80,20 @@ struct Message {
+     QString richBody;
+     QString suggestions;
+     QString botId;
++    // A suggestion response we sent: the imdn.Message-ID of the bot's message
++    // it answers, for sending richBody again exactly as it went.
++    QString inReplyTo;
+ 
+     Message() = default;
+ 
++    // The response to a chatbot's suggested action: not shown in the
++    // conversation (RCC.07 3.6.10.6.2.2) unless it failed.
++    bool isHiddenResponse() const
++    {
++        return sentByMe && deliveryStatus != MessageState::Failed && richContentType == QStringLiteral("application/vnd.gsma.botsuggestion.response.v1.0+json")
++            && richBody.startsWith(QStringLiteral("{\"response\":{\"action\""));
++    }
++
+     Message(const StringMap &map)
+     {
+         id = map[SL("id")];
+@@ -108,6 +119,7 @@ struct Message {
+         richBody = map[SL("richBody")];
+         suggestions = map[SL("suggestions")];
+         botId = map[SL("botId")];
++        inReplyTo = map[SL("inReplyTo")];
+     }
+ 
+     StringMap toMap() const
+@@ -136,6 +148,7 @@ struct Message {
+             {SL("richBody"), richBody},
+             {SL("suggestions"), suggestions},
+             {SL("botId"), botId},
++            {SL("inReplyTo"), inReplyTo},
+         };
+     }
+ };
+diff --git a/lib/database/migrations.qrc b/lib/database/migrations.qrc
+index 4a703f5..f0b836d 100644
+--- a/lib/database/migrations.qrc
++++ b/lib/database/migrations.qrc
+@@ -6,5 +6,7 @@
+         <file>migrations/2026-11-11-000000_transport/up.sql</file>
+         <file>migrations/2026-11-12-000000_chatbot/down.sql</file>
+         <file>migrations/2026-11-12-000000_chatbot/up.sql</file>
++        <file>migrations/2026-11-13-000000_inreplyto/down.sql</file>
++        <file>migrations/2026-11-13-000000_inreplyto/up.sql</file>
+     </qresource>
+ </RCC>
+diff --git a/lib/database/migrations/2026-11-13-000000_inreplyto/down.sql b/lib/database/migrations/2026-11-13-000000_inreplyto/down.sql
+new file mode 100644
+index 0000000..c7326fc
+--- /dev/null
++++ b/lib/database/migrations/2026-11-13-000000_inreplyto/down.sql
+@@ -0,0 +1,3 @@
++-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++ALTER TABLE Messages DROP COLUMN inReplyTo;
+diff --git a/lib/database/migrations/2026-11-13-000000_inreplyto/up.sql b/lib/database/migrations/2026-11-13-000000_inreplyto/up.sql
+new file mode 100644
+index 0000000..c5be322
+--- /dev/null
++++ b/lib/database/migrations/2026-11-13-000000_inreplyto/up.sql
+@@ -0,0 +1,5 @@
++-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++-- A chatbot suggestion response we sent: the imdn.Message-ID of the message
++-- it answers, so that a failed one can go again exactly as it went.
++ALTER TABLE Messages ADD COLUMN inReplyTo TEXT;
+diff --git a/src/contents/ui/ChatsPage.qml b/src/contents/ui/ChatsPage.qml
+index 39eae57..cded7f2 100644
+--- a/src/contents/ui/ChatsPage.qml
++++ b/src/contents/ui/ChatsPage.qml
+@@ -143,6 +143,13 @@ Kirigami.ScrollablePage {
+                         delegateRoot.botIconFile = localUrl
+                     }
+                 }
++                // one that failed: again when the network is back (and when
++                // the list shows it again)
++                function onNetworkAvailable() {
++                    if (!delegateRoot.botIconFile) {
++                        delegateRoot.fetchBotIcon()
++                    }
++                }
+             }
+ 
+             property var attachments: lastAttachment ? JSON.parse(lastAttachment) : []
+diff --git a/src/contents/ui/MessagesPage.qml b/src/contents/ui/MessagesPage.qml
+index 1e380a4..28d9b04 100644
+--- a/src/contents/ui/MessagesPage.qml
++++ b/src/contents/ui/MessagesPage.qml
+@@ -473,6 +473,7 @@ Kirigami.ScrollablePage {
+                         menu.attachments = content.attachments
+                         menu.smil = model.smil
+                         menu.resend = model.sentByMe && model.deliveryState == MessageModel.Failed
++                        menu.suggestionResponse = !!model.suggestionResponse
+                         menu.tapbacks = rect.tapbacks
+                         menu.open()
+                     }
+@@ -930,6 +931,8 @@ Kirigami.ScrollablePage {
+         property var attachments: []
+         property string smil
+         property bool resend: false
++        // a chatbot suggestion response: it goes again as it went, never as text
++        property bool suggestionResponse: false
+         property var tapbacks
+ 
+         contentItem: ColumnLayout {
+@@ -1043,6 +1046,11 @@ Kirigami.ScrollablePage {
+                 text: i18nc("Retry sending message", "Resend")
+                 icon.name: "edit-redo"
+                 onClicked: {
++                    if (menu.suggestionResponse) {
++                        messageModel.resendSuggestionResponse(menu.id)
++                        menu.close()
++                        return
++                    }
+                     messageModel.sendMessage(menu.text, menu.attachments.map(o => "file://" + attachmentsFolder + "/" + o.fileName), menu.attachments.reduce((a,c) => a += (c.size || 0), 0))
+                     listView.currentIndex = menu.index
+                     messageModel.deleteMessage(menu.id, menu.index, menu.attachments.map(o => o.fileName))
+diff --git a/src/contents/ui/RichImage.qml b/src/contents/ui/RichImage.qml
+index c279925..de3a239 100644
+--- a/src/contents/ui/RichImage.qml
++++ b/src/contents/ui/RichImage.qml
+@@ -26,6 +26,8 @@ Item {
+     property string contentDescription
+     readonly property alias status: image.status
+     property string localUrl: ""
++    // the last fetch failed: a placeholder to tap
++    property bool failed: false
+ 
+     signal clicked()
+     signal pressAndHold()
+@@ -34,20 +36,40 @@ Item {
+                   : image.implicitWidth > 0 ? Math.round(image.implicitHeight * width / image.implicitWidth)
+                   : Kirigami.Units.gridUnit * 6
+ 
++    // Asked for when shown (made, or visible again) and when the network
++    // is back; RichMedia decides whether a failed one is fetched again
++    // (every 30 s at most, 3 times). A tap on the placeholder always is.
+     function refresh() {
+         localUrl = url ? RichMedia.localFile(url, folder) : ""
++        failed = !localUrl && !!url && RichMedia.failed(url, folder)
++    }
++    function retry() {
++        failed = false
++        localUrl = url ? RichMedia.retry(url, folder) : ""
+     }
+     onUrlChanged: refresh()
+     onFolderChanged: refresh()
++    onVisibleChanged: if (visible && !localUrl) refresh()
+     Component.onCompleted: refresh()
+ 
+     Connections {
+         target: RichMedia
+         function onFetched(fetchedUrl, local) {
+             if (fetchedUrl === root.url) {
++                root.failed = false
+                 root.localUrl = local
+             }
+         }
++        function onFetchFailed(fetchedUrl) {
++            if (fetchedUrl === root.url) {
++                root.failed = true
++            }
++        }
++        function onNetworkAvailable() {
++            if (root.failed && root.visible) {
++                root.refresh()
++            }
++        }
+     }
+ 
+     Rectangle {
+@@ -61,7 +83,33 @@ Item {
+             height: width
+             source: "image-x-generic"
+             color: Kirigami.Theme.disabledTextColor
+-            visible: !root.playable
++            visible: !root.playable && !root.failed
++        }
++
++        // it did not come: say so, and take a tap to fetch it again
++        Column {
++            visible: root.failed
++            anchors.centerIn: parent
++            width: parent.width - Kirigami.Units.largeSpacing * 2
++            spacing: Kirigami.Units.smallSpacing
++
++            Kirigami.Icon {
++                anchors.horizontalCenter: parent.horizontalCenter
++                width: Math.min(Kirigami.Units.iconSizes.medium, root.width, root.height)
++                height: width
++                source: "view-refresh"
++                color: Kirigami.Theme.disabledTextColor
++            }
++            Text {
++                // too small for words: the icon is enough (a bot's icon)
++                visible: root.width >= Kirigami.Units.gridUnit * 6 && root.height >= Kirigami.Units.gridUnit * 4
++                width: parent.width
++                horizontalAlignment: Text.AlignHCenter
++                wrapMode: Text.Wrap
++                text: i18nc("@info a chatbot message's picture", "Image failed to load, tap to retry")
++                font: Kirigami.Theme.smallFont
++                color: Kirigami.Theme.disabledTextColor
++            }
+         }
+     }
+ 
+@@ -81,7 +129,7 @@ Item {
+ 
+     // video, audio, R9's iframe play: it opens outside
+     Rectangle {
+-        visible: root.playable
++        visible: root.playable && !root.failed
+         anchors.centerIn: parent
+         width: Kirigami.Units.iconSizes.large
+         height: width
+@@ -99,7 +147,7 @@ Item {
+ 
+     MouseArea {
+         anchors.fill: parent
+-        onClicked: root.clicked()
++        onClicked: root.failed ? root.retry() : root.clicked()
+         onPressAndHold: root.pressAndHold()
+     }
+ }
+diff --git a/src/messagemodel.cpp b/src/messagemodel.cpp
+index 49acb8f..635cabe 100644
+--- a/src/messagemodel.cpp
++++ b/src/messagemodel.cpp
+@@ -183,7 +183,8 @@ QHash<int, QByteArray> MessageModel::roleNames() const
+             {Role::SizeRole, BL("size")},
+             {Role::TapbacksRole, BL("tapbacks")},
+             {Role::TransportRole, BL("transport")},
+-            {Role::RichRole, BL("rich")}};
++            {Role::RichRole, BL("rich")},
++            {Role::SuggestionResponseRole, BL("suggestionResponse")}};
+ }
+ 
+ QVariant MessageModel::data(const QModelIndex &index, int role) const
+@@ -235,6 +236,8 @@ QVariant MessageModel::data(const QModelIndex &index, int role) const
+         return message.tapbacks;
+     case Role::TransportRole:
+         return message.transport;
++    case Role::SuggestionResponseRole:
++        return message.sentByMe && message.richContentType == SL("application/vnd.gsma.botsuggestion.response.v1.0+json");
+     case Role::RichRole: {
+         // a chatbot message as the view shows it; {} for everything else,
+         // and for the replies we sent (they are their display text)
+@@ -329,14 +332,23 @@ void MessageModel::messageUpdated(const QString &numbers, const QString &id)
+             return;
+         }
+         const Message message{serializedMessages.front()};
+-        const auto newest = std::find_if(m_messages.cbegin(), m_messages.cend(), [](const Message &m) {
+-            return m.datetime.isValid();
++        if (message.isHiddenResponse()) {
++            return; // a chatbot action's response, not shown while it is not failed
++        }
++        // in its place by time: a failed chatbot response can come after
++        // the bot's next message
++        const auto at = std::find_if(m_messages.begin(), m_messages.end(), [&message](const Message &m) {
++            return m.datetime.isValid() && m.datetime <= message.datetime;
+         });
+-        if (newest != m_messages.cend() && message.datetime < newest->datetime) {
++        if (at == m_messages.end() && std::any_of(m_messages.cbegin(), m_messages.cend(), [](const Message &m) {
++                return m.datetime.isValid();
++            })) {
+             return;
+         }
+-        beginInsertRows({}, m_messages.size(), m_messages.size());
+-        m_messages.insert(m_messages.begin(), message);
++        const int position = static_cast<int>(std::distance(m_messages.begin(), at));
++        const int row = static_cast<int>(m_messages.size()) - position;
++        beginInsertRows({}, row, row);
++        m_messages.insert(m_messages.begin() + position, message);
+         endInsertRows();
+         Q_EMIT m_handler.messagesChanged(m_phoneNumberList);
+         return;
+@@ -403,6 +415,13 @@ void MessageModel::sendSuggestion(const QString &id, const QVariantMap &suggesti
+     }
+ }
+ 
++void MessageModel::resendSuggestionResponse(const QString &id)
++{
++    // the same response again, over RCS only (the daemon keeps it as it went)
++    updateMessageState(id, MessageState::Pending, true);
++    m_handler.interface()->resendSuggestionResponse(id);
++}
++
+ QString MessageModel::calendarFile(const QVariantMap &event) const
+ {
+     // RFC 5545; the times come as ISO 8601 (RCC.07)
+diff --git a/src/messagemodel.h b/src/messagemodel.h
+index b59ba25..7069ed2 100644
+--- a/src/messagemodel.h
++++ b/src/messagemodel.h
+@@ -63,7 +63,8 @@ public:
+         SizeRole,
+         TapbacksRole,
+         TransportRole,
+-        RichRole
++        RichRole,
++        SuggestionResponseRole
+     };
+     Q_ENUM(Role)
+ 
+@@ -152,6 +153,11 @@ public:
+      * response when there is one to send.
+      */
+     Q_INVOKABLE void sendSuggestion(const QString &id, const QVariantMap &suggestion);
++    /**
++     * @brief sends a failed chatbot suggestion response again, exactly as
++     * it went, over RCS only.
++     */
++    Q_INVOKABLE void resendSuggestionResponse(const QString &id);
+     /**
+      * @brief an iCalendar file for a chatbot's createCalendarEvent, to open
+      * with the calendar; "" when it could not be written.
+diff --git a/src/richmedia.cpp b/src/richmedia.cpp
+index 890065c..8b1764f 100644
+--- a/src/richmedia.cpp
++++ b/src/richmedia.cpp
+@@ -9,6 +9,7 @@
+ #include <QFile>
+ #include <QFileInfo>
+ #include <QNetworkAccessManager>
++#include <QNetworkInformation>
+ #include <QNetworkReply>
+ #include <QNetworkRequest>
+ #include <QRegularExpression>
+@@ -16,13 +17,38 @@
+ 
+ #include <global.h>
+ 
++#include <algorithm>
++
+ // Pictures only: a card's video is opened, not fetched.
+ constexpr qint64 MAX_SIZE = 10 * 1024 * 1024;
++// Fetched again on its own when shown: not more often than this, and not
++// after this many failures in a row (a tap always fetches).
++constexpr qint64 RETRY_SECONDS = 30;
++constexpr int MAX_AUTOMATIC = 3;
+ 
+ RichMedia::RichMedia(QNetworkAccessManager *network, QObject *parent)
+     : QObject(parent)
+     , m_network(network)
+ {
++    // The network coming back (NetworkManager and the like tell us; nothing
++    // is polled): what failed may be fetched again. Without a backend,
++    // showing a picture again or a tap still does it.
++    if (QNetworkInformation::loadBackendByFeatures(QNetworkInformation::Feature::Reachability)) {
++        m_reachability = static_cast<int>(QNetworkInformation::instance()->reachability());
++        connect(QNetworkInformation::instance(), &QNetworkInformation::reachabilityChanged, this, [this](QNetworkInformation::Reachability reachability) {
++            // back: online after having been known to be offline, not the
++            // backend's first report (Unknown to Online) when it starts
++            const auto before = static_cast<QNetworkInformation::Reachability>(m_reachability);
++            m_reachability = static_cast<int>(reachability);
++            qDebug() << "RCS chatbot media: network" << before << "->" << reachability;
++            if (reachability == QNetworkInformation::Reachability::Online && before != QNetworkInformation::Reachability::Online
++                && before != QNetworkInformation::Reachability::Unknown) {
++                networkBack();
++            }
++        });
++    } else {
++        qDebug() << "RCS chatbot media: no network information backend, no fetching again when the network is back";
++    }
+ }
+ 
+ QString RichMedia::pathFor(const QString &url, const QString &folder)
+@@ -38,6 +64,22 @@ QString RichMedia::pathFor(const QString &url, const QString &folder)
+ }
+ 
+ QString RichMedia::localFile(const QString &url, const QString &folder)
++{
++    return fetch(url, folder, Reason::Shown);
++}
++
++QString RichMedia::retry(const QString &url, const QString &folder)
++{
++    return fetch(url, folder, Reason::User);
++}
++
++bool RichMedia::failed(const QString &url, const QString &folder) const
++{
++    const QString path = pathFor(url, folder);
++    return m_failed.contains(path) && !m_pending.contains(path);
++}
++
++QString RichMedia::fetch(const QString &url, const QString &folder, Reason reason)
+ {
+     const QUrl remote(url);
+     if (folder.isEmpty() || !remote.isValid() || (remote.scheme() != u"https" && remote.scheme() != u"http") || remote.host().isEmpty()) {
+@@ -47,9 +89,18 @@ QString RichMedia::localFile(const QString &url, const QString &folder)
+     if (QFileInfo::exists(path)) {
+         return QUrl::fromLocalFile(path).toString();
+     }
+-    if (m_pending.contains(path) || m_failed.contains(path)) {
++    if (m_pending.contains(path)) {
+         return {};
+     }
++    const auto failure = m_failed.constFind(path);
++    if (failure != m_failed.constEnd() && reason == Reason::Shown
++        && (failure->count >= MAX_AUTOMATIC || (failure->last.isValid() && failure->last.secsTo(QDateTime::currentDateTimeUtc()) < RETRY_SECONDS))) {
++        return {};
++    }
++    if (failure != m_failed.constEnd() && reason == Reason::User) {
++        // the user asked: the automatic tries start over
++        m_failed[path].count = 0;
++    }
+     m_pending.insert(path);
+ 
+     QNetworkRequest request(remote);
+@@ -72,23 +123,40 @@ void RichMedia::finished(QNetworkReply *reply, const QString &url, const QString
+     reply->deleteLater();
+     m_pending.remove(path);
+     const QByteArray data = reply->error() == QNetworkReply::NoError ? reply->readAll() : QByteArray();
+-    if (data.isEmpty()) {
++    bool stored = false;
++    if (!data.isEmpty()) {
++        QDir().mkpath(QFileInfo(path).absolutePath());
++        QFile file(path + SL(".part"));
++        if (file.open(QIODevice::WriteOnly) && file.write(data) == data.size()) {
++            file.close();
++            QFile::remove(path);
++            stored = QFile::rename(file.fileName(), path);
++        }
++        if (!stored) {
++            QFile::remove(file.fileName());
++        }
++    }
++    if (!stored) {
+         qDebug() << "RCS chatbot media" << url << "not fetched:" << reply->errorString();
+-        m_failed.insert(path);
++        Failure &failure = m_failed[path];
++        failure.count++;
++        failure.last = QDateTime::currentDateTimeUtc();
++        Q_EMIT fetchFailed(url);
+         return;
+     }
+-    QDir().mkpath(QFileInfo(path).absolutePath());
+-    QFile file(path + SL(".part"));
+-    if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) {
+-        m_failed.insert(path);
++    m_failed.remove(path);
++    Q_EMIT fetched(url, QUrl::fromLocalFile(path).toString());
++}
++
++void RichMedia::networkBack()
++{
++    if (m_failed.isEmpty()) {
+         return;
+     }
+-    file.close();
+-    QFile::remove(path);
+-    if (!QFile::rename(file.fileName(), path)) {
+-        QFile::remove(file.fileName());
+-        m_failed.insert(path);
+-        return;
++    // one more try each for what is shown, whenever it failed
++    for (auto &failure : m_failed) {
++        failure.count = std::min(failure.count, MAX_AUTOMATIC - 1);
++        failure.last = QDateTime();
+     }
+-    Q_EMIT fetched(url, QUrl::fromLocalFile(path).toString());
++    Q_EMIT networkAvailable();
+ }
+diff --git a/src/richmedia.h b/src/richmedia.h
+index a49ced9..59a1e9e 100644
+--- a/src/richmedia.h
++++ b/src/richmedia.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <QDateTime>
+ #include <QHash>
+ #include <QObject>
+ #include <QSet>
+@@ -15,6 +16,11 @@ class QNetworkReply;
+  * Pictures of RCS chatbot messages (rich card media and thumbnails, open
+  * rich card images, chatbot icons), fetched over HTTP(S) once and kept in
+  * the conversation's attachment folder under rbm/, named by the URL's hash.
++ *
++ * A picture that did not come is fetched again only when someone asks:
++ * when it is shown again (at most every 30 s, and not after 3 failures in
++ * a row), when the user taps it (always), and when the network comes back
++ * (QNetworkInformation, when a backend is there). Nothing runs meanwhile.
+  */
+ class RichMedia : public QObject
+ {
+@@ -25,19 +31,39 @@ public:
+ 
+     /*
+      * The local file:// URL of url when it is here already. Otherwise ""
+-     * and the download starts; fetched() follows when it is done.
+-     * folder is the conversation's attachment folder.
++     * and the download starts, unless it failed lately (see above);
++     * fetched() or fetchFailed() follows. folder is the conversation's
++     * attachment folder.
+      */
+     Q_INVOKABLE QString localFile(const QString &url, const QString &folder);
++    // The same, asked by the user: fetched again whatever failed before.
++    Q_INVOKABLE QString retry(const QString &url, const QString &folder);
++    // Whether the last try for url failed (the picture shows "tap to retry").
++    Q_INVOKABLE bool failed(const QString &url, const QString &folder) const;
+ 
+ Q_SIGNALS:
+     void fetched(const QString &url, const QString &localUrl);
++    void fetchFailed(const QString &url);
++    // The network is back: pictures that failed may be asked for again.
++    void networkAvailable();
+ 
+ private:
++    struct Failure {
++        int count = 0;
++        QDateTime last;
++    };
++    enum class Reason {
++        Shown,
++        User,
++    };
++
+     static QString pathFor(const QString &url, const QString &folder);
++    QString fetch(const QString &url, const QString &folder, Reason reason);
+     void finished(QNetworkReply *reply, const QString &url, const QString &path);
++    void networkBack();
+ 
+     QNetworkAccessManager *m_network;
+     QSet<QString> m_pending; // paths being fetched
+-    QSet<QString> m_failed; // and those that failed this run, not asked again
++    QHash<QString, Failure> m_failed; // by path
++    int m_reachability = 0; // QNetworkInformation::Reachability, Unknown at first
+ };
+-- 
+2.56.0
+

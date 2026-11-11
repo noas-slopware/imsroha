@@ -52,5 +52,13 @@ Patches, in order:
   bot's name, icon and description, and no input where R9 says the sender takes no
   replies. Needs Qt Network (in qt6-base).
 
-0004-0007 and 0009-0011 are inert without imsroha-rcs on the bus. Build: `cd spacebar && makepkg -sC`
+- `0012-daemon-app-resend-chatbot-responses-as-they-went-fet.patch`: a failed chatbot suggestion response
+  (reply or action) is sent again exactly as it went, through `SendSuggestionResponse`
+  (`resendSuggestionResponse`, the message it answers kept in a new `inReplyTo`
+  column), never as text, SMS or MMS. In a chatbot's conversation nothing RCS was
+  chosen for falls back to SMS or MMS. Chatbot pictures that failed show "tap to
+  retry" and are fetched again when shown again (every 30 s at most, 3 times), when
+  tapped, and when the network comes back (QNetworkInformation); never on a timer.
+
+0004-0007 and 0009-0012 are inert without imsroha-rcs on the bus. Build: `cd spacebar && makepkg -sC`
 (`-C`: 0004 creates a file, so a stale `src/` makes `prepare()` fail).

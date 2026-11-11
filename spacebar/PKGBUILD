@@ -5,12 +5,13 @@
 # (0001-0003), RCS chat (0004-0006), RCS file transfer (0007), sharp
 # attachment images on scaled screens (0008), read reports (0009) and RCS
 # chatbots: rich cards, carousels, open rich cards and suggestions
-# (0010-0011); RCS goes through codes.noa.IMSroha.Rcs when imsroha-rcs runs;
-# without it, SMS and MMS as upstream.
+# (0010-0011), with exact resends and picture retries (0012); RCS goes
+# through codes.noa.IMSroha.Rcs when imsroha-rcs runs; without it, SMS and
+# MMS as upstream.
 
 pkgname=spacebar
 pkgver=6.3.4
-pkgrel=10
+pkgrel=11
 pkgdesc="SMS and messaging application for Mobile Devices running Plasma"
 arch=('x86_64' 'armv7h' 'aarch64')
 url="https://community.kde.org/Plasma/Mobile"
@@ -49,7 +50,8 @@ source=("https://download.kde.org/stable/plasma/$pkgver/$pkgname-$pkgver.tar.xz"
         0008-app-decode-attachment-images-for-the-screen-s-pixels.patch
         0009-daemon-send-RCS-read-reports-for-messages-that-arriv.patch
         0010-daemon-RCS-chatbot-messages-through-IMSroha.patch
-        0011-app-show-RCS-chatbot-messages-their-suggestions-and-.patch)
+        0011-app-show-RCS-chatbot-messages-their-suggestions-and-.patch
+        0012-daemon-app-resend-chatbot-responses-as-they-went-fet.patch)
 sha256sums=('fe1b7c5651baabcf580041cf1616ede4ad434ae84f0838464e9082d1e4f1e633'
             '911e17ce5424becb661f9df69c863557d32b59fc56b76318f62eceb4aad246fe'
             '150c1e68612360d3051c8a2f99337aa100a5f74cb4bca27856c2ba74976df428'
@@ -61,7 +63,8 @@ sha256sums=('fe1b7c5651baabcf580041cf1616ede4ad434ae84f0838464e9082d1e4f1e633'
             '2091af09aa497a4ba3384f35391d1c5257f44e2d764cc10b089305452fe44feb'
             '11a4558f462e47d07c674e77add0a3d6d9c3037bb541886dc9698da623ed3ac9'
             '48e79a4fc315890adb434aa08c602005cf4ab637c22d30c1ebeef35d660a4340'
-            '5e14db8579c4679c073e891e9b599c2748b88163785b174a9029e7c584c7f08d')
+            '5e14db8579c4679c073e891e9b599c2748b88163785b174a9029e7c584c7f08d'
+            '4cbba054d2e7f8e0666bbbd2e6fc95612e41ad6dfb1671f888c77edaa044c151')
 
 prepare() {
   for p in 0001-daemon-close-the-connection-after-every-MMSC-request.patch \
@@ -74,7 +77,8 @@ prepare() {
            0008-app-decode-attachment-images-for-the-screen-s-pixels.patch \
            0009-daemon-send-RCS-read-reports-for-messages-that-arriv.patch \
            0010-daemon-RCS-chatbot-messages-through-IMSroha.patch \
-           0011-app-show-RCS-chatbot-messages-their-suggestions-and-.patch; do
+           0011-app-show-RCS-chatbot-messages-their-suggestions-and-.patch \
+           0012-daemon-app-resend-chatbot-responses-as-they-went-fet.patch; do
     patch -d $pkgname-$pkgver -p1 < $p
   done
 }
