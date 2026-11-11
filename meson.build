@@ -9,6 +9,7 @@ add_project_arguments('-DIMSROHA_VERSION="@0@"'.format(meson.project_version()),
 
 glib = dependency('glib-2.0')
 gio = dependency('gio-2.0')
+gnutls = dependency('gnutls')
 qmi = dependency('qmi-glib', version: '>= 1.36')
 qrtr = dependency('qrtr-glib')
 systemd = dependency('libsystemd')
@@ -32,10 +33,10 @@ executable('imsroha',
 # RCS: its own executable on the internet PDN; nothing above links it.
 rcs_core = static_library('imsroha-rcs-core',
   'src/rcs/rcs_config.c', 'src/rcs/acs.c', 'src/rcs/http.c', 'src/rcs/net.c', 'src/rcs/smsport.c',
-  'src/rcs/sipmsg.c', 'src/rcs/cpim.c', 'src/rcs/msrp.c',
+  'src/rcs/sipmsg.c', 'src/rcs/cpim.c', 'src/rcs/msrp.c', 'src/rcs/cert.c',
   include_directories: include_directories('src'),
   link_with: common,
-  dependencies: [glib, gio])
+  dependencies: [glib, gio, gnutls])
 rcs_inc = include_directories('src', 'src/rcs')
 resolv = cc.find_library('resolv', required: false)
 executable('imsroha-rcs',
@@ -111,6 +112,8 @@ test('esp-loopback', find_program('tests/esp-loopback.sh'),
   depends: golden, is_parallel: false)
 
 # RCS
+test('rcs-cert', executable('rcs-cert', 'tests/rcs/cert.c', link_with: rcs_core,
+  include_directories: rcs_inc, dependencies: [glib, gio], build_by_default: false))
 test('rcs-smsport', executable('rcs-smsport', 'tests/rcs/smsport.c', link_with: rcs_core,
   include_directories: rcs_inc, dependencies: [glib], build_by_default: false))
 rcs_acs_request = executable('rcs-acs-request', 'tests/rcs/acs-request.c', link_with: rcs_core,

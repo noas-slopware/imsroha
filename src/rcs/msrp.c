@@ -409,7 +409,7 @@ void msrp_connect(struct msrp *m)
 	if (!m->cancel)
 		m->cancel = g_cancellable_new();
 	fprintf(stderr, "imsroha-rcs: MSRP to %s:%u over %s\n", m->host, m->port, m->tls ? "TLS" : "TCP");
-	rcs_net_connect_async(m->cfg, m->host, m->port, m->tls, MSRP_CONNECT_TIMEOUT, m->cancel, on_connected, m);
+	rcs_net_connect_async(m->cfg, m->host, m->port, m->tls ? RCS_TLS_CLIENT_CERT : 0, MSRP_CONNECT_TIMEOUT, m->cancel, on_connected, m);
 }
 
 int msrp_send(struct msrp *m, const char *ctype, const char *body, size_t len, int want_report,

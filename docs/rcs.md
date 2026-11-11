@@ -350,6 +350,13 @@ Not done yet, or different from R9's own examples:
   request carries P-Access-Network-Info. imsroha-rcs follows `psMedia` (MSRPoTLS in
   the sample: `msrps://`), puts port 9 in the SDP, offers no session timer and sends no
   P-Access-Network-Info.
+- With MSRPoTLS the MSRP relay wants a client certificate (LG U+'s answers a
+  connection without one with the TLS alert "Certificate is required"). As Samsung's
+  stack does, imsroha-rcs makes a self-signed RSA-2048 certificate for the registered
+  address (CN and SAN URI), keeps it with its key in `<state-dir>/<IMSI>/msrp-cert.pem`
+  (0600), makes a new one 30 days before it expires or when the address changes,
+  presents it on every MSRP connection and names its hash in the SDP
+  (`a=fingerprint:SHA-1 ...`, RFC 4975 14.1).
 - The P-CSCF's certificate is checked against the SRV target when NAPTR/SRV found
   one, against the configured name otherwise.
 

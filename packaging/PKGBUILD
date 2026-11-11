@@ -11,12 +11,12 @@
 
 pkgname=imsroha
 pkgver=0.2.0
-pkgrel=3
+pkgrel=4
 pkgdesc="Userspace IMS: VoLTE calls and SMS over IMS on Qualcomm QMI modems, behind ModemManager"
 arch=('aarch64' 'x86_64')
 url="https://github.com/noas-slopware/imsroha"
 license=('GPL-3.0-only')
-depends=('glib2' 'glib-networking' 'libqmi' 'libqrtr-glib' 'systemd-libs' 'alsa-lib' 'opencore-amr' 'vo-amrwbenc' 'iproute2')
+depends=('glib2' 'glib-networking' 'gnutls' 'libqmi' 'libqrtr-glib' 'systemd-libs' 'alsa-lib' 'opencore-amr' 'vo-amrwbenc' 'iproute2')
 makedepends=('meson' 'gcc' 'pkgconf')
 # The tests need python, openssl, util-linux (unshare) and dbus (dbus-run-session).
 checkdepends=('python' 'openssl' 'util-linux' 'dbus')

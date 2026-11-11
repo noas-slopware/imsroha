@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "net.h"
+#include "cert.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -101,6 +102,13 @@ GIOStream *rcs_net_connect(const struct rcs_config *cfg, const char *host, uint1
 		}
 		g_tls_connection_set_database(G_TLS_CONNECTION(t), db);
 		g_object_unref(db);
+	}
+	if (tls == RCS_TLS_CLIENT_CERT) {
+		GTlsCertificate *cert = rcs_cert_get();
+		if (cert) {
+			g_tls_connection_set_certificate(G_TLS_CONNECTION(t), cert);
+			g_object_unref(cert);
+		}
 	}
 	if (!g_tls_connection_handshake(G_TLS_CONNECTION(t), cancel, error)) {
 		g_prefix_error(error, "TLS with %s: ", host);

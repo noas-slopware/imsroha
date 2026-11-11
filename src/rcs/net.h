@@ -5,6 +5,10 @@
 #include <gio/gio.h>
 #include "rcs_config.h"
 
+/* tls: 0 = plain TCP, 1 = TLS, RCS_TLS_CLIENT_CERT = TLS presenting the MSRP
+ * client certificate (cert.h) when there is one. */
+#define RCS_TLS_CLIENT_CERT 2
+
 /*
  * Every RCS connection: TCP to host:port, bound to [rcs] interface= (and
  * interface-ipv4= for IPv4) when set, then TLS when asked for, with the

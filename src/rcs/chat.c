@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "cpim.h"
+#include "cert.h"
 #include "msrp.h"
 #include "rcsd.h"
 #include "sipua.h"
@@ -132,6 +133,19 @@ static char *sdp(struct chat *c)
 	struct sipua *ua = c->r->ua;
 	const char *ip = sipua_local_ip(ua);
 	int v6 = sipua_local_v6(ua);
+	int tls = sipua_msrp_tls(ua);
+	char fp[96] = "";
+	if (tls) {
+		/* MSRPoTLS: the client certificate's hash (RFC 4975 14.1, RFC 8122) */
+		char *dir = g_build_filename(c->r->cfg.state_dir, c->r->id.imsi, NULL);
+		GError *e = NULL;
+		if (rcs_cert_ensure(dir, sipua_impu(ua), &e) == 0)
+			snprintf(fp, sizeof(fp), "a=fingerprint:%s\r\n", rcs_cert_fingerprint());
+		else
+			fprintf(stderr, "imsroha-rcs: %s\n", e->message);
+		g_clear_error(&e);
+		g_free(dir);
+	}
 	char *s = g_strdup_printf(
 		"v=0\r\n"
 		"o=- %u %u IN %s %s\r\n"
@@ -143,9 +157,10 @@ static char *sdp(struct chat *c)
 		"a=accept-types:message/cpim application/im-iscomposing+xml\r\n"
 		"a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml\r\n"
 		"a=setup:active\r\n"
+		"%s"
 		"a=sendrecv\r\n",
 		g_random_int(), 1u, v6 ? "IP6" : "IP4", ip, v6 ? "IP6" : "IP4", ip,
-		sipua_msrp_tls(ua) ? "TCP/TLS/MSRP" : "TCP/MSRP", c->local_path);
+		tls ? "TCP/TLS/MSRP" : "TCP/MSRP", c->local_path, fp);
 	return s;
 }
 
