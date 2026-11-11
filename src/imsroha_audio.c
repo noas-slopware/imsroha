@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
 /*
- * b2q-ims-audio: call audio for b2q-imsd, run in the user's session.
+ * imsroha-audio: call audio for imsroha, run in the user's session.
  *
- * b2q-imsd (a system service) keeps RTP and AMR-WB and exchanges 20 ms PCM
- * frames with this process over /run/b2q-imsd/audio.sock (see audio.h for
+ * imsroha (a system service) keeps RTP and AMR-WB and exchanges 20 ms PCM
+ * frames with this process over /run/imsroha/audio.sock (see audio.h for
  * the protocol). Here the frames go to and from PipeWire through the ALSA
  * "pipewire" PCM, so WirePlumber and callaudiod route them like any other
  * call audio. Nothing is opened between calls.
@@ -33,8 +33,8 @@
 #define FRAME_BYTES (FRAME * 2)
 #define LATENCY_US 60000 /* three frames of ALSA buffer each way */
 
-static const char *sock_dir = "/run/b2q-imsd";
-static const char *sock_path = "/run/b2q-imsd/audio.sock";
+static const char *sock_dir = "/run/imsroha";
+static const char *sock_path = "/run/imsroha/audio.sock";
 /*
  * "pipewire", not "default": if the ALSA config ever stopped pointing default
  * at PipeWire, default would open the sound card directly and take it away
@@ -116,10 +116,10 @@ static void try_open(void)
 	open_tries++;
 	open_next_ms = now_ms() + OPEN_RETRY_MS;
 	if (play && cap)
-		fprintf(stderr, "b2q-ims-audio: call audio on (playback ok, capture ok%s)\n",
+		fprintf(stderr, "imsroha-audio: call audio on (playback ok, capture ok%s)\n",
 			open_tries > 1 ? ", after retrying" : "");
 	else if (!open_pending())
-		fprintf(stderr, "b2q-ims-audio: call audio on (playback %s, capture %s): %s %s\n",
+		fprintf(stderr, "imsroha-audio: call audio on (playback %s, capture %s): %s %s\n",
 			play ? "ok" : "none", cap ? "ok" : "none", pcm_name, snd_strerror(open_err));
 }
 
@@ -146,7 +146,7 @@ static void call_end(void)
 		cap = NULL;
 	}
 	up_fill = 0;
-	fprintf(stderr, "b2q-ims-audio: call audio off\n");
+	fprintf(stderr, "imsroha-audio: call audio off\n");
 }
 
 static void downlink(const int16_t *pcm)
@@ -196,7 +196,7 @@ static int try_connect(void)
 		close(fd);
 		return -1;
 	}
-	fprintf(stderr, "b2q-ims-audio: connected to %s\n", sock_path);
+	fprintf(stderr, "imsroha-audio: connected to %s\n", sock_path);
 	return fd;
 }
 
@@ -204,7 +204,7 @@ static int try_connect(void)
  * Wait until the socket can be connected: inotify on its directory for a new
  * socket, and on the parent for the directory itself appearing. With
  * connect_now unset (after a disconnect) the first attempt waits for an event
- * too: b2q-imsd re-creates the socket when it restarts, and connecting again
+ * too: imsroha re-creates the socket when it restarts, and connecting again
  * right away to a daemon that just dropped us would only spin.
  */
 static int wait_for_socket(int connect_now)
@@ -304,13 +304,13 @@ int main(void)
 	setvbuf(stderr, NULL, _IOLBF, 0);
 
 	/* Overrides for testing against a stand-in imsd and a non-PipeWire PCM. */
-	if ((e = getenv("B2Q_IMS_AUDIO_DIR")) && *e) {
+	if ((e = getenv("IMSROHA_AUDIO_DIR")) && *e) {
 		static char path[256];
 		sock_dir = e;
 		snprintf(path, sizeof(path), "%s/audio.sock", e);
 		sock_path = path;
 	}
-	if ((e = getenv("B2Q_IMS_AUDIO_PCM")) && *e)
+	if ((e = getenv("IMSROHA_AUDIO_PCM")) && *e)
 		pcm_name = e;
 
 	int first = 1;
@@ -324,7 +324,7 @@ int main(void)
 		call_end();
 		close(sock);
 		sock = -1;
-		fprintf(stderr, "b2q-ims-audio: b2q-imsd disconnected\n");
+		fprintf(stderr, "imsroha-audio: imsroha disconnected\n");
 	}
 	return 0;
 }

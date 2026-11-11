@@ -1,20 +1,20 @@
 From c0db057852025f2f9bfd0f0869b428846d48a830 Mon Sep 17 00:00:00 2001
 From: Noa Himesaka <himesaka@noa.codes>
 Date: Tue, 10 Nov 2026 11:25:57 +0900
-Subject: [PATCH] call-ims: send DTMF through b2q-imsd
+Subject: [PATCH] call-ims: send DTMF through imsroha
 
 MMCallIms implemented start, accept and hangup but no send_dtmf, so
 every Call.SendDtmf on an IMS call failed with "Sending dtmf is not
 supported by this modem" before reaching the IMS daemon.
 
-Forward the digits to org.b2q.Imsd.SendDtmf with the call's index.
-b2q-imsd queues them and sends RFC 4733 telephone-event packets on the
+Forward the digits to codes.noa.IMSroha.SendDtmf with the call's index.
+imsroha queues them and sends RFC 4733 telephone-event packets on the
 call's RTP stream, at the clock of the speech codec in use, and refuses
 when the far end did not negotiate telephone-event for that clock.
 ---
  src/mm-call-ims.c        | 63 ++++++++++++++++++++++++++++++++++++++++
- src/mm-ims-backend-b2q.c | 60 ++++++++++++++++++++++++++++++++++++++
- src/mm-ims-backend-b2q.h | 10 +++++++
+ src/mm-ims-backend-imsroha.c | 60 ++++++++++++++++++++++++++++++++++++++
+ src/mm-ims-backend-imsroha.h | 10 +++++++
  3 files changed, 133 insertions(+)
 
 diff --git a/src/mm-call-ims.c b/src/mm-call-ims.c
@@ -37,13 +37,13 @@ index f42c9b7..f35d7a5 100644
 +}
 +
 +static void
-+send_dtmf_ready (MMImsBackendB2q *backend,
++send_dtmf_ready (MMImsBackendImsroha *backend,
 +                 GAsyncResult    *res,
 +                 GTask           *task)
 +{
 +    GError *error = NULL;
 +
-+    if (!mm_ims_backend_b2q_send_dtmf_finish (backend, res, &error))
++    if (!mm_ims_backend_imsroha_send_dtmf_finish (backend, res, &error))
 +        g_task_return_error (task, error);
 +    else
 +        g_task_return_boolean (task, TRUE);
@@ -57,7 +57,7 @@ index f42c9b7..f35d7a5 100644
 +                gpointer             user_data)
 +{
 +    MMBroadbandModemQmi *modem = NULL;
-+    MMImsBackendB2q     *backend = NULL;
++    MMImsBackendImsroha     *backend = NULL;
 +    GTask               *task;
 +    guint                call_id;
 +
@@ -67,9 +67,9 @@ index f42c9b7..f35d7a5 100644
 +    g_object_get (self, MM_BASE_CALL_MODEM, &modem, NULL);
 +    if (modem) {
 +        backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
-+        if (backend && mm_ims_backend_b2q_is_available (backend)) {
++        if (backend && mm_ims_backend_imsroha_is_available (backend)) {
 +            mm_obj_dbg (self, "sending DTMF on IMS call %u", call_id);
-+            mm_ims_backend_b2q_send_dtmf (backend,
++            mm_ims_backend_imsroha_send_dtmf (backend,
 +                                          call_id,
 +                                          dtmf,
 +                                          NULL,
@@ -96,16 +96,16 @@ index f42c9b7..f35d7a5 100644
 +    base_call_class->send_dtmf = call_send_dtmf;
 +    base_call_class->send_dtmf_finish = call_send_dtmf_finish;
  }
-diff --git a/src/mm-ims-backend-b2q.c b/src/mm-ims-backend-b2q.c
+diff --git a/src/mm-ims-backend-imsroha.c b/src/mm-ims-backend-imsroha.c
 index f58dc26..0520572 100644
---- a/src/mm-ims-backend-b2q.c
-+++ b/src/mm-ims-backend-b2q.c
-@@ -622,6 +622,66 @@ mm_ims_backend_b2q_hangup_call_finish (MMImsBackendB2q  *self,
+--- a/src/mm-ims-backend-imsroha.c
++++ b/src/mm-ims-backend-imsroha.c
+@@ -622,6 +622,66 @@ mm_ims_backend_imsroha_hangup_call_finish (MMImsBackendImsroha  *self,
      return g_task_propagate_boolean (G_TASK (res), error);
  }
  
 +/*****************************************************************************/
-+/* DTMF: b2q-imsd sends the digits as RFC 4733 telephone-event packets on the
++/* DTMF: imsroha sends the digits as RFC 4733 telephone-event packets on the
 + * call's RTP stream. */
 +
 +static void
@@ -125,7 +125,7 @@ index f58dc26..0520572 100644
 +}
 +
 +void
-+mm_ims_backend_b2q_send_dtmf (MMImsBackendB2q    *self,
++mm_ims_backend_imsroha_send_dtmf (MMImsBackendImsroha    *self,
 +                              guint32             call_id,
 +                              const gchar        *dtmf,
 +                              GCancellable       *cancellable,
@@ -143,9 +143,9 @@ index f58dc26..0520572 100644
 +    }
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "SendDtmf",
 +                            g_variant_new ("(us)", call_id, dtmf),
 +                            G_VARIANT_TYPE ("()"),
@@ -157,7 +157,7 @@ index f58dc26..0520572 100644
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_send_dtmf_finish (MMImsBackendB2q  *self,
++mm_ims_backend_imsroha_send_dtmf_finish (MMImsBackendImsroha  *self,
 +                                     GAsyncResult     *res,
 +                                     GError          **error)
 +{
@@ -167,25 +167,25 @@ index f58dc26..0520572 100644
  /*****************************************************************************/
  /* SMS methods */
  
-diff --git a/src/mm-ims-backend-b2q.h b/src/mm-ims-backend-b2q.h
+diff --git a/src/mm-ims-backend-imsroha.h b/src/mm-ims-backend-imsroha.h
 index 66d046e..fddd461 100644
---- a/src/mm-ims-backend-b2q.h
-+++ b/src/mm-ims-backend-b2q.h
-@@ -83,6 +83,16 @@ gboolean mm_ims_backend_b2q_hangup_call_finish (MMImsBackendB2q  *self,
+--- a/src/mm-ims-backend-imsroha.h
++++ b/src/mm-ims-backend-imsroha.h
+@@ -83,6 +83,16 @@ gboolean mm_ims_backend_imsroha_hangup_call_finish (MMImsBackendImsroha  *self,
                                                  GAsyncResult     *res,
                                                  GError          **error);
  
-+void mm_ims_backend_b2q_send_dtmf (MMImsBackendB2q    *self,
++void mm_ims_backend_imsroha_send_dtmf (MMImsBackendImsroha    *self,
 +                                   guint32             call_id,
 +                                   const gchar        *dtmf,
 +                                   GCancellable       *cancellable,
 +                                   GAsyncReadyCallback callback,
 +                                   gpointer            user_data);
-+gboolean mm_ims_backend_b2q_send_dtmf_finish (MMImsBackendB2q  *self,
++gboolean mm_ims_backend_imsroha_send_dtmf_finish (MMImsBackendImsroha  *self,
 +                                              GAsyncResult     *res,
 +                                              GError          **error);
 +
- void mm_ims_backend_b2q_send_sms (MMImsBackendB2q    *self,
+ void mm_ims_backend_imsroha_send_sms (MMImsBackendImsroha    *self,
                                    const gchar        *number,
                                    const gchar        *text,
 -- 

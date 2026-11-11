@@ -1,0 +1,34 @@
+[Unit]
+Description=IMSroha, userspace IMS (SIP over the modem's IMS PDN)
+Documentation=https://github.com/noas-slopware/imsroha
+# imsroha binds its SIP socket to the IMS address once, at start. The bearer
+# is Type=notify and only goes active once that address exists. It Upholds=
+# this unit and propagates its stop here, so every new PDN gets a fresh
+# imsroha and a fresh REGISTER. Requisite=, not BindsTo=: starting imsroha
+# must never start the bearer, or it would cut the bearer's RestartSec= short.
+After=imsroha-bearer.service dbus.socket
+Requisite=imsroha-bearer.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/imsroha
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+# /var/lib/imsroha/inbox: MT-SMS PDUs stored before the RP-ACK and kept
+# until ModemManager acknowledges them (AckPdu).
+StateDirectory=imsroha
+StateDirectoryMode=0700
+# /run/imsroha: the bearer's pdn hand-off, and audio.sock (root:audio 0660)
+# for imsroha-audio in the user session. Kept across restarts so the
+# bridge's inotify watch stays valid.
+RuntimeDirectory=imsroha
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+# Speaks QMI to the modem, binds to the IMS PDN and installs IPsec SAs, so it
+# runs as root and is not confined: no sandbox directive may hide /dev, /run
+# or the network namespace from it.
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

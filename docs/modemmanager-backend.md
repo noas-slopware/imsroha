@@ -1,4 +1,6 @@
-# Phase 1.5: ModemManager backend switch for b2q-imsd
+# Phase 1.5: ModemManager backend switch for imsroha
+
+> Written while imsroha was `userspace/imsd` in [linux-zflip3](https://github.com/noas-slopware/linux-zflip3), as `b2q-imsd`. Names and paths below are the ones of that time; the generic replacements are in the README.
 
 Design only. No ModemManager source lives in this repo and nothing here is applied to
 one. The goal is that plasma-dialer and spacebar keep speaking only

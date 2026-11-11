@@ -1,23 +1,23 @@
 # Maintainer: Noa Himesaka <himesaka@noa.codes>
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-3.0-only
+# (this recipe; ModemManager and the patches to it are GPL-2.0-or-later)
 #
-# ModemManager 1.24.2 for the b2q aarch64 rootfs with the b2q IMS backend, the
-# bearer-count crash fix, IMS DTMF and the kept IPA QMAP path from this directory
-# (see README.md; 0002 is kept for reference and not applied).
+# ModemManager 1.24.2 with the IMSroha backend (voice and messaging handed to
+# imsroha over D-Bus), the bearer-count crash fix, IMS DTMF, the kept IPA QMAP
+# path and per-carrier SMS (SKT keeps SMS on the modem), all from this directory (see README.md; 0002 is kept for
+# reference and not applied).
 #
-# Build on the phone as the unprivileged `build` user, from this directory:
+#   makepkg -s
 #
-#   su build -c 'cd /home/build/modmgr-links && makepkg -s --noconfirm'
-#
-# Then install the resulting package as root with `pacman -U`. pkgrel is above
-# the ports repo's and above the previous local build, so this build wins.
+# Install the result with `pacman -U`. pkgrel is above the Arch package's, so
+# this build wins. The udev rule that enables the backend ships with imsroha.
 
 pkgname=modemmanager
 pkgver=1.24.2
-pkgrel=13
-pkgdesc="Mobile broadband modem management service with b2q IMS support"
+pkgrel=14
+pkgdesc="Mobile broadband modem management service with IMSroha (userspace IMS) support"
 url="https://www.freedesktop.org/wiki/Software/ModemManager/"
-arch=(aarch64)
+arch=(aarch64 x86_64)
 license=(GPL-2.0-or-later)
 depends=(
   bash
@@ -45,27 +45,28 @@ makedepends=(
 )
 source=(
   "git+https://gitlab.freedesktop.org/mobile-broadband/ModemManager.git#tag=${pkgver}"
-  "0001-broadband-modem-qmi-add-b2q-imsd-backend-for-voice-a.patch"
+  "0001-broadband-modem-qmi-add-imsroha-backend-for-voice-and-messaging.patch"
   "0003-iface-modem-do-not-abort-when-the-bearer-count-exceeds.patch"
-  "0004-call-ims-send-DTMF-through-b2q-imsd.patch"
+  "0004-call-ims-send-DTMF-through-imsroha.patch"
   "0005-port-qmi-keep-the-IPA-QMAP-data-path-when-another-PDN.patch"
-  "99-b2q-ims.rules"
+  "0006-broadband-modem-qmi-leave-SMS-with-the-modem-where-the-carrier-has-no-SMS-over-IP.patch"
 )
 b2sums=(
   'SKIP'
-  '1de21071ec6c46ee006b15a93c44d43739ee92263e10a71d5c71d2211f63756ef1a1fe98ef900ba752f18fa9b71966a1e284d24524ad830628a4efce90788e4d'
+  'd904e1cf6ba3268d9a5330c0157282674cc0d6f2e35e3233e954f09235bdd27911144ffb3169649f18038927d49d39d7f44d6ec3733237298d7375adfff8135a'
   '24bb2494310c45f5ef27a447e8530375741daf32f20f3c396d281143b44e93a6b1d85b3f65e28520f5ac0a115142d33a94877612db9a2dd7e8d3a2075bfef3bf'
-  'c3dd4b0417a7a0c782b1c1e79ef57310df7679a07d6804736d59467ca0049ebf0e7b3ac89f0397bedf04658c31e3d6bef6cc2b49d54a6d7172bded0bc7721f3c'
-  '2fd535c70f54c0d416a5b2595cad1ca1c75049e3106d6e0b3b2ac6b59bf179fdacdb85a5febe5ae3e9e6bb5d88e22f7fd01e5ebb09fe95ce2b90f3dff702bf4c'
-  '0130853c9a69fd39f8d159e1964dea4f82ae21ccefea5e0f8a7b4d9d92d6fc626b182fc07490df1f1831d6a82539408231d168dd59dd99ba02f24427e036bde4'
+  '7bb38fde31fc5b8bb069e6c28afca042c071b12d865abca48111b838d0f3a8abae6b5940e1b287e8f7a30980d4fffce47a6f0f9322ea7b8b298cccf8b81a6645'
+  'e215477136dac72d1ee429ee7297815ba35ed42d7c9c2ad125a0c4aee5f32e8a1965b69ffb0c70afab0cfaa4a85021c910cb7f4912fdeae1f8226b4068d8db67'
+  '5a149bff976d549eb6e4195ab6fa97e05fd0166c8cec1fe52d3fa5e8b269b978e696a5e4b33fd587ffadca69b7ab1a06d9e4b33a056f605bda9939bb3e957c42'
 )
 
 prepare() {
   cd ModemManager
-  git apply "$srcdir/0001-broadband-modem-qmi-add-b2q-imsd-backend-for-voice-a.patch"
+  git apply "$srcdir/0001-broadband-modem-qmi-add-imsroha-backend-for-voice-and-messaging.patch"
   git apply "$srcdir/0003-iface-modem-do-not-abort-when-the-bearer-count-exceeds.patch"
-  git apply "$srcdir/0004-call-ims-send-DTMF-through-b2q-imsd.patch"
+  git apply "$srcdir/0004-call-ims-send-DTMF-through-imsroha.patch"
   git apply "$srcdir/0005-port-qmi-keep-the-IPA-QMAP-data-path-when-another-PDN.patch"
+  git apply "$srcdir/0006-broadband-modem-qmi-leave-SMS-with-the-modem-where-the-carrier-has-no-SMS-over-IP.patch"
 }
 
 build() {
@@ -91,5 +92,4 @@ package() {
   rm -rf "$pkgdir"/usr/lib/girepository-1.0
   rm -rf "$pkgdir"/usr/share/gir-1.0
 
-  install -Dm644 "$srcdir/99-b2q-ims.rules" "$pkgdir/usr/lib/udev/rules.d/99-b2q-ims.rules"
 }

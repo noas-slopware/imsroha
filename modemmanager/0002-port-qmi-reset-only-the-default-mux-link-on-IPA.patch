@@ -5,7 +5,7 @@ The IPA data path carries more than ModemManager's default PDN. On b2q the
 IMS bearer keeps profile 4 on mux id 3 as qmapmux0.3, on the same rmnet_ipa0
 parent. The internal reset brought the parent down and deleted every link
 found on it, so every ModemManager restart destroyed the IMS link and
-b2q-imsd deregistered.
+imsroha deregistered.
 
 For the ipa net driver, skip the parent link reset and delete only
 qmapmux0.0, the default link ModemManager recreates. A missing link is not

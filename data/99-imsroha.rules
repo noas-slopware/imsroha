@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-only
+ACTION!="add|change", GOTO="imsroha_rules_end"
+
+# The IMS PDN's rmnet link belongs to imsroha-bearer: ModemManager must not
+# take it as a data port. ims-netdev= in imsroha.conf names it (default imsroha0).
+SUBSYSTEM=="net", KERNEL=="imsroha*", ENV{ID_MM_PORT_IGNORE}="1"
+
+# ModemManager hands voice and messaging to imsroha on modems with this tag.
+# Qualcomm SoC modems get it here; for a USB or PCIe modem, add a rule that
+# sets ID_MM_IMSROHA=1 on its ports.
+ENV{ID_MM_QCOM_SOC}=="1", ENV{ID_MM_IMSROHA}="1"
+
+LABEL="imsroha_rules_end"

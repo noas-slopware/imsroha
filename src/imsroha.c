@@ -1,8 +1,10 @@
-/* b2q-imsd — IMS daemon for Samsung Galaxy Z Flip3 (SM-F711N)
+// SPDX-License-Identifier: GPL-3.0-only
+/* imsroha — userspace IMS for Linux phones with Qualcomm QMI modems
  *
- * Implements 3GPP SIP registration (ISIM AKA), SMS over IMS (3GPP TS 24.011),
+ * Implements 3GPP SIP registration (IMS AKA on the ISIM or the USIM), SMS
+ * over IMS (TS 24.341 / 24.011),
  * and VoLTE voice signaling. Standard dialer/SMS apps talk to ModemManager;
- * MM delegates voice/messaging to this daemon over D-Bus (org.b2q.Imsd).
+ * MM delegates voice/messaging to this daemon over D-Bus (codes.noa.IMSroha).
  *
  * Event-driven only: sd-event + sd-bus. No polls, no sleeps.
  */
@@ -98,7 +100,7 @@ static int method_answer_call(sd_bus_message *m, void *userdata,
 		return sd_bus_error_setf(ret_error, SD_BUS_ERROR_FAILED,
 					 "call %u is not ringing", call_id);
 
-	fprintf(stderr, "b2q-imsd: answering call %u\n", call_id);
+	fprintf(stderr, "imsroha: answering call %u\n", call_id);
 	r = imsd_sip_answer_call(&sip_ctx);
 	if (r < 0)
 		return sd_bus_error_setf(ret_error, SD_BUS_ERROR_FAILED, "failed to answer call: %d", r);
@@ -196,7 +198,7 @@ static int on_signal(sd_event_source *s, const struct signalfd_siginfo *si, void
 {
 	(void)s; (void)si;
 	sd_event *event = userdata;
-	fprintf(stderr, "b2q-imsd: caught exit signal, stopping...\n");
+	fprintf(stderr, "imsroha: caught exit signal, stopping...\n");
 	sd_event_exit(event, 0);
 	return 0;
 }
@@ -213,7 +215,7 @@ int main(int argc, char **argv)
 
 	int r = sd_event_default(&event);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: sd_event_default failed: %d\n", r);
+		fprintf(stderr, "imsroha: sd_event_default failed: %d\n", r);
 		return 1;
 	}
 
@@ -227,48 +229,48 @@ int main(int argc, char **argv)
 
 	r = sd_bus_open_system(&bus);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: sd_bus_open_system failed: %d\n", r);
+		fprintf(stderr, "imsroha: sd_bus_open_system failed: %d\n", r);
 		goto done;
 	}
 
 	r = sd_bus_add_object_vtable(bus, NULL, IMSD_BUS_PATH,
 				     IMSD_BUS_NAME, imsd_vtable, NULL);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: sd_bus_add_object_vtable failed: %d\n", r);
+		fprintf(stderr, "imsroha: sd_bus_add_object_vtable failed: %d\n", r);
 		goto done;
 	}
 
 	r = sd_bus_request_name(bus, IMSD_BUS_NAME, 0);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: sd_bus_request_name failed: %d\n", r);
+		fprintf(stderr, "imsroha: sd_bus_request_name failed: %d\n", r);
 		goto done;
 	}
 
 	r = sd_bus_attach_event(bus, event, 0);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: sd_bus_attach_event failed: %d\n", r);
+		fprintf(stderr, "imsroha: sd_bus_attach_event failed: %d\n", r);
 		goto done;
 	}
 
 	/* Call audio goes to the user session; SMS works without it. */
 	r = imsd_audio_init(event);
 	if (r < 0)
-		fprintf(stderr, "b2q-imsd: no call audio socket: %s\n", strerror(-r));
+		fprintf(stderr, "imsroha: no call audio socket: %s\n", strerror(-r));
 
 	/* Before REGISTER: nothing may be acknowledged until it can be stored. */
 	r = imsd_inbox_init();
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: cannot open the inbox: %d\n", r);
+		fprintf(stderr, "imsroha: cannot open the inbox: %d\n", r);
 		goto done;
 	}
 
 	r = imsd_sip_init(&sip_ctx, event, bus);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: imsd_sip_init failed: %d\n", r);
+		fprintf(stderr, "imsroha: imsd_sip_init failed: %d\n", r);
 		goto done;
 	}
 
-	fprintf(stderr, "b2q-imsd: daemon running on %s\n", IMSD_BUS_NAME);
+	fprintf(stderr, "imsroha: daemon running on %s\n", IMSD_BUS_NAME);
 	r = sd_event_loop(event);
 	ret = (r < 0) ? 1 : 0;
 

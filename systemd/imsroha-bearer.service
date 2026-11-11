@@ -1,0 +1,38 @@
+[Unit]
+Description=IMSroha IMS PDN bearer
+Documentation=https://github.com/noas-slopware/imsroha
+# Samsung modems hold the IMS PDN back until their IMS registration is
+# ungated; the helper exits at once on any other modem.
+Wants=imsroha-vss-samsung.service
+After=imsroha-vss-samsung.service
+Before=imsroha.service
+# The modem answers Start Network with OutOfCall until it has attached, so the
+# first try at boot fails and exits nonzero. Retry every 5 s, backing off to
+# 15 s, and never give up: without this bearer there are no calls and no SMS.
+StartLimitIntervalSec=0
+# imsroha binds to the address of this PDN. Upholds= starts it whenever the
+# bearer is active (READY=1, not while waiting to restart), PropagatesStopTo=
+# stops it whenever the bearer goes down, crashes included. imsroha only has
+# Requisite= on the bearer, so nothing on its side can start the bearer early
+# and cut RestartSec= short.
+Upholds=imsroha.service
+PropagatesStopTo=imsroha.service
+
+[Service]
+# READY=1 is sent once the link carries the IMS address and
+# $RUNTIME_DIRECTORY/pdn names it. The process exits nonzero when the PDN
+# drops, the modem goes away or the link is deleted.
+Type=notify
+ExecStart=/usr/bin/imsroha-bearer
+Restart=on-failure
+RestartSec=5
+RestartSteps=2
+RestartMaxDelaySec=15
+# Shared with imsroha (the pdn hand-off and the call audio socket).
+RuntimeDirectory=imsroha
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

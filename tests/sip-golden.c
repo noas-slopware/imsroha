@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
 /*
  * Golden-output test for the SIP layer. It includes sip.c, stubs the modem,
  * audio and inbox, plays a fake P-CSCF on loopback and writes every message
@@ -31,6 +31,7 @@ int imsd_aka_run_isim(const struct imsd_aka_challenge *ch, struct imsd_aka_resul
 }
 
 int imsd_isim_read_identity(struct imsd_isim_identity *id) { (void)id; return -ENOSYS; }
+void imsroha_sim_set_device(const struct imsroha_device *dev) { (void)dev; }
 int imsd_audio_init(sd_event *e) { (void)e; return 0; }
 void imsd_audio_call_start(void) {}
 void imsd_audio_call_end(void) {}

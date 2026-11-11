@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
 #define _GNU_SOURCE /* accept4 */
 #include "audio.h"
 
@@ -63,7 +63,7 @@ static int on_client(sd_event_source *s, int fd, uint32_t revents, void *userdat
 	(void)userdata;
 
 	if (revents & (EPOLLHUP | EPOLLERR)) {
-		fprintf(stderr, "b2q-imsd: audio client disconnected\n");
+		fprintf(stderr, "imsroha: audio client disconnected\n");
 		drop_client();
 		return 0;
 	}
@@ -77,7 +77,7 @@ static int on_client(sd_event_source *s, int fd, uint32_t revents, void *userdat
 			return 0;
 		}
 		if (n == 0) {
-			fprintf(stderr, "b2q-imsd: audio client disconnected\n");
+			fprintf(stderr, "imsroha: audio client disconnected\n");
 			drop_client();
 			return 0;
 		}
@@ -110,7 +110,7 @@ static int on_accept(sd_event_source *s, int fd, uint32_t revents, void *userdat
 	 * off in a loop. The refused client waits for the socket to be re-created.
 	 */
 	if (client_fd >= 0) {
-		fprintf(stderr, "b2q-imsd: audio client refused, one is already connected\n");
+		fprintf(stderr, "imsroha: audio client refused, one is already connected\n");
 		close(c);
 		return 0;
 	}
@@ -119,7 +119,7 @@ static int on_accept(sd_event_source *s, int fd, uint32_t revents, void *userdat
 		drop_client();
 		return 0;
 	}
-	fprintf(stderr, "b2q-imsd: audio client connected\n");
+	fprintf(stderr, "imsroha: audio client connected\n");
 	if (in_call)
 		send_ctl('S');
 	return 0;
@@ -127,13 +127,13 @@ static int on_accept(sd_event_source *s, int fd, uint32_t revents, void *userdat
 
 int imsd_audio_init(sd_event *event)
 {
-	/* systemd sets RUNTIME_DIRECTORY from RuntimeDirectory=b2q-imsd. */
+	/* systemd sets RUNTIME_DIRECTORY from RuntimeDirectory=imsroha. */
 	const char *dir = getenv("RUNTIME_DIRECTORY");
 	struct sockaddr_un sa = { .sun_family = AF_UNIX };
 	char *path = sock_path;
 
 	if (!dir || !*dir)
-		dir = "/run/b2q-imsd";
+		dir = "/run/imsroha";
 	if ((size_t)snprintf(path, sizeof(sock_path), "%s/" SOCK_NAME, dir) >= sizeof(sock_path))
 		return -ENAMETOOLONG;
 	if (mkdir(dir, 0755) < 0 && errno != EEXIST)
@@ -156,7 +156,7 @@ int imsd_audio_init(sd_event *event)
 	/* The user session's audio bridge connects as a member of "audio". */
 	struct group *g = getgrnam("audio");
 	if (!g || chown(path, 0, g->gr_gid) < 0 || chmod(path, 0660) < 0)
-		fprintf(stderr, "b2q-imsd: cannot hand %s to group audio: %m\n", path);
+		fprintf(stderr, "imsroha: cannot hand %s to group audio: %m\n", path);
 
 	return sd_event_add_io(ev, NULL, listen_fd, EPOLLIN, on_accept, NULL);
 }
@@ -166,7 +166,7 @@ void imsd_audio_call_start(void)
 	in_call = 1;
 	up_head = up_count = 0;
 	if (client_fd < 0)
-		fprintf(stderr, "b2q-imsd: no audio client in the user session, call has no audio\n");
+		fprintf(stderr, "imsroha: no audio client in the user session, call has no audio\n");
 	send_ctl('S');
 }
 

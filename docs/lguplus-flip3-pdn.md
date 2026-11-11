@@ -1,4 +1,6 @@
-# IMS PDN values baked into b2q-imsd
+# The IMS PDN as recorded on the Galaxy Z Flip3 (LG U+)
+
+> Written while imsroha was `userspace/imsd` in [linux-zflip3](https://github.com/noas-slopware/linux-zflip3), as `b2q-imsd`. Names and paths below are the ones of that time; the generic replacements are in the README.
 
 Source: ModemManager debug logs captured read-only on 2026-11-07 22:16 (same boot,
 no disconnect) plus the `ims_bearer.py` holder's logged `Get Current Settings` result.

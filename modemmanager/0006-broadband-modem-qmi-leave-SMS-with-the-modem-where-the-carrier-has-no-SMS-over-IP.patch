@@ -1,0 +1,186 @@
+From 76f11e169e6da34a735cc5f92bf22f7ff5e9e498 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 12:30:06 +0900
+Subject: [PATCH] broadband-modem-qmi: leave SMS with the modem where the
+ carrier has no SMS over IP
+
+imsroha hands Voice and Messaging to the IMS backend together, but not
+every carrier carries SMS over IMS: SKT registers mmtel only and keeps
+SMS on its CS/SGs path, which the modem does by itself over WMS.
+
+Read the carrier from imsroha's own profiles: the group in
+/usr/share/imsroha/carriers.conf whose plmn= list holds the SIM's
+operator identifier decides with sms-over-ip=, and [carrier]
+sms-over-ip= in /etc/imsroha/imsroha.conf overrides it. When it says
+false, every messaging hook takes the plain QMI path; voice stays with
+imsroha. With no SIM operator yet, no profile or no key, SMS stays with
+imsroha as before, and the answer is only cached once the SIM has
+named its operator.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQudVXGNFPydQSwgEs
+---
+ src/mm-broadband-modem-qmi.c | 78 ++++++++++++++++++++++++++++++++----
+ src/mm-broadband-modem-qmi.h |  1 +
+ 2 files changed, 72 insertions(+), 7 deletions(-)
+
+diff --git a/src/mm-broadband-modem-qmi.c b/src/mm-broadband-modem-qmi.c
+index caf6002..a8fc8d3 100644
+--- a/src/mm-broadband-modem-qmi.c
++++ b/src/mm-broadband-modem-qmi.c
+@@ -188,6 +188,8 @@ struct _MMBroadbandModemQmiPrivate {
+     /* IMSroha backend */
+     gboolean imsroha_checked;
+     gboolean imsroha_enabled;
++    gboolean imsroha_sms_checked;
++    gboolean imsroha_sms_enabled;
+     GObject *imsroha_backend;
+ };
+ 
+@@ -223,6 +225,68 @@ mm_broadband_modem_qmi_is_imsroha_enabled (MMBroadbandModemQmi *self)
+     return self->priv->imsroha_enabled;
+ }
+ 
++/*
++ * Whether imsroha carries SMS for this SIM's carrier. imsroha's carrier
++ * profiles (/usr/share/imsroha/carriers.conf, groups with a plmn= list) say
++ * sms-over-ip=false for carriers whose network does SMS outside IMS (SKT):
++ * there the modem keeps SMS, over WMS as without imsroha. A [carrier]
++ * sms-over-ip= in /etc/imsroha/imsroha.conf overrides it. Unknown PLMN, no
++ * profile, no key: imsroha carries SMS.
++ */
++#define IMSROHA_CARRIERS "/usr/share/imsroha/carriers.conf"
++#define IMSROHA_CONF     "/etc/imsroha/imsroha.conf"
++
++static gboolean
++imsroha_profile_sms_over_ip (const gchar *operator_id)
++{
++    g_autoptr(GKeyFile) carriers = g_key_file_new ();
++    g_autoptr(GKeyFile) local = g_key_file_new ();
++    gboolean sms = TRUE;
++
++    if (operator_id && g_key_file_load_from_file (carriers, IMSROHA_CARRIERS, G_KEY_FILE_NONE, NULL)) {
++        g_auto(GStrv) groups = g_key_file_get_groups (carriers, NULL);
++        guint i;
++
++        for (i = 0; groups && groups[i]; i++) {
++            g_auto(GStrv) plmns = g_key_file_get_string_list (carriers, groups[i], "plmn", NULL, NULL);
++
++            if (plmns && g_strv_contains ((const gchar * const *) plmns, operator_id)) {
++                if (g_key_file_has_key (carriers, groups[i], "sms-over-ip", NULL))
++                    sms = g_key_file_get_boolean (carriers, groups[i], "sms-over-ip", NULL);
++                break;
++            }
++        }
++    }
++    if (g_key_file_load_from_file (local, IMSROHA_CONF, G_KEY_FILE_NONE, NULL) &&
++        g_key_file_has_key (local, "carrier", "sms-over-ip", NULL))
++        sms = g_key_file_get_boolean (local, "carrier", "sms-over-ip", NULL);
++    return sms;
++}
++
++gboolean
++mm_broadband_modem_qmi_is_imsroha_sms_enabled (MMBroadbandModemQmi *self)
++{
++    MMBaseSim *sim = NULL;
++    const gchar *operator_id = NULL;
++
++    if (!mm_broadband_modem_qmi_is_imsroha_enabled (self))
++        return FALSE;
++    if (self->priv->imsroha_sms_checked)
++        return self->priv->imsroha_sms_enabled;
++
++    g_object_get (self, MM_IFACE_MODEM_SIM, &sim, NULL);
++    if (sim)
++        operator_id = mm_gdbus_sim_get_operator_identifier (MM_GDBUS_SIM (sim));
++    self->priv->imsroha_sms_enabled = imsroha_profile_sms_over_ip (operator_id);
++    /* Decided for good only once the SIM has said who it belongs to. */
++    self->priv->imsroha_sms_checked = operator_id && *operator_id;
++    mm_obj_info (self, "SMS %s (SIM operator %s)",
++                 self->priv->imsroha_sms_enabled ? "via IMSroha" : "left with the modem: the carrier has no SMS over IP",
++                 operator_id && *operator_id ? operator_id : "unknown");
++    g_clear_object (&sim);
++    return self->priv->imsroha_sms_enabled;
++}
++
+ MMImsBackendImsroha *
+ mm_broadband_modem_qmi_peek_ims_backend (MMBroadbandModemQmi *self)
+ {
+@@ -7593,7 +7657,7 @@ messaging_check_support (MMIfaceModemMessaging *self,
+ 
+     task = g_task_new (self, NULL, callback, user_data);
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (MM_BROADBAND_MODEM_QMI (self))) {
+         mm_obj_dbg (self, "messaging capabilities supported via IMSroha");
+         g_task_return_boolean (task, TRUE);
+         g_object_unref (task);
+@@ -7750,7 +7814,7 @@ messaging_init_current_storages (MMIfaceModemMessaging *_self,
+     QmiClient *client = NULL;
+     GTask *task;
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (self)) {
+         task = g_task_new (self, NULL, callback, user_data);
+         g_task_return_int (task, (gssize)MM_SMS_STORAGE_ME);
+         g_object_unref (task);
+@@ -7869,7 +7933,7 @@ messaging_set_default_storage (MMIfaceModemMessaging *_self,
+     QmiMessageWmsSetRoutesInputRouteListElement route;
+     GTask *task;
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (self)) {
+         task = g_task_new (self, NULL, callback, user_data);
+         g_task_return_boolean (task, TRUE);
+         g_object_unref (task);
+@@ -8357,7 +8421,7 @@ load_initial_sms_parts (MMIfaceModemMessaging *_self,
+     GTask *task;
+     QmiClient *client = NULL;
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (self)) {
+         /* imsroha's inbox holds what arrived while ModemManager was not listening. */
+         task = g_task_new (self, NULL, callback, user_data);
+         mm_ims_backend_imsroha_load_initial_sms (MM_IMS_BACKEND_IMSROHA (self->priv->imsroha_backend),
+@@ -8577,7 +8641,7 @@ common_setup_cleanup_messaging_unsolicited_events (MMBroadbandModemQmi  *self,
+ {
+     QmiClient *client = NULL;
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (self))
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (self))
+         return TRUE;
+ 
+     client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
+@@ -8789,7 +8853,7 @@ common_enable_disable_messaging_unsolicited_events (MMBroadbandModemQmi *self,
+     QmiMessageWmsSetEventReportInput *input;
+     GError *error = NULL;
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (self)) {
+         g_task_return_boolean (task, TRUE);
+         g_object_unref (task);
+         return;
+@@ -8947,7 +9011,7 @@ messaging_create_sms (MMIfaceModemMessaging *_self)
+ {
+     MMBroadbandModemQmi *self = MM_BROADBAND_MODEM_QMI (_self);
+ 
+-    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_sms_enabled (self)) {
+         return mm_sms_ims_new (MM_BASE_MODEM (self));
+     }
+ 
+diff --git a/src/mm-broadband-modem-qmi.h b/src/mm-broadband-modem-qmi.h
+index 1cff8d9..58c0894 100644
+--- a/src/mm-broadband-modem-qmi.h
++++ b/src/mm-broadband-modem-qmi.h
+@@ -66,6 +66,7 @@ MMPortQmi *mm_broadband_modem_qmi_get_port_qmi_for_data  (MMBroadbandModemQmi  *
+ 
+ typedef struct _MMImsBackendImsroha MMImsBackendImsroha;
+ gboolean         mm_broadband_modem_qmi_is_imsroha_enabled (MMBroadbandModemQmi *self);
++gboolean         mm_broadband_modem_qmi_is_imsroha_sms_enabled (MMBroadbandModemQmi *self);
+ MMImsBackendImsroha *mm_broadband_modem_qmi_peek_ims_backend   (MMBroadbandModemQmi *self);
+ 
+ #endif /* MM_BROADBAND_MODEM_QMI_H */
+-- 
+2.56.0
+

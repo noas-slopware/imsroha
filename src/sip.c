@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "sip.h"
 #include "audio.h"
 #include "inbox.h"
 #include "aka.h"
 #include "dbus.h"
 #include "sms.h"
+#include "dns.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -374,13 +376,13 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 
 	ctx->call_has_wb = ctx->call_pt_amrwb > 0;
 	ctx->call_has_nb = ctx->call_pt_amr > 0;
-	if (ctx->call_pt_amrwb <= 0) ctx->call_pt_amrwb = IMSD_PT_AMRWB;
-	if (ctx->call_pt_amr <= 0) ctx->call_pt_amr = IMSD_PT_AMR;
-	if (ctx->call_pt_dtmf_wb <= 0) ctx->call_pt_dtmf_wb = IMSD_PT_DTMF_WB;
-	if (ctx->call_pt_dtmf_nb <= 0) ctx->call_pt_dtmf_nb = IMSD_PT_DTMF;
+	if (ctx->call_pt_amrwb <= 0) ctx->call_pt_amrwb = ctx->cfg.car.pt_amrwb;
+	if (ctx->call_pt_amr <= 0) ctx->call_pt_amr = ctx->cfg.car.pt_amr;
+	if (ctx->call_pt_dtmf_wb <= 0) ctx->call_pt_dtmf_wb = ctx->cfg.car.pt_dtmf_wb;
+	if (ctx->call_pt_dtmf_nb <= 0) ctx->call_pt_dtmf_nb = ctx->cfg.car.pt_dtmf;
 	if (ctx->call_pt_dtmf <= 0) ctx->call_pt_dtmf = ctx->call_has_wb ? ctx->call_pt_dtmf_wb : ctx->call_pt_dtmf_nb;
 
-	fprintf(stderr, "b2q-imsd: remote SDP codecs: AMR-WB %s, AMR %s, DTMF PT %d (wb %d, nb %d), octet-align=%d\n",
+	fprintf(stderr, "imsroha: remote SDP codecs: AMR-WB %s, AMR %s, DTMF PT %d (wb %d, nb %d), octet-align=%d\n",
 		ctx->call_has_wb ? "yes" : "no", ctx->call_has_nb ? "yes" : "no",
 		ctx->call_pt_dtmf, ctx->call_pt_dtmf_wb, ctx->call_pt_dtmf_nb, ctx->call_octet_aligned);
 }
@@ -420,8 +422,8 @@ static void sdp_new_session(struct imsd_sip_ctx *ctx)
  */
 static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int answer)
 {
-	int amrwb = IMSD_PT_AMRWB, amr = IMSD_PT_AMR;
-	int dtmf_wb = IMSD_PT_DTMF_WB, dtmf_nb = IMSD_PT_DTMF;
+	int amrwb = ctx->cfg.car.pt_amrwb, amr = ctx->cfg.car.pt_amr;
+	int dtmf_wb = ctx->cfg.car.pt_dtmf_wb, dtmf_nb = ctx->cfg.car.pt_dtmf;
 
 	if (answer) {
 		amrwb = ctx->call_has_wb ? ctx->call_pt_amrwb : 0;
@@ -446,9 +448,10 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 		"s=-\r\n"
 		"c=IN IP6 %s\r\n"
 		"t=0 0\r\n"
-		"m=audio 40000 RTP/AVP%s\r\n"
+		"m=audio %u RTP/AVP%s\r\n"
 		"b=AS:41\r\n",
-		(unsigned long long)ctx->sdp_sess_id, ver, ctx->local_ip, ctx->local_ip, pts);
+		(unsigned long long)ctx->sdp_sess_id, ver, ctx->local_ip, ctx->local_ip,
+		(unsigned)ctx->cfg.car.rtp_port, pts);
 	if (amrwb && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d AMR-WB/16000/1\r\n"
@@ -474,40 +477,13 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 	return (int)len;
 }
 
-static int get_ims_ipv6(char *buf, size_t len)
-{
-	struct ifaddrs *ifaddr, *ifa;
-	int found = 0;
-
-	if (getifaddrs(&ifaddr) == -1)
-		return -errno;
-
-	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET6)
-			continue;
-		if (strcmp(ifa->ifa_name, IMSD_IMS_IFACE) != 0)
-			continue;
-
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-		if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr))
-			continue;
-
-		if (inet_ntop(AF_INET6, &sin6->sin6_addr, buf, len)) {
-			found = 1;
-			break;
-		}
-	}
-	freeifaddrs(ifaddr);
-	return found ? 0 : -ENODEV;
-}
-
 static int send_sip_msg(struct imsd_sip_ctx *ctx, const void *buf, size_t len)
 {
 	ssize_t sent = sendto(ctx->fd, buf, len, 0,
 			      (struct sockaddr *)&ctx->pcscf_addr,
 			      sizeof(ctx->pcscf_addr));
 	if (sent < 0) {
-		fprintf(stderr, "b2q-imsd: sendto failed: %s\n", strerror(errno));
+		fprintf(stderr, "imsroha: sendto failed: %s\n", strerror(errno));
 		return -errno;
 	}
 	return 0;
@@ -539,7 +515,7 @@ static void send_simple_response(struct imsd_sip_ctx *ctx, const char *status,
 		uint32_t h = fnv1a(2166136261u, call_id);
 		h = fnv1a(h, from);
 		h = fnv1a(h, cseq);
-		snprintf(tag, sizeof(tag), ";tag=b2q%08x", h);
+		snprintf(tag, sizeof(tag), ";tag=ir%08x", h);
 	}
 
 	char resp[2048];
@@ -558,6 +534,12 @@ static void send_simple_response(struct imsd_sip_ctx *ctx, const char *status,
 
 static void schedule_reg_retry(struct imsd_sip_ctx *ctx);
 
+/* The Contact feature tag that asks for SMS over IP (TS 24.341 5.3.1.2), when the carrier does it. */
+static const char *contact_sms(const struct imsd_sip_ctx *ctx)
+{
+	return ctx->cfg.car.sms_over_ip ? ";+g.3gpp.smsip" : "";
+}
+
 /*
  * The Expires we ask for. 600000 s unless the registrar answered 423 Interval
  * Too Brief with a larger Min-Expires (RFC 3261 10.2.8), which then sticks.
@@ -573,29 +555,30 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 	char branch[32];
 	snprintf(branch, sizeof(branch), "z9hG4bK%08x", (unsigned)rand());
 
-	char req[1024];
+	char req[2048];
 	int len = snprintf(req, sizeof(req),
-		"REGISTER sip:" IMSD_DOMAIN " SIP/2.0\r\n"
+		"REGISTER sip:%s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=%s;rport\r\n"
 		"From: <%s>;tag=%s\r\n"
 		"To: <%s>\r\n"
 		"Call-ID: %s\r\n"
 		"CSeq: %u REGISTER\r\n"
-		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";+g.3gpp.smsip\r\n"
-		"Authorization: Digest username=\"%s\", realm=\"" IMSD_DOMAIN "\", nonce=\"\", uri=\"sip:" IMSD_DOMAIN "\", response=\"\"\r\n"
+		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"%s\r\n"
+		"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"\", uri=\"sip:%s\", response=\"\"\r\n"
 		"Max-Forwards: 70\r\n"
 		"Expires: %u\r\n"
 		"Supported: path\r\n"
-		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
-		"User-Agent: " IMSD_USER_AGENT "\r\n"
+		"P-Access-Network-Info: %s\r\n"
+		"User-Agent: %s\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, ctx->impi,
-		reg_req_expires(ctx));
+		ctx->domain, ctx->local_ip, ctx->sip_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
+		ctx->impu_user, ctx->local_ip, ctx->sip_port, contact_sms(ctx), ctx->impi, ctx->domain, ctx->domain,
+		reg_req_expires(ctx), ctx->pani, ctx->user_agent);
 
 	/* A refresh keeps the account usable; only the first REGISTER is "registering". */
 	if (ctx->reg_state != IMSD_UP)
 		ctx->reg_state = IMSD_REGISTERING;
-	fprintf(stderr, "b2q-imsd: sending REGISTER (CSeq %u)...\n", ctx->reg_cseq - 1);
+	fprintf(stderr, "imsroha: sending REGISTER (CSeq %u)...\n", ctx->reg_cseq - 1);
 	schedule_reg_retry(ctx);
 	return send_sip_msg(ctx, req, len);
 }
@@ -604,26 +587,27 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 {
 	char auth_hdr[512];
 	if (find_header(msg, "WWW-Authenticate", auth_hdr, sizeof(auth_hdr)) < 0) {
-		fprintf(stderr, "b2q-imsd: 401 missing WWW-Authenticate\n");
+		fprintf(stderr, "imsroha: 401 missing WWW-Authenticate\n");
 		return -EINVAL;
 	}
 
 	char nonce_str[128] = "";
-	char realm_str[64] = IMSD_DOMAIN;
+	char realm_str[128];
+	snprintf(realm_str, sizeof(realm_str), "%s", ctx->domain);
 	char alg_str[32] = "AKAv1-MD5";
 	find_param(auth_hdr, "nonce", nonce_str, sizeof(nonce_str));
 	find_param(auth_hdr, "realm", realm_str, sizeof(realm_str));
 	find_param(auth_hdr, "algorithm", alg_str, sizeof(alg_str));
 
 	if (!nonce_str[0]) {
-		fprintf(stderr, "b2q-imsd: 401 missing nonce\n");
+		fprintf(stderr, "imsroha: 401 missing nonce\n");
 		return -EINVAL;
 	}
 
 	unsigned char nonce_bin[64];
 	int nonce_len = b64_decode(nonce_str, strlen(nonce_str), nonce_bin, sizeof(nonce_bin));
 	if (nonce_len < 32) {
-		fprintf(stderr, "b2q-imsd: nonce decode failed or too short (%d bytes)\n", nonce_len);
+		fprintf(stderr, "imsroha: nonce decode failed or too short (%d bytes)\n", nonce_len);
 		return -EINVAL;
 	}
 
@@ -632,10 +616,10 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 	memcpy(ch.rand, nonce_bin, 16);
 	memcpy(ch.autn, nonce_bin + 16, 16);
 
-	fprintf(stderr, "b2q-imsd: executing AKA on ISIM via QMI UIM...\n");
+	fprintf(stderr, "imsroha: executing AKA on ISIM via QMI UIM...\n");
 	int r = imsd_aka_run_isim(&ch, &res);
 	if (r < 0 || !res.success) {
-		fprintf(stderr, "b2q-imsd: imsd_aka_run_isim failed: %d\n", r);
+		fprintf(stderr, "imsroha: imsd_aka_run_isim failed: %d\n", r);
 		return -EIO;
 	}
 
@@ -648,14 +632,14 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		b64_encode(res.auts, res.auts_len, auts_b64, sizeof(auts_b64));
 
 		/* RFC 3310 empty password digest */
-		char ha1_in[128];
+		char ha1_in[320];
 		snprintf(ha1_in, sizeof(ha1_in), "%s:%s:",
 		ctx->impi, realm_str);
 		char ha1[33];
 		md5_hex(ha1_in, strlen(ha1_in), ha1);
 
-		char ha2_in[128];
-		snprintf(ha2_in, sizeof(ha2_in), "REGISTER:sip:%s", IMSD_DOMAIN);
+		char ha2_in[256];
+		snprintf(ha2_in, sizeof(ha2_in), "REGISTER:sip:%s", ctx->domain);
 		char ha2[33];
 		md5_hex(ha2_in, strlen(ha2_in), ha2);
 
@@ -665,9 +649,9 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		md5_hex(resp_in, strlen(resp_in), resp_digest);
 
 		snprintf(auth_line, sizeof(auth_line),
-			"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"sip:" IMSD_DOMAIN "\", response=\"%s\", algorithm=%s, auts=\"%s\"\r\n",
-		ctx->impi, realm_str, nonce_str, resp_digest, alg_str, auts_b64);
-		fprintf(stderr, "b2q-imsd: resending REGISTER with AUTS...\n");
+			"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"sip:%s\", response=\"%s\", algorithm=%s, auts=\"%s\"\r\n",
+		ctx->impi, realm_str, nonce_str, ctx->domain, resp_digest, alg_str, auts_b64);
+		fprintf(stderr, "imsroha: resending REGISTER with AUTS...\n");
 	} else {
 		/* HA1 = MD5(username:realm:RES_BIN) */
 		unsigned char ha1_raw[256];
@@ -679,8 +663,8 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		char ha1[33];
 		md5_hex(ha1_raw, ha1_len, ha1);
 
-		char ha2_in[128];
-		snprintf(ha2_in, sizeof(ha2_in), "REGISTER:sip:%s", IMSD_DOMAIN);
+		char ha2_in[256];
+		snprintf(ha2_in, sizeof(ha2_in), "REGISTER:sip:%s", ctx->domain);
 		char ha2[33];
 		md5_hex(ha2_in, strlen(ha2_in), ha2);
 
@@ -690,29 +674,30 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		md5_hex(resp_in, strlen(resp_in), resp_digest);
 
 		snprintf(auth_line, sizeof(auth_line),
-			"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"sip:" IMSD_DOMAIN "\", response=\"%s\", algorithm=%s\r\n",
-		ctx->impi, realm_str, nonce_str, resp_digest, alg_str);
-		fprintf(stderr, "b2q-imsd: sending authenticated REGISTER (RES len %zu)...\n", res.res_len);
+			"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"sip:%s\", response=\"%s\", algorithm=%s\r\n",
+		ctx->impi, realm_str, nonce_str, ctx->domain, resp_digest, alg_str);
+		fprintf(stderr, "imsroha: sending authenticated REGISTER (RES len %zu)...\n", res.res_len);
 	}
 
-	char req[1500];
+	char req[2560];
 	int len = snprintf(req, sizeof(req),
-		"REGISTER sip:" IMSD_DOMAIN " SIP/2.0\r\n"
+		"REGISTER sip:%s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=%s;rport\r\n"
 		"From: <%s>;tag=%s\r\n"
 		"To: <%s>\r\n"
 		"Call-ID: %s\r\n"
 		"CSeq: %u REGISTER\r\n"
-		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";+g.3gpp.smsip\r\n"
+		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"%s\r\n"
 		"%s"
 		"Max-Forwards: 70\r\n"
 		"Expires: %u\r\n"
 		"Supported: path\r\n"
-		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
-		"User-Agent: " IMSD_USER_AGENT "\r\n"
+		"P-Access-Network-Info: %s\r\n"
+		"User-Agent: %s\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, auth_line,
-		reg_req_expires(ctx));
+		ctx->domain, ctx->local_ip, ctx->sip_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
+		ctx->impu_user, ctx->local_ip, ctx->sip_port, contact_sms(ctx), auth_line,
+		reg_req_expires(ctx), ctx->pani, ctx->user_agent);
 
 	schedule_reg_retry(ctx);
 	return send_sip_msg(ctx, req, len);
@@ -723,7 +708,15 @@ static int on_reg_retry_timer(sd_event_source *s, uint64_t usec, void *userdata)
 	(void)s; (void)usec;
 	struct imsd_sip_ctx *ctx = userdata;
 	ctx->reg_retry_count++;
-	fprintf(stderr, "b2q-imsd: REGISTER timed out (retry #%d), resending...\n", ctx->reg_retry_count);
+	/* TS 24.229 5.1.1.2.1: a P-CSCF that stays silent is replaced by the next one. */
+	if (ctx->pcscf_n > 1 && ctx->reg_retry_count % 2 == 0) {
+		char a[INET6_ADDRSTRLEN];
+		ctx->pcscf_cur = (ctx->pcscf_cur + 1) % ctx->pcscf_n;
+		ctx->pcscf_addr = ctx->pcscf_list[ctx->pcscf_cur];
+		inet_ntop(AF_INET6, &ctx->pcscf_addr.sin6_addr, a, sizeof(a));
+		fprintf(stderr, "imsroha: no answer, trying P-CSCF [%s]:%u\n", a, ntohs(ctx->pcscf_addr.sin6_port));
+	}
+	fprintf(stderr, "imsroha: REGISTER timed out (retry #%d), resending...\n", ctx->reg_retry_count);
 	imsd_sip_register(ctx);
 	return 0;
 }
@@ -768,7 +761,7 @@ static void handle_register_rejected(struct imsd_sip_ctx *ctx, const char *msg, 
 			me = strtoul(min_exp, NULL, 10);
 		if (me > reg_req_expires(ctx) && me <= UINT32_MAX) {
 			ctx->reg_min_expires = (uint32_t)me;
-			fprintf(stderr, "b2q-imsd: REGISTER 423, retrying with Expires %u\n",
+			fprintf(stderr, "imsroha: REGISTER 423, retrying with Expires %u\n",
 				ctx->reg_min_expires);
 			imsd_sip_register(ctx);
 			return;
@@ -786,7 +779,7 @@ static void handle_register_rejected(struct imsd_sip_ctx *ctx, const char *msg, 
 		if (ra > 0 && ra <= 3600)
 			delay_sec = ra;
 	}
-	fprintf(stderr, "b2q-imsd: REGISTER rejected (SIP %d), next attempt in %" PRIu64 " s\n",
+	fprintf(stderr, "imsroha: REGISTER rejected (SIP %d), next attempt in %" PRIu64 " s\n",
 		status_code, delay_sec);
 	arm_reg_retry(ctx, delay_sec);
 }
@@ -802,7 +795,7 @@ static int on_reg_timer(sd_event_source *s, uint64_t usec, void *userdata)
 {
 	(void)s; (void)usec;
 	struct imsd_sip_ctx *ctx = userdata;
-	fprintf(stderr, "b2q-imsd: refreshing SIP registration...\n");
+	fprintf(stderr, "imsroha: refreshing SIP registration...\n");
 	imsd_sip_register(ctx);
 	return 0;
 }
@@ -835,9 +828,9 @@ static void setup_remote_rtp(struct imsd_sip_ctx *ctx, const char *ip, uint16_t 
 	ctx->remote_rtp_addr.sin6_family = AF_INET6;
 	ctx->remote_rtp_addr.sin6_port = htons(port);
 	if (inet_pton(AF_INET6, ip, &ctx->remote_rtp_addr.sin6_addr) <= 0) {
-		fprintf(stderr, "b2q-imsd: inet_pton failed for remote RTP IP '%s'\n", ip);
+		fprintf(stderr, "imsroha: inet_pton failed for remote RTP IP '%s'\n", ip);
 	} else {
-		fprintf(stderr, "b2q-imsd: remote RTP target set to [%s]:%u\n", ip, port);
+		fprintf(stderr, "imsroha: remote RTP target set to [%s]:%u\n", ip, port);
 	}
 }
 
@@ -909,7 +902,7 @@ int imsd_sip_send_dtmf(struct imsd_sip_ctx *ctx, const char *dtmf)
 
 	memcpy(ctx->dtmf_queue + ctx->dtmf_q_len, dtmf, n);
 	ctx->dtmf_q_len += n;
-	fprintf(stderr, "b2q-imsd: queued DTMF \"%s\" (queue len %zu)\n", dtmf, ctx->dtmf_q_len);
+	fprintf(stderr, "imsroha: queued DTMF \"%s\" (queue len %zu)\n", dtmf, ctx->dtmf_q_len);
 	return 0;
 }
 
@@ -1003,7 +996,7 @@ static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 
 	if (pt_dtmf < 0 && (ctx->dtmf_q_len || ctx->dtmf_active_event >= 0)) {
 		/* A re-INVITE or UPDATE dropped telephone-event mid-sequence. */
-		fprintf(stderr, "b2q-imsd: telephone-event no longer negotiated, dropping %zu queued DTMF\n",
+		fprintf(stderr, "imsroha: telephone-event no longer negotiated, dropping %zu queued DTMF\n",
 			ctx->dtmf_q_len);
 		ctx->dtmf_q_len = 0;
 		ctx->dtmf_active_event = -1;
@@ -1061,7 +1054,7 @@ static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 		       (struct sockaddr *)&ctx->remote_rtp_addr, sizeof(ctx->remote_rtp_addr));
 
 		if (first_pkt || ctx->dtmf_end_sent == 3) {
-			fprintf(stderr, "b2q-imsd: DTMF event %d %s (pt %d, dur %u)\n",
+			fprintf(stderr, "imsroha: DTMF event %d %s (pt %d, dur %u)\n",
 				ctx->dtmf_active_event, is_end ? "end" : "start",
 				pt_dtmf, ctx->dtmf_duration);
 		}
@@ -1104,7 +1097,7 @@ static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 	       (struct sockaddr *)&ctx->remote_rtp_addr, sizeof(ctx->remote_rtp_addr));
 
 	if (ctx->rtp_tx_pkts == 1 || ctx->rtp_tx_pkts % 100 == 0) {
-		fprintf(stderr, "b2q-imsd: RTP tx #%" PRIu64 " (ts %u, len %zu) -> [%s]:%u\n",
+		fprintf(stderr, "imsroha: RTP tx #%" PRIu64 " (ts %u, len %zu) -> [%s]:%u\n",
 			ctx->rtp_tx_pkts, ctx->rtp_tx_ts, pkt_len,
 			ctx->remote_rtp_ip, ctx->remote_rtp_port);
 	}
@@ -1135,7 +1128,7 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		memcpy(&ctx->remote_rtp_addr, &from, sizeof(from));
 		ctx->remote_rtp_port = ntohs(from.sin6_port);
 		inet_ntop(AF_INET6, &from.sin6_addr, ctx->remote_rtp_ip, sizeof(ctx->remote_rtp_ip));
-		fprintf(stderr, "b2q-imsd: learned remote RTP endpoint from incoming packet: [%s]:%u\n",
+		fprintf(stderr, "imsroha: learned remote RTP endpoint from incoming packet: [%s]:%u\n",
 			ctx->remote_rtp_ip, ctx->remote_rtp_port);
 	}
 
@@ -1143,7 +1136,7 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		uint16_t seq = (buf[2] << 8) | buf[3];
 		uint8_t pt = buf[1] & 0x7f;
 		if (ctx->rtp_rx_pkts <= 5 || ctx->rtp_rx_pkts % 50 == 1) {
-			fprintf(stderr, "b2q-imsd: RTP rx #%" PRIu64 " (pt %u, seq %u, len %zd) [hdr: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x payload: %02x %02x %02x %02x]\n",
+			fprintf(stderr, "imsroha: RTP rx #%" PRIu64 " (pt %u, seq %u, len %zd) [hdr: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x payload: %02x %02x %02x %02x]\n",
 				ctx->rtp_rx_pkts, pt, seq, n,
 				buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
 				buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
@@ -1157,8 +1150,8 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		 * comfort noise) is not speech for the AMR decoders.
 		 */
 		int pt_rx = buf[1] & 0x7f;
-		int is_wb = pt_rx == ctx->call_pt_amrwb || pt_rx == IMSD_PT_AMRWB;
-		int is_nb = pt_rx == ctx->call_pt_amr || pt_rx == IMSD_PT_AMR;
+		int is_wb = pt_rx == ctx->call_pt_amrwb || pt_rx == ctx->cfg.car.pt_amrwb;
+		int is_nb = pt_rx == ctx->call_pt_amr || pt_rx == ctx->cfg.car.pt_amr;
 		if (ctx->codec_open && n > 13 && (is_wb || is_nb)) {
 			uint32_t ts = (uint32_t)buf[4] << 24 | (uint32_t)buf[5] << 16 |
 				      (uint32_t)buf[6] << 8 | buf[7];
@@ -1174,23 +1167,23 @@ static void imsd_rtp_start(struct imsd_sip_ctx *ctx)
 	if (ctx->rtp_fd < 0) {
 		int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 		if (fd < 0) {
-			fprintf(stderr, "b2q-imsd: failed to create RTP socket: %m\n");
+			fprintf(stderr, "imsroha: failed to create RTP socket: %m\n");
 			return;
 		}
 
 		int on = 1;
 		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 		/* Same as the SIP socket: media only from the IMS PDN. */
-		setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, IMSD_IMS_IFACE, sizeof(IMSD_IMS_IFACE));
+		setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ctx->iface, strlen(ctx->iface) + 1);
 
 		struct sockaddr_in6 addr;
 		memset(&addr, 0, sizeof(addr));
 		addr.sin6_family = AF_INET6;
-		addr.sin6_port = htons(40000);
+		addr.sin6_port = htons(ctx->cfg.car.rtp_port);
 		inet_pton(AF_INET6, ctx->local_ip, &addr.sin6_addr);
 
 		if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-			fprintf(stderr, "b2q-imsd: failed to bind RTP socket to port 40000: %m\n");
+			fprintf(stderr, "imsroha: failed to bind RTP socket to port %u: %m\n", ctx->cfg.car.rtp_port);
 			close(fd);
 			return;
 		}
@@ -1200,7 +1193,7 @@ static void imsd_rtp_start(struct imsd_sip_ctx *ctx)
 		ctx->rtp_rx_bytes = 0;
 
 		sd_event_add_io(ctx->event, &ctx->rtp_source, ctx->rtp_fd, EPOLLIN, on_rtp_packet, ctx);
-		fprintf(stderr, "b2q-imsd: RTP receiver listening on [%s]:40000\n", ctx->local_ip);
+		fprintf(stderr, "imsroha: RTP receiver listening on [%s]:%u\n", ctx->local_ip, ctx->cfg.car.rtp_port);
 	}
 
 	if (!ctx->rtp_tx_timer) {
@@ -1216,7 +1209,7 @@ static void imsd_rtp_start(struct imsd_sip_ctx *ctx)
 		ctx->dtmf_gap_frames = 0;
 		sd_event_add_time(ctx->event, &ctx->rtp_tx_timer, CLOCK_MONOTONIC,
 				  now_usec + 20000, 1000, on_rtp_tx_timer, ctx);
-		fprintf(stderr, "b2q-imsd: started RTP TX timer (20ms) for uplink audio\n");
+		fprintf(stderr, "imsroha: started RTP TX timer (20ms) for uplink audio\n");
 	}
 }
 
@@ -1236,7 +1229,7 @@ static void imsd_rtp_stop(struct imsd_sip_ctx *ctx)
 		ctx->rtp_fd = -1;
 	}
 	if (ctx->rtp_rx_pkts > 0 || ctx->rtp_tx_pkts > 0) {
-		fprintf(stderr, "b2q-imsd: RTP session ended, rx %" PRIu64 " pkts (%" PRIu64 " bytes), tx %" PRIu64 " pkts; "
+		fprintf(stderr, "imsroha: RTP session ended, rx %" PRIu64 " pkts (%" PRIu64 " bytes), tx %" PRIu64 " pkts; "
 			"playout: %" PRIu64 " frames filled, %" PRIu64 " late, %" PRIu64 " resyncs\n",
 			ctx->rtp_rx_pkts, ctx->rtp_rx_bytes, ctx->rtp_tx_pkts,
 			ctx->playout_filled, ctx->playout_late, ctx->playout_resyncs);
@@ -1311,7 +1304,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	 * current provisional response again; it is not a new call.
 	 */
 	if (ctx->call_is_incoming && !strcmp(call_id, ctx->inc_call_id) && !strcmp(cseq, ctx->inc_cseq)) {
-		fprintf(stderr, "b2q-imsd: INVITE retransmission (Call-ID %s)\n", call_id);
+		fprintf(stderr, "imsroha: INVITE retransmission (Call-ID %s)\n", call_id);
 		if (ctx->call_state == IMSD_CALL_RINGING) {
 			char ringing[2048];
 			int rlen = snprintf(ringing, sizeof(ringing),
@@ -1324,7 +1317,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 				"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
 				"Allow: " IMSD_ALLOW "\r\n"
 				"Content-Length: 0\r\n\r\n",
-				via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT);
+				via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port);
 			send_sip_msg(ctx, ringing, rlen);
 		}
 		return 0;
@@ -1332,7 +1325,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 
 	const char *active_cid = ctx->call_is_incoming ? ctx->inc_call_id : ctx->call_id;
 	if (ctx->call_state == IMSD_CALL_ACTIVE && active_cid[0] && !strcmp(call_id, active_cid)) {
-		fprintf(stderr, "b2q-imsd: in-dialog re-INVITE (Call-ID %s, CSeq %s)\n", call_id, cseq);
+		fprintf(stderr, "imsroha: in-dialog re-INVITE (Call-ID %s, CSeq %s)\n", call_id, cseq);
 		const char *body = strstr(msg, "\r\n\r\n");
 		int has_offer = body && body[4];
 		char sdp[1024];
@@ -1340,7 +1333,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 		if (has_offer) {
 			/* Check the offer before it replaces the session we have. */
 			if (!sdp_has_amr(body + 4)) {
-				fprintf(stderr, "b2q-imsd: re-INVITE offers no AMR, keeping the session\n");
+				fprintf(stderr, "imsroha: re-INVITE offers no AMR, keeping the session\n");
 				send_simple_response(ctx, "488 Not Acceptable Here", via, from, to, call_id, cseq);
 				return 0;
 			}
@@ -1382,7 +1375,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 			"Content-Length: %d\r\n\r\n"
 			"%s",
 			via, from, to_with_tag, call_id, cseq,
-			ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, se_hdr, sdp_len, sdp);
+			ctx->impu_user, ctx->local_ip, ctx->sip_port, se_hdr, sdp_len, sdp);
 		send_sip_msg(ctx, resp, len);
 		return 0;
 	}
@@ -1392,7 +1385,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	 * taking it would overwrite the first call's dialog state.
 	 */
 	if (ctx->call_state != IMSD_CALL_IDLE && ctx->call_state != IMSD_CALL_TERMINATED) {
-		fprintf(stderr, "b2q-imsd: busy, rejecting INVITE (Call-ID %s)\n", call_id);
+		fprintf(stderr, "imsroha: busy, rejecting INVITE (Call-ID %s)\n", call_id);
 		send_simple_response(ctx, "486 Busy Here", via, from, to, call_id, cseq);
 		return 0;
 	}
@@ -1400,7 +1393,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	const char *offer = strstr(msg, "\r\n\r\n");
 	if (offer && offer[4]) {
 		if (!sdp_has_amr(offer + 4)) {
-			fprintf(stderr, "b2q-imsd: INVITE offers no AMR, rejecting (Call-ID %s)\n", call_id);
+			fprintf(stderr, "imsroha: INVITE offers no AMR, rejecting (Call-ID %s)\n", call_id);
 			send_simple_response(ctx, "488 Not Acceptable Here", via, from, to, call_id, cseq);
 			return 0;
 		}
@@ -1408,8 +1401,8 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 
 	char caller[64] = "";
 	extract_caller_number(from, caller, sizeof(caller));
-	fprintf(stderr, "b2q-imsd: incoming VoLTE call from %s (Call-ID %s)\n", caller, call_id);
-	fprintf(stderr, "b2q-imsd: incoming INVITE message:\n%s\n", msg);
+	fprintf(stderr, "imsroha: incoming VoLTE call from %s (Call-ID %s)\n", caller, call_id);
+	fprintf(stderr, "imsroha: incoming INVITE message:\n%s\n", msg);
 
 	sdp_new_session(ctx);
 	snprintf(ctx->inc_via, sizeof(ctx->inc_via), "%s", via);
@@ -1423,8 +1416,8 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	const char *body = strstr(msg, "\r\n\r\n");
 	ctx->inc_offerless = !(body && body[4]);
 	if (ctx->inc_offerless) {
-		ctx->call_pt_amrwb = IMSD_PT_AMRWB;
-		ctx->call_pt_amr = IMSD_PT_AMR;
+		ctx->call_pt_amrwb = ctx->cfg.car.pt_amrwb;
+		ctx->call_pt_amr = ctx->cfg.car.pt_amr;
 		ctx->call_has_wb = ctx->call_has_nb = 1;
 		ctx->call_has_dtmf_wb = ctx->call_has_dtmf_nb = 0;
 	} else {
@@ -1466,7 +1459,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
 		"Allow: " IMSD_ALLOW "\r\n"
 		"Content-Length: 0\r\n\r\n",
-		via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT);
+		via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port);
 	send_sip_msg(ctx, ringing, rlen);
 
 	ctx->call_state = IMSD_CALL_RINGING;
@@ -1488,7 +1481,7 @@ static int handle_incoming_cancel(struct imsd_sip_ctx *ctx, const char *msg, siz
 
 	if (!ctx->call_is_incoming || ctx->call_state == IMSD_CALL_IDLE ||
 	    ctx->call_state == IMSD_CALL_TERMINATED || strcmp(call_id, ctx->inc_call_id) != 0) {
-		fprintf(stderr, "b2q-imsd: ignoring CANCEL for unknown Call-ID %s\n", call_id);
+		fprintf(stderr, "imsroha: ignoring CANCEL for unknown Call-ID %s\n", call_id);
 		char err_resp[2048];
 		int err_len = snprintf(err_resp, sizeof(err_resp),
 			"SIP/2.0 481 Call/Transaction Does Not Exist\r\n"
@@ -1508,12 +1501,12 @@ static int handle_incoming_cancel(struct imsd_sip_ctx *ctx, const char *msg, siz
 	 * effect on the call (RFC 3261 9.2). The caller ends it with a BYE.
 	 */
 	if (ctx->call_state != IMSD_CALL_RINGING) {
-		fprintf(stderr, "b2q-imsd: CANCEL after the call was answered, ignoring (Call-ID %s)\n", call_id);
+		fprintf(stderr, "imsroha: CANCEL after the call was answered, ignoring (Call-ID %s)\n", call_id);
 		send_simple_response(ctx, "200 OK", cancel_via, from, to, call_id, cseq);
 		return 0;
 	}
 
-	fprintf(stderr, "b2q-imsd: caller cancelled incoming call (Call-ID %s)\n", call_id);
+	fprintf(stderr, "imsroha: caller cancelled incoming call (Call-ID %s)\n", call_id);
 
 
 	/* 1. 200 OK for CANCEL */
@@ -1611,16 +1604,19 @@ static int tpdu_to_mm_hex(const unsigned char *tpdu, size_t tpdu_len, char *hex,
 	return 0;
 }
 
+
 /*
- * Answer an incoming MESSAGE with 200 OK carrying the RP reply in its body,
- * the way LG U+ expects it (TS 24.341 5.3.2.4 sends it as a new MESSAGE;
- * the carrier accepts it in the response).
+ * Answer an incoming RP-DATA. TS 24.341 5.3.2.4: a bodiless 200 OK, then the
+ * RP-ACK or RP-ERROR in a MESSAGE of our own to the SC that sent it, with
+ * In-Reply-To naming the received MESSAGE. LG U+ takes the RP reply in the
+ * 200 OK's body instead (sms-rp-ack=response in its carrier profile).
  */
 static void send_rp_reply(struct imsd_sip_ctx *ctx, const char *via, const char *from,
 			  const char *to, const char *tag, const char *call_id, const char *cseq,
 			  const unsigned char *rp, size_t rp_len)
 {
 	unsigned char full[2048];
+	int in_response = ctx->cfg.car.sms_rp_in_response;
 	int len = snprintf((char *)full, sizeof(full),
 		"SIP/2.0 200 OK\r\n"
 		"%s"
@@ -1628,10 +1624,45 @@ static void send_rp_reply(struct imsd_sip_ctx *ctx, const char *via, const char 
 		"To: %s;tag=%s\r\n"
 		"Call-ID: %s\r\n"
 		"CSeq: %s\r\n"
-		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
+		"P-Access-Network-Info: %s\r\n"
+		"%s"
+		"Content-Length: %zu\r\n\r\n",
+		via, from, to, tag, call_id, cseq, ctx->pani,
+		in_response ? "Content-Type: application/vnd.3gpp.sms\r\n" : "",
+		in_response ? rp_len : 0);
+	if (len < 0 || (size_t)len + rp_len > sizeof(full))
+		return;
+	if (in_response) {
+		memcpy(full + len, rp, rp_len);
+		send_sip_msg(ctx, full, len + rp_len);
+		return;
+	}
+	send_sip_msg(ctx, full, len);
+
+	char sc[256], branch[32], ftag[16], cid[64], route[300] = "";
+	sip_uri_of(from, sc, sizeof(sc));
+	rand_hex(branch, 8);
+	rand_hex(ftag, 8);
+	rand_hex(cid, 16);
+	if (ctx->reg_service_route[0])
+		snprintf(route, sizeof(route), "Route: %s\r\n", ctx->reg_service_route);
+	len = snprintf((char *)full, sizeof(full),
+		"MESSAGE %s SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
+		"%s"
+		"From: <%s>;tag=%s\r\n"
+		"To: <%s>\r\n"
+		"Call-ID: %s@%s\r\n"
+		"CSeq: 1 MESSAGE\r\n"
+		"In-Reply-To: %s\r\n"
+		"Max-Forwards: 70\r\n"
+		"P-Access-Network-Info: %s\r\n"
+		"P-Preferred-Identity: <%s>\r\n"
+		"User-Agent: %s\r\n"
 		"Content-Type: application/vnd.3gpp.sms\r\n"
 		"Content-Length: %zu\r\n\r\n",
-		via, from, to, tag, call_id, cseq, rp_len);
+		sc, ctx->local_ip, ctx->sip_port, branch, route, ctx->impu, ftag, sc,
+		cid, ctx->domain, call_id, ctx->pani, ctx->impu, ctx->user_agent, rp_len);
 	if (len < 0 || (size_t)len + rp_len > sizeof(full))
 		return;
 	memcpy(full + len, rp, rp_len);
@@ -1677,7 +1708,7 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 			size_t n = body_len < 256 ? body_len : 256;
 			for (size_t i = 0; i < n; i++)
 				snprintf(dump + 2 * i, 3, "%02x", rp[i]);
-			fprintf(stderr, "b2q-imsd: could not parse RP-DATA (%d), sending RP-ERROR: %s\n",
+			fprintf(stderr, "imsroha: could not parse RP-DATA (%d), sending RP-ERROR: %s\n",
 				r, dump);
 			/* RP-ERROR, cause 111: protocol error, unspecified (TS 24.011 8.2.5.4) */
 			const unsigned char rp_err[4] = { 0x04, mr, 0x01, 111 };
@@ -1689,13 +1720,13 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 			/* A retry of a message we already took: answer it, keep nothing. */
 			const unsigned char rp_ack[2] = { 0x02, mr };
 			send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
-			fprintf(stderr, "b2q-imsd: duplicate MT-SMS (MR 0x%02x), acked again\n", mr);
+			fprintf(stderr, "imsroha: duplicate MT-SMS (MR 0x%02x), acked again\n", mr);
 			return 0;
 		}
 
 		r = imsd_inbox_store(hex, id);
 		if (r < 0) {
-			fprintf(stderr, "b2q-imsd: cannot store MT-SMS (MR 0x%02x): %s, sending RP-ERROR\n",
+			fprintf(stderr, "imsroha: cannot store MT-SMS (MR 0x%02x): %s, sending RP-ERROR\n",
 				mr, strerror(-r));
 			/* RP-ERROR, cause 22: memory capacity exceeded, so the SMSC keeps it */
 			const unsigned char rp_err[4] = { 0x04, mr, 0x01, 22 };
@@ -1706,7 +1737,7 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 		imsd_inbox_remember(hex);
 		const unsigned char rp_ack[2] = { 0x02, mr };
 		send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
-		fprintf(stderr, "b2q-imsd: stored MT-SMS %s (MR 0x%02x, DCS 0x%02x, %zu bytes), sent RP-ACK\n",
+		fprintf(stderr, "imsroha: stored MT-SMS %s (MR 0x%02x, DCS 0x%02x, %zu bytes), sent RP-ACK\n",
 			id, mr, dcs, tpdu_len);
 		imsd_emit_pdu_received(ctx->bus, id, hex);
 		return 0;
@@ -1728,7 +1759,7 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 	if (body_len >= 2 && (unsigned char)body_start[0] == 0x03) {
 		/* RP-ACK for MO-SMS */
 		unsigned char mr = (unsigned char)body_start[1];
-		fprintf(stderr, "b2q-imsd: received RP-ACK for MO-SMS (MR 0x%02x)\n", mr);
+		fprintf(stderr, "imsroha: received RP-ACK for MO-SMS (MR 0x%02x)\n", mr);
 		char ref_str[16];
 		snprintf(ref_str, sizeof(ref_str), "%u", mr);
 
@@ -1747,7 +1778,7 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 	if (body_len >= 2 && (unsigned char)body_start[0] == 0x05) {
 		/* RP-ERROR for MO-SMS */
 		unsigned char mr = (unsigned char)body_start[1];
-		fprintf(stderr, "b2q-imsd: received RP-ERROR for MO-SMS (MR 0x%02x)\n", mr);
+		fprintf(stderr, "imsroha: received RP-ERROR for MO-SMS (MR 0x%02x)\n", mr);
 		if (ctx->pending_sms_msg) {
 			sd_bus_reply_method_errorf(ctx->pending_sms_msg, SD_BUS_ERROR_FAILED,
 						   "Carrier returned RP-ERROR for MR %u", mr);
@@ -1786,15 +1817,15 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		char status_line[128];
 		memcpy(status_line, buf, line_len);
 		status_line[line_len] = '\0';
-		fprintf(stderr, "b2q-imsd: received %s\n", status_line);
+		fprintf(stderr, "imsroha: received %s\n", status_line);
 
 		if (status_code >= 300) {
 			char reason[256] = "", warning[256] = "";
 			find_header(buf, "Reason", reason, sizeof(reason));
 			find_header(buf, "Warning", warning, sizeof(warning));
-			if (reason[0]) fprintf(stderr, "b2q-imsd: Reason: %s\n", reason);
-			if (warning[0]) fprintf(stderr, "b2q-imsd: Warning: %s\n", warning);
-			fprintf(stderr, "b2q-imsd: full error response (%d):\n%s\n", status_code, buf);
+			if (reason[0]) fprintf(stderr, "imsroha: Reason: %s\n", reason);
+			if (warning[0]) fprintf(stderr, "imsroha: Warning: %s\n", warning);
+			fprintf(stderr, "imsroha: full error response (%d):\n%s\n", status_code, buf);
 		}
 
 		if (status_code == 401) {
@@ -1811,20 +1842,20 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				find_header(buf, "Service-Route", ctx->reg_service_route, sizeof(ctx->reg_service_route));
 				find_header(buf, "P-Associated-URI", ctx->reg_associated_uri, sizeof(ctx->reg_associated_uri));
 				ctx->reg_state = IMSD_UP;
-				fprintf(stderr, "b2q-imsd: registered successfully! (expires %u s)\n", ctx->reg_expires);
-				fprintf(stderr, "b2q-imsd: REGISTER 200 OK headers:\n%s\n", buf);
+				fprintf(stderr, "imsroha: registered successfully! (expires %u s)\n", ctx->reg_expires);
+				fprintf(stderr, "imsroha: REGISTER 200 OK headers:\n%s\n", buf);
 				if (ctx->reg_service_route[0])
-					fprintf(stderr, "b2q-imsd: learned Service-Route: %s\n", ctx->reg_service_route);
+					fprintf(stderr, "imsroha: learned Service-Route: %s\n", ctx->reg_service_route);
 				if (ctx->reg_associated_uri[0])
-					fprintf(stderr, "b2q-imsd: learned P-Associated-URI: %s\n", ctx->reg_associated_uri);
+					fprintf(stderr, "imsroha: learned P-Associated-URI: %s\n", ctx->reg_associated_uri);
 				imsd_emit_state_changed(ctx->bus, IMSD_UP);
 				schedule_reg_refresh(ctx, ctx->reg_expires);
 			} else if (strstr(cseq, "PRACK")) {
-				fprintf(stderr, "b2q-imsd: PRACK acknowledged (200 OK)\n");
+				fprintf(stderr, "imsroha: PRACK acknowledged (200 OK)\n");
 			} else if (strstr(cseq, "INVITE")) {
 				/* 200 OK for Call -> Send ACK */
 				const char *body = strstr(buf, "\r\n\r\n");
-				fprintf(stderr, "b2q-imsd: INVITE answered (200 OK):\n%s\n", buf);
+				fprintf(stderr, "imsroha: INVITE answered (200 OK):\n%s\n", buf);
 				if (body && body[4]) {
 					char remote_ip[INET6_ADDRSTRLEN] = "";
 					uint16_t remote_port = 0;
@@ -1861,9 +1892,9 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"CSeq: %u ACK\r\n"
 					"Max-Forwards: 70\r\n"
 					"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->sip_port, branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ctx->call_invite_cseq);
 				send_sip_msg(ctx, ack, ack_len);
-				fprintf(stderr, "b2q-imsd: sent ACK:\n%.*s\n", ack_len, ack);
+				fprintf(stderr, "imsroha: sent ACK:\n%.*s\n", ack_len, ack);
 				ctx->call_state = IMSD_CALL_ACTIVE;
 				imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 4, 0);
 			}
@@ -1873,7 +1904,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			if (body && body[4]) {
 				char remote_ip[INET6_ADDRSTRLEN] = "";
 				uint16_t remote_port = 0;
-				fprintf(stderr, "b2q-imsd: early media SDP (%d):\n%s\n", status_code, body + 4);
+				fprintf(stderr, "imsroha: early media SDP (%d):\n%s\n", status_code, body + 4);
 				parse_sdp_codecs(body + 4, ctx);
 				if (parse_sdp_media(body + 4, remote_ip, sizeof(remote_ip), &remote_port) == 0) {
 					setup_remote_rtp(ctx, remote_ip, remote_port);
@@ -1913,7 +1944,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"RAck: %s %u INVITE\r\n"
 					"Max-Forwards: 70\r\n"
 					"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, IMSD_SIP_PORT, prack_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_cseq, rseq_hdr, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->sip_port, prack_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_cseq, rseq_hdr, ctx->call_invite_cseq);
 				send_sip_msg(ctx, prack, prack_len);
 			}
 			ctx->call_state = (status_code == 180) ? IMSD_CALL_RINGING : IMSD_CALL_EARLY_MEDIA;
@@ -1928,7 +1959,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			char cseq[64] = "";
 			find_header(buf, "CSeq", cseq, sizeof(cseq));
 			if (strstr(cseq, "MESSAGE")) {
-				fprintf(stderr, "b2q-imsd: SIP MESSAGE rejected by carrier (SIP %d)\n", status_code);
+				fprintf(stderr, "imsroha: SIP MESSAGE rejected by carrier (SIP %d)\n", status_code);
 				if (ctx->pending_sms_msg) {
 					sd_bus_reply_method_errorf(ctx->pending_sms_msg, SD_BUS_ERROR_FAILED,
 								   "Carrier rejected SMS (SIP status %d)", status_code);
@@ -1955,7 +1986,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"CSeq: %u ACK\r\n"
 					"Max-Forwards: 70\r\n"
 					"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, IMSD_SIP_PORT, ctx->call_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->sip_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_invite_cseq);
 				send_sip_msg(ctx, ack, ack_len);
 				ctx->call_state = IMSD_CALL_TERMINATED;
 				imsd_rtp_stop(ctx);
@@ -1969,7 +2000,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 	} else if (strncmp(buf, "CANCEL ", 7) == 0) {
 		handle_incoming_cancel(ctx, buf, (size_t)n);
 	} else if (strncmp(buf, "ACK ", 4) == 0) {
-		fprintf(stderr, "b2q-imsd: received ACK for incoming call dialog\n");
+		fprintf(stderr, "imsroha: received ACK for incoming call dialog\n");
 		/* After an offerless INVITE or re-INVITE the ACK carries the answer. */
 		char ack_cid[128] = "";
 		find_header(buf, "Call-ID", ack_cid, sizeof(ack_cid));
@@ -1997,13 +2028,13 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		int same_dialog = active_cid[0] && strcmp(call_id, active_cid) == 0;
 		if (same_dialog && ctx->call_state == IMSD_CALL_TERMINATED) {
 			/* Our 200 OK got lost and the BYE came again: answer it again. */
-			fprintf(stderr, "b2q-imsd: BYE retransmission (Call-ID %s)\n", call_id);
+			fprintf(stderr, "imsroha: BYE retransmission (Call-ID %s)\n", call_id);
 			send_simple_response(ctx, "200 OK", via, from, to, call_id, cseq);
 			return 0;
 		}
 		if (ctx->call_state == IMSD_CALL_IDLE || ctx->call_state == IMSD_CALL_TERMINATED ||
 		    !same_dialog) {
-			fprintf(stderr, "b2q-imsd: ignoring BYE for inactive/mismatched Call-ID %s\n", call_id);
+			fprintf(stderr, "imsroha: ignoring BYE for inactive/mismatched Call-ID %s\n", call_id);
 			char err_resp[2048];
 			int err_len = snprintf(err_resp, sizeof(err_resp),
 				"SIP/2.0 481 Call/Transaction Does Not Exist\r\n"
@@ -2019,7 +2050,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		}
 		char reason[160] = "";
 		find_header(buf, "Reason", reason, sizeof(reason));
-		fprintf(stderr, "b2q-imsd: remote hung up (BYE)%s%s\n", reason[0] ? ", Reason: " : "", reason);
+		fprintf(stderr, "imsroha: remote hung up (BYE)%s%s\n", reason[0] ? ", Reason: " : "", reason);
 		char ok_resp[2048];
 		int ok_len = snprintf(ok_resp, sizeof(ok_resp),
 			"SIP/2.0 200 OK\r\n"
@@ -2058,7 +2089,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		if (in_dialog_only &&
 		    (ctx->call_state == IMSD_CALL_IDLE || ctx->call_state == IMSD_CALL_TERMINATED ||
 		     !active_cid[0] || strcmp(call_id, active_cid) != 0)) {
-			fprintf(stderr, "b2q-imsd: in-dialog request for unknown Call-ID %s\n", call_id);
+			fprintf(stderr, "imsroha: in-dialog request for unknown Call-ID %s\n", call_id);
 			send_simple_response(ctx, "481 Call/Transaction Does Not Exist", via, from, to, call_id, cseq);
 			return 0;
 		}
@@ -2070,7 +2101,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			const char *tag = (ctx->call_state != IMSD_CALL_IDLE && ctx->call_state != IMSD_CALL_TERMINATED)
 				? (ctx->call_is_incoming ? ctx->call_to_tag : ctx->call_from_tag)
 				: ctx->reg_from_tag;
-			snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", to, tag[0] ? tag : "b2q");
+			snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", to, tag[0] ? tag : "imsroha");
 		}
 
 		char se_hdr[128] = "", se_val[64] = "";
@@ -2081,7 +2112,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		if (strncmp(buf, "UPDATE ", 7) == 0 && body && body[4]) {
 			/* Check the offer before it replaces the session we have. */
 			if (!sdp_has_amr(body + 4)) {
-				fprintf(stderr, "b2q-imsd: UPDATE offers no AMR, keeping the session\n");
+				fprintf(stderr, "imsroha: UPDATE offers no AMR, keeping the session\n");
 				send_simple_response(ctx, "488 Not Acceptable Here", via, from, to, call_id, cseq);
 				return 0;
 			}
@@ -2112,9 +2143,9 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				"Content-Length: %d\r\n\r\n"
 				"%s",
 				via, from, to_with_tag, call_id, cseq,
-				ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, se_hdr, sdp_len, sdp);
+				ctx->impu_user, ctx->local_ip, ctx->sip_port, se_hdr, sdp_len, sdp);
 			send_sip_msg(ctx, ok_resp, ok_len);
-			fprintf(stderr, "b2q-imsd: answered UPDATE with SDP (CSeq %s)\n", cseq);
+			fprintf(stderr, "imsroha: answered UPDATE with SDP (CSeq %s)\n", cseq);
 		} else {
 			char ok_resp[2048];
 			int ok_len = snprintf(ok_resp, sizeof(ok_resp),
@@ -2129,9 +2160,9 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				"%s"
 				"Content-Length: 0\r\n\r\n",
 				via, from, to_with_tag, call_id, cseq,
-				ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, se_hdr);
+				ctx->impu_user, ctx->local_ip, ctx->sip_port, se_hdr);
 			send_sip_msg(ctx, ok_resp, ok_len);
-			fprintf(stderr, "b2q-imsd: answered in-dialog/request with 200 OK (CSeq %s)\n", cseq);
+			fprintf(stderr, "imsroha: answered in-dialog/request with 200 OK (CSeq %s)\n", cseq);
 		}
 	}
 
@@ -2144,7 +2175,7 @@ static int on_sms_timeout(sd_event_source *s, uint64_t usec, void *userdata)
 	struct imsd_sip_ctx *ctx = userdata;
 	ctx->sms_timeout_timer = NULL;
 	if (ctx->pending_sms_msg) {
-		fprintf(stderr, "b2q-imsd: SMS delivery timeout (no carrier RP-ACK received)\n");
+		fprintf(stderr, "imsroha: SMS delivery timeout (no carrier RP-ACK received)\n");
 		sd_bus_reply_method_errorf(ctx->pending_sms_msg, SD_BUS_ERROR_TIMEOUT,
 					   "SMS delivery timed out waiting for carrier ack");
 		sd_bus_message_unref(ctx->pending_sms_msg);
@@ -2159,7 +2190,7 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 		return -EINVAL;
 
 	if (ctx->pending_sms_msg) {
-		fprintf(stderr, "b2q-imsd: rejecting MO-SMS, previous SMS still pending ack\n");
+		fprintf(stderr, "imsroha: rejecting MO-SMS, previous SMS still pending ack\n");
 		return -EBUSY;
 	}
 
@@ -2168,9 +2199,11 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 		ctx->sms_mr = 1;
 
 	unsigned char rp_buf[512];
-	int rp_len = imsd_sms_encode_rp_data(dest_number, text, ctx->sms_mr, rp_buf, sizeof(rp_buf));
+	int rp_len = imsd_sms_encode_rp_data(dest_number, text, ctx->cfg.car.country_code,
+					     ctx->sms_mr, ctx->smsc, ctx->smsc_len,
+					     rp_buf, sizeof(rp_buf));
 	if (rp_len < 0) {
-		fprintf(stderr, "b2q-imsd: failed to encode SMS RP-DATA: %d\n", rp_len);
+		fprintf(stderr, "imsroha: failed to encode SMS RP-DATA: %d\n", rp_len);
 		return rp_len;
 	}
 
@@ -2189,37 +2222,40 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 	clean_dest[c_idx] = '\0';
 
 	char sip_dest[64];
-	if (has_plus && strncmp(clean_dest, "82", 2) == 0 && c_idx > 2) {
-		snprintf(sip_dest, sizeof(sip_dest), "0%s", clean_dest + 2);
+	const char *cc = ctx->cfg.car.country_code;
+	size_t cc_len = strlen(cc);
+	if (has_plus && cc_len && strncmp(clean_dest, cc, cc_len) == 0 && c_idx > cc_len) {
+		snprintf(sip_dest, sizeof(sip_dest), "0%s", clean_dest + cc_len);
 	} else if (has_plus) {
 		snprintf(sip_dest, sizeof(sip_dest), "+%s", clean_dest);
 	} else {
 		snprintf(sip_dest, sizeof(sip_dest), "%s", clean_dest);
 	}
 
-	char req_hdr[1024];
+	char req_hdr[2048];
 	int hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-		"MESSAGE sip:%s@" IMSD_DOMAIN ";user=phone SIP/2.0\r\n"
+		"MESSAGE sip:%s@%s;user=phone SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
 		"From: <%s>;tag=%s\r\n"
-		"To: <sip:%s@" IMSD_DOMAIN ";user=phone>\r\n"
-		"Call-ID: %s@" IMSD_DOMAIN "\r\n"
+		"To: <sip:%s@%s;user=phone>\r\n"
+		"Call-ID: %s@%s\r\n"
 		"CSeq: 1 MESSAGE\r\n"
 		"Max-Forwards: 70\r\n"
-		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
+		"P-Access-Network-Info: %s\r\n"
 		"P-Preferred-Identity: <%s>\r\n"
 		"P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel.smsip\r\n"
-		"User-Agent: " IMSD_USER_AGENT "\r\n"
+		"User-Agent: %s\r\n"
 		"Accept-Contact: *;+g.3gpp.smsip;require;explicit\r\n"
 		"Content-Type: application/vnd.3gpp.sms\r\n"
 		"Content-Length: %d\r\n\r\n",
-		sip_dest, ctx->local_ip, IMSD_SIP_PORT, branch, ctx->impu, tag, sip_dest, cid, ctx->impu, rp_len);
+		sip_dest, ctx->domain, ctx->local_ip, ctx->sip_port, branch, ctx->impu, tag, sip_dest, ctx->domain,
+		cid, ctx->domain, ctx->pani, ctx->impu, ctx->user_agent, rp_len);
 
-	unsigned char full_msg[1536];
+	unsigned char full_msg[2560];
 	memcpy(full_msg, req_hdr, hdr_len);
 	memcpy(full_msg + hdr_len, rp_buf, rp_len);
 
-	fprintf(stderr, "b2q-imsd: sending MO-SMS (MR 0x%02x) to %s (%d bytes)...\n",
+	fprintf(stderr, "imsroha: sending MO-SMS (MR 0x%02x) to %s (%d bytes)...\n",
 		ctx->sms_mr, sip_dest, rp_len);
 	int r = send_sip_msg(ctx, full_msg, hdr_len + rp_len);
 	if (r < 0)
@@ -2251,7 +2287,7 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 	rand_hex(ctx->call_from_tag, 8);
 	char cid_rnd[32];
 	rand_hex(cid_rnd, 16);
-	snprintf(ctx->call_id, sizeof(ctx->call_id), "%s@" IMSD_DOMAIN, cid_rnd);
+	snprintf(ctx->call_id, sizeof(ctx->call_id), "%s@%s", cid_rnd, ctx->domain);
 	ctx->call_cseq = 1;
 	ctx->call_invite_cseq = 1;
 	ctx->call_is_incoming = 0;
@@ -2264,8 +2300,8 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 	snprintf(ctx->call_branch, sizeof(ctx->call_branch), "z9hG4bK%s", branch);
 
 	/* Fixed payload types in our offer, never the previous call's. */
-	ctx->call_pt_amrwb = IMSD_PT_AMRWB;
-	ctx->call_pt_amr = IMSD_PT_AMR;
+	ctx->call_pt_amrwb = ctx->cfg.car.pt_amrwb;
+	ctx->call_pt_amr = ctx->cfg.car.pt_amr;
 	ctx->call_has_wb = ctx->call_has_nb = 1;
 	/* No DTMF until the answer says which telephone-event clocks it kept. */
 	ctx->call_has_dtmf_wb = ctx->call_has_dtmf_nb = 0;
@@ -2277,6 +2313,8 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 	char clean_dest[64];
 	size_t c_idx = 0;
 	int has_plus = (dest_number[0] == '+');
+	const char *cc = ctx->cfg.car.country_code;
+	size_t cc_len = strlen(cc);
 	for (size_t i = (has_plus ? 1 : 0); dest_number[i] && c_idx + 1 < sizeof(clean_dest); i++) {
 		if (dest_number[i] >= '0' && dest_number[i] <= '9')
 			clean_dest[c_idx++] = dest_number[i];
@@ -2296,25 +2334,25 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 	 * LG U+'s own HSS and failed for every KT and SKT number. A dial string
 	 * that is already a sip: or tel: URI is passed through for diagnostics.
 	 */
-	char target_ruri[160];
-	char target_to[160];
+	char target_ruri[256];
+	char target_to[260];
 	if (strncmp(dest_number, "sip:", 4) == 0 || strncmp(dest_number, "tel:", 4) == 0) {
 		snprintf(target_ruri, sizeof(target_ruri), "%s", dest_number);
-	} else if (has_plus && strncmp(clean_dest, "82", 2)) {
-		/* International number outside Korea: a global tel: URI. */
+	} else if (has_plus && (!cc_len || strncmp(clean_dest, cc, cc_len))) {
+		/* International number outside the home country: a global tel: URI. */
 		snprintf(target_ruri, sizeof(target_ruri), "tel:+%s", clean_dest);
 	} else {
 		/*
-		 * Domestic, service code (114) or +82: the national form as a local
-		 * number. A global tel:+82... got 503 from LG U+.
+		 * Domestic, service code (114) or +<home cc>: the national form as a
+		 * local number. A global tel:+82... got 503 from LG U+.
 		 */
 		char national[64];
 		const char *number = clean_dest;
 		if (has_plus) {
-			snprintf(national, sizeof(national), "0%s", clean_dest + 2);
+			snprintf(national, sizeof(national), "0%s", clean_dest + cc_len);
 			number = national;
 		}
-		snprintf(target_ruri, sizeof(target_ruri), "tel:%s;phone-context=" IMSD_DOMAIN, number);
+		snprintf(target_ruri, sizeof(target_ruri), "tel:%s;phone-context=%s", number, ctx->domain);
 	}
 	snprintf(target_to, sizeof(target_to), "<%s>", target_ruri);
 
@@ -2328,7 +2366,7 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 		snprintf(route_hdr, sizeof(route_hdr), "Route: %s\r\n", ctx->reg_service_route);
 	}
 
-	char req[1800];
+	char req[3072];
 	int req_len = snprintf(req, sizeof(req),
 		"INVITE %s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
@@ -2339,21 +2377,22 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 		"CSeq: %u INVITE\r\n"
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
 		"Max-Forwards: 70\r\n"
-		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000\r\n"
+		"P-Access-Network-Info: %s\r\n"
 		"P-Preferred-Identity: <%s>\r\n"
 		"P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel\r\n"
-		"User-Agent: " IMSD_USER_AGENT "\r\n"
+		"User-Agent: %s\r\n"
 		"P-Early-Media: supported\r\n"
 		"Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";require;explicit\r\n"
 		"Allow: " IMSD_ALLOW "\r\n"
 		"Supported: 100rel, timer\r\n"
-		"Session-Expires: 1800\r\n"
+		"Session-Expires: %u\r\n"
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: %d\r\n\r\n"
 		"%s",
-		target_ruri, ctx->local_ip, IMSD_SIP_PORT, branch, route_hdr, ctx->impu, ctx->call_from_tag, target_to, ctx->call_id, ctx->call_cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, ctx->impu, sdp_len, sdp);
+		target_ruri, ctx->local_ip, ctx->sip_port, branch, route_hdr, ctx->impu, ctx->call_from_tag, target_to, ctx->call_id, ctx->call_cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port, ctx->pani, ctx->impu, ctx->user_agent,
+		ctx->cfg.car.session_expires, sdp_len, sdp);
 
-	fprintf(stderr, "b2q-imsd: placing VoLTE call to %s with INVITE:\n%s\n", dest_number, req);
+	fprintf(stderr, "imsroha: placing VoLTE call to %s with INVITE:\n%s\n", dest_number, req);
 	imsd_rtp_start(ctx);
 	imsd_emit_call_added(ctx->bus, ctx->active_call_id, dest_number, 2);
 	imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 2, 0);
@@ -2385,7 +2424,7 @@ int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: %d\r\n\r\n"
 		"%s",
-		ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag, ctx->inc_call_id, ctx->inc_cseq, ctx->impu_user, ctx->local_ip, IMSD_SIP_PORT, sdp_len, sdp);
+		ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag, ctx->inc_call_id, ctx->inc_cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port, sdp_len, sdp);
 
 	imsd_rtp_start(ctx);
 	send_sip_msg(ctx, resp, len);
@@ -2416,7 +2455,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag,
 				ctx->inc_call_id, ctx->inc_cseq);
 			send_sip_msg(ctx, decl, dlen);
-			fprintf(stderr, "b2q-imsd: declined incoming call (603)\n");
+			fprintf(stderr, "imsroha: declined incoming call (603)\n");
 		} else if (ctx->call_state == IMSD_CALL_ACTIVE) {
 			char bye_branch[32];
 			rand_hex(bye_branch, 8);
@@ -2432,7 +2471,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				"CSeq: %u BYE\r\n"
 				"Max-Forwards: 70\r\n"
 				"Content-Length: 0\r\n\r\n",
-				ruri, ctx->local_ip, IMSD_SIP_PORT, bye_branch,
+				ruri, ctx->local_ip, ctx->sip_port, bye_branch,
 				ctx->inc_to, ctx->call_to_tag, ctx->inc_from,
 				ctx->inc_call_id, ++ctx->call_cseq);
 			send_sip_msg(ctx, req, len);
@@ -2452,7 +2491,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				"CSeq: %u CANCEL\r\n"
 				"Max-Forwards: 70\r\n"
 				"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, IMSD_SIP_PORT, ctx->call_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_id, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->sip_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_id, ctx->call_invite_cseq);
 			send_sip_msg(ctx, req, len);
 		} else if (ctx->call_state == IMSD_CALL_ACTIVE) {
 			/* Send BYE */
@@ -2469,7 +2508,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				"CSeq: %u BYE\r\n"
 				"Max-Forwards: 70\r\n"
 				"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, IMSD_SIP_PORT, bye_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ++ctx->call_cseq);
+		ruri, ctx->local_ip, ctx->sip_port, bye_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ++ctx->call_cseq);
 			send_sip_msg(ctx, req, len);
 		}
 	}
@@ -2477,6 +2516,135 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 	uint32_t cid = ctx->active_call_id;
 	ctx->call_state = IMSD_CALL_IDLE;
 	imsd_emit_call_state_changed(ctx->bus, cid, 6, 0);
+	return 0;
+}
+
+/* Adds one P-CSCF to the list unless it is there already. */
+static void pcscf_add(struct imsd_sip_ctx *ctx, const struct in6_addr *a, uint16_t port)
+{
+	for (int i = 0; i < ctx->pcscf_n; i++)
+		if (!memcmp(&ctx->pcscf_list[i].sin6_addr, a, sizeof(*a)) &&
+		    ctx->pcscf_list[i].sin6_port == htons(port))
+			return;
+	if (ctx->pcscf_n >= IMSD_MAX_PCSCF)
+		return;
+	struct sockaddr_in6 *sa = &ctx->pcscf_list[ctx->pcscf_n++];
+	memset(sa, 0, sizeof(*sa));
+	sa->sin6_family = AF_INET6;
+	sa->sin6_port = htons(port);
+	sa->sin6_addr = *a;
+}
+
+/* "addr", "[addr]:port", "name" or "name:port"; names resolve over the PDN's DNS. */
+static void pcscf_add_spec(struct imsd_sip_ctx *ctx, const char *spec, const struct imsroha_pdn *pdn)
+{
+	char host[256];
+	uint16_t port = ctx->cfg.car.pcscf_port;
+	struct in6_addr a[4];
+
+	if (spec[0] == '[') {
+		const char *end = strchr(spec, ']');
+		if (!end)
+			return;
+		snprintf(host, sizeof(host), "%.*s", (int)(end - spec - 1), spec + 1);
+		if (end[1] == ':')
+			port = (uint16_t)atoi(end + 2);
+	} else if (strchr(spec, ':') && strchr(spec, ':') == strrchr(spec, ':') && !strchr(spec, '[')
+		   && inet_pton(AF_INET6, spec, &a[0]) != 1) {
+		/* one colon and not an IPv6 address: name:port */
+		const char *c = strchr(spec, ':');
+		snprintf(host, sizeof(host), "%.*s", (int)(c - spec), spec);
+		port = (uint16_t)atoi(c + 1);
+	} else {
+		snprintf(host, sizeof(host), "%s", spec);
+	}
+	if (inet_pton(AF_INET6, host, &a[0]) == 1) {
+		pcscf_add(ctx, &a[0], port);
+		return;
+	}
+	struct in_addr v4;
+	if (inet_pton(AF_INET, host, &v4) == 1) {
+		fprintf(stderr, "imsroha: P-CSCF %s is IPv4, the IMS PDN is IPv6 only: skipped\n", host);
+		return;
+	}
+	int n = imsroha_dns_aaaa(host, pdn->dns, ctx->local_ip, ctx->iface, a, 4, 2000);
+	for (int i = 0; i < n; i++)
+		pcscf_add(ctx, &a[i], port);
+}
+
+static void pcscf_add_list(struct imsd_sip_ctx *ctx, const char *list, const struct imsroha_pdn *pdn)
+{
+	char buf[512];
+	snprintf(buf, sizeof(buf), "%s", list);
+	for (char *save = NULL, *t = strtok_r(buf, " ,", &save); t; t = strtok_r(NULL, " ,", &save))
+		pcscf_add_spec(ctx, t, pdn);
+}
+
+int imsd_sip_setup(struct imsd_sip_ctx *ctx, const struct imsd_isim_identity *id,
+		   const struct imsroha_config *cfg, const struct imsroha_pdn *pdn)
+{
+	ctx->cfg = *cfg;
+	snprintf(ctx->impi, sizeof(ctx->impi), "%s", id->impi);
+	snprintf(ctx->impu, sizeof(ctx->impu), "%s", id->impu);
+	if (strncmp(id->impu, "sip:", 4) != 0 || !strchr(id->impu, '@')) {
+		fprintf(stderr, "imsroha: public identity is not a SIP URI\n");
+		return -EPROTO;
+	}
+	snprintf(ctx->impu_user, sizeof(ctx->impu_user), "%.*s",
+		 (int)(strchr(id->impu, '@') - (id->impu + 4)), id->impu + 4);
+
+	/* The ISIM's home domain, else the carrier's, else the one derived from the PLMN. */
+	if (id->has_isim && id->domain[0])
+		snprintf(ctx->domain, sizeof(ctx->domain), "%s", id->domain);
+	else if (cfg->car.domain[0])
+		snprintf(ctx->domain, sizeof(ctx->domain), "%s", cfg->car.domain);
+	else
+		imsroha_derived_domain(id->mcc, id->mnc, ctx->domain, sizeof(ctx->domain));
+	if (id->has_isim && cfg->car.domain[0] && strcmp(id->domain, cfg->car.domain))
+		fprintf(stderr, "imsroha: ISIM home domain %s, carrier profile says %s: using the ISIM's\n",
+			id->domain, cfg->car.domain);
+
+	snprintf(ctx->iface, sizeof(ctx->iface), "%s", pdn->iface);
+	snprintf(ctx->local_ip, sizeof(ctx->local_ip), "%s", pdn->addr);
+	ctx->sip_port = cfg->car.sip_port;
+	imsroha_config_user_agent(cfg, ctx->user_agent, sizeof(ctx->user_agent));
+	/*
+	 * No cell identity is read from the modem: the PLMN with an all-zero
+	 * TAC and cell id, which is what LG U+ has been answering to.
+	 */
+	snprintf(ctx->pani, sizeof(ctx->pani), "3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=%s%s00000000000",
+		 id->mcc, id->mnc);
+
+	const char *smsc = cfg->car.smsc[0] ? cfg->car.smsc : id->smsc;
+	int n = smsc[0] ? imsd_sms_address_element(smsc, ctx->smsc, sizeof(ctx->smsc)) : -ENOENT;
+	ctx->smsc_len = n > 0 ? (size_t)n : 0;
+	if (cfg->car.sms_over_ip && !ctx->smsc_len)
+		fprintf(stderr, "imsroha: no SMSC (EF_SMSP is empty, no smsc= set): MO-SMS will fail\n");
+
+	/* P-CSCFs: what the network sent in the PCO, then the carrier's list. */
+	ctx->pcscf_n = 0;
+	pcscf_add_list(ctx, pdn->pcscf, pdn);
+	pcscf_add_list(ctx, pdn->pcscf_fqdn, pdn);
+	pcscf_add_list(ctx, cfg->car.pcscf, pdn);
+	if (!ctx->pcscf_n) {
+		fprintf(stderr, "imsroha: no P-CSCF: none in the PCO, none in the carrier profile\n");
+		return -EDESTADDRREQ;
+	}
+	ctx->pcscf_cur = 0;
+	ctx->pcscf_addr = ctx->pcscf_list[0];
+
+	char a[INET6_ADDRSTRLEN];
+	inet_ntop(AF_INET6, &ctx->pcscf_addr.sin6_addr, a, sizeof(a));
+	fprintf(stderr, "imsroha: carrier %s, domain %s, P-CSCF [%s]:%u (%d known), SIP port %u, SMS over IP %s\n",
+		cfg->car.name[0] ? cfg->car.name : "(none, 3GPP defaults)", ctx->domain, a,
+		ntohs(ctx->pcscf_addr.sin6_port), ctx->pcscf_n, ctx->sip_port,
+		cfg->car.sms_over_ip ? "yes" : "no");
+
+	rand_hex(ctx->reg_from_tag, 8);
+	char cid_rnd[32];
+	rand_hex(cid_rnd, 16);
+	snprintf(ctx->reg_call_id, sizeof(ctx->reg_call_id), "%s@%s", cid_rnd, ctx->domain);
+	ctx->reg_cseq = 1;
 	return 0;
 }
 
@@ -2491,38 +2659,44 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	ctx->rtp_fd = -1;
 	srand((unsigned)time(NULL) ^ getpid());
 
+	struct imsroha_config cfg;
+	int r = imsroha_config_load_device(&cfg.dev);
+	if (r < 0)
+		return r;
+	imsroha_sim_set_device(&cfg.dev);
+
 	/*
-	 * Who we are comes from the ISIM (TS 31.103 EF_IMPI/EF_IMPU/EF_DOMAIN),
-	 * not from constants: the same build works for any SIM, and no
-	 * subscriber identity lives in the source.
+	 * Who we are comes from the SIM (the ISIM's files, or identities derived
+	 * from the USIM's IMSI), never from constants: the same build works for
+	 * any SIM, and no subscriber identity lives in the source.
 	 */
 	struct imsd_isim_identity id;
-	int r = imsd_isim_read_identity(&id);
+	r = imsd_isim_read_identity(&id);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: cannot read the identity from the ISIM: %s\n", strerror(-r));
+		fprintf(stderr, "imsroha: cannot read the identity from the SIM: %s\n", strerror(-r));
 		return r;
 	}
-	if (strncmp(id.impu, "sip:", 4) != 0 || !strchr(id.impu, '@')) {
-		fprintf(stderr, "b2q-imsd: ISIM public identity is not a SIP URI\n");
-		return -EPROTO;
-	}
-	if (strcmp(id.domain, IMSD_DOMAIN) != 0)
-		fprintf(stderr, "b2q-imsd: ISIM home domain %s differs from %s\n", id.domain, IMSD_DOMAIN);
-	snprintf(ctx->impi, sizeof(ctx->impi), "%s", id.impi);
-	snprintf(ctx->impu, sizeof(ctx->impu), "%s", id.impu);
-	snprintf(ctx->impu_user, sizeof(ctx->impu_user), "%.*s",
-		 (int)(strchr(id.impu, '@') - (id.impu + 4)), id.impu + 4);
-	fprintf(stderr, "b2q-imsd: identity read from the ISIM\n");
+	fprintf(stderr, "imsroha: identity read from the %s\n", id.has_isim ? "ISIM" : "USIM (derived)");
 
-	r = get_ims_ipv6(ctx->local_ip, sizeof(ctx->local_ip));
+	r = imsroha_config_load(&cfg, id.mcc, id.mnc);
+	if (r < 0)
+		return r;
+
+	struct imsroha_pdn pdn;
+	r = imsroha_pdn_read(imsroha_runtime_dir(), &pdn);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: failed to find IPv6 on %s: %d\n", IMSD_IMS_IFACE, r);
+		fprintf(stderr, "imsroha: no IMS PDN hand-off in %s/pdn (%s): is imsroha-bearer up?\n",
+			imsroha_runtime_dir(), strerror(-r));
 		return r;
 	}
+
+	r = imsd_sip_setup(ctx, &id, &cfg, &pdn);
+	if (r < 0)
+		return r;
 
 	ctx->fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (ctx->fd < 0) {
-		fprintf(stderr, "b2q-imsd: socket failed: %s\n", strerror(errno));
+		fprintf(stderr, "imsroha: socket failed: %s\n", strerror(errno));
 		return -errno;
 	}
 
@@ -2533,8 +2707,8 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	 * this a host on Wi-Fi could hand us SIP (and fake SMS) for the IMS
 	 * address. Only the carrier's side of the IMS PDN may reach this socket.
 	 */
-	if (setsockopt(ctx->fd, SOL_SOCKET, SO_BINDTODEVICE, IMSD_IMS_IFACE, sizeof(IMSD_IMS_IFACE)) < 0) {
-		fprintf(stderr, "b2q-imsd: SO_BINDTODEVICE %s failed: %s\n", IMSD_IMS_IFACE, strerror(errno));
+	if (setsockopt(ctx->fd, SOL_SOCKET, SO_BINDTODEVICE, ctx->iface, strlen(ctx->iface) + 1) < 0) {
+		fprintf(stderr, "imsroha: SO_BINDTODEVICE %s failed: %s\n", ctx->iface, strerror(errno));
 		int r = -errno;
 		close(ctx->fd);
 		ctx->fd = -1;
@@ -2544,38 +2718,27 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	struct sockaddr_in6 bind_addr;
 	memset(&bind_addr, 0, sizeof(bind_addr));
 	bind_addr.sin6_family = AF_INET6;
-	bind_addr.sin6_port = htons(IMSD_SIP_PORT);
+	bind_addr.sin6_port = htons(ctx->sip_port);
 	inet_pton(AF_INET6, ctx->local_ip, &bind_addr.sin6_addr);
 
 	if (bind(ctx->fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
 		int r = -errno;
-		fprintf(stderr, "b2q-imsd: bind %s:%u failed: %s\n",
-			ctx->local_ip, IMSD_SIP_PORT, strerror(-r));
+		fprintf(stderr, "imsroha: bind %s:%u failed: %s\n",
+			ctx->local_ip, ctx->sip_port, strerror(-r));
 		close(ctx->fd);
 		ctx->fd = -1;
 		return r;
 	}
 
-	memset(&ctx->pcscf_addr, 0, sizeof(ctx->pcscf_addr));
-	ctx->pcscf_addr.sin6_family = AF_INET6;
-	ctx->pcscf_addr.sin6_port = htons(IMSD_PCSCF_PORT);
-	inet_pton(AF_INET6, IMSD_PCSCF_IP, &ctx->pcscf_addr.sin6_addr);
-
-	rand_hex(ctx->reg_from_tag, 8);
-	char cid_rnd[32];
-	rand_hex(cid_rnd, 16);
-	snprintf(ctx->reg_call_id, sizeof(ctx->reg_call_id), "%s@" IMSD_DOMAIN, cid_rnd);
-	ctx->reg_cseq = 1;
-
 	sd_event_source *io_src = NULL;
 	r = sd_event_add_io(event, &io_src, ctx->fd, EPOLLIN, on_sip_packet, ctx);
 	if (r < 0) {
-		fprintf(stderr, "b2q-imsd: sd_event_add_io failed: %d\n", r);
+		fprintf(stderr, "imsroha: sd_event_add_io failed: %d\n", r);
 		close(ctx->fd);
 		return r;
 	}
 
-	fprintf(stderr, "b2q-imsd: SIP UDP socket bound to [%s]:%u\n", ctx->local_ip, IMSD_SIP_PORT);
+	fprintf(stderr, "imsroha: SIP UDP socket bound to [%s]:%u\n", ctx->local_ip, ctx->sip_port);
 	return imsd_sip_register(ctx);
 }
 

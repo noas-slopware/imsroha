@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #include <stddef.h>
@@ -7,26 +8,12 @@
 #include <netinet/in.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-event.h>
+#include <net/if.h>
 #include "codec.h"
+#include "config.h"
 
-#define IMSD_SIP_PORT 5060
-#define IMSD_PCSCF_IP "2001:4430:4:401::43"
-#define IMSD_PCSCF_PORT 5060
-#define IMSD_DOMAIN "lte-lguplus.co.kr"
-#define IMSD_IMS_IFACE "qmapmux0.3"
-/*
- * TTAK.KO-06.0357 (Korean VoLTE terminal standard), mandatory User-Agent:
- * "TTA-VoLTE/<ver> <model>/<SW version> Device_Type/<type> <operator>", the
- * format of the stock LG U+ profile ("TTA-VoLTE/[UICC_VERSION]
- * [PRODUCT_MODEL]/[BUILD_VERSION] Device_Type/Android_Phone [OMCCODE]").
- * Operators classify the terminal from it.
- */
-/* Payload types imsd offers (same numbers as the stock profile where it has them). */
-#define IMSD_PT_AMRWB 106
-#define IMSD_PT_AMR 104
-#define IMSD_PT_DTMF_WB 107
-#define IMSD_PT_DTMF 101
-#define IMSD_USER_AGENT "TTA-VoLTE/1.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LUC"
+/* At most this many P-CSCFs are tried, in order (PCO first, then the carrier's). */
+#define IMSD_MAX_PCSCF 8
 /* Methods we answer; every Allow header we send lists the same set. */
 #define IMSD_ALLOW "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO"
 
@@ -49,7 +36,19 @@ struct imsd_sip_ctx {
 	sd_event *event;
 	sd_bus *bus;
 	char local_ip[INET6_ADDRSTRLEN];
-	struct sockaddr_in6 pcscf_addr;
+	struct sockaddr_in6 pcscf_addr;    /* the P-CSCF in use: pcscf_list[pcscf_cur] */
+	struct sockaddr_in6 pcscf_list[IMSD_MAX_PCSCF];
+	int pcscf_n, pcscf_cur;
+
+	/* Who and where we are, from the config, the SIM and the PDN. */
+	struct imsroha_config cfg;
+	char iface[IFNAMSIZ];
+	char domain[128];       /* home network domain: R-URI, realm, phone-context */
+	uint16_t sip_port;
+	char user_agent[256];
+	char pani[160];         /* P-Access-Network-Info value */
+	unsigned char smsc[12]; /* RP destination: the SC address element (length, TON/NPI, BCD) */
+	size_t smsc_len;
 
 	/* Subscriber identity, read from the ISIM at start (never compiled in). */
 	char impi[128];      /* private identity, the Digest username */
@@ -59,7 +58,7 @@ struct imsd_sip_ctx {
 	/* Registration state */
 	int reg_state; /* 0=down, 1=registering, 2=up */
 	uint32_t reg_cseq;
-	char reg_call_id[64];
+	char reg_call_id[192];
 	char reg_from_tag[16];
 	uint32_t reg_expires;
 	/* Min-Expires from a 423 to REGISTER, 0 until one arrives. */
@@ -73,12 +72,12 @@ struct imsd_sip_ctx {
 	/* Call state */
 	int call_state;
 	uint32_t active_call_id;
-	char call_id[64];
+	char call_id[192];
 	char call_branch[64];
 	char call_from_tag[16];
 	char call_to_tag[64];
-	char call_remote[160]; /* the INVITE's To value, <tel:...> */
-	char call_remote_uri[128];
+	char call_remote[256]; /* the INVITE's To value, <tel:...> */
+	char call_remote_uri[256];
 	char call_remote_contact[128];
 	uint32_t call_cseq;
 	uint32_t call_invite_cseq;
@@ -170,6 +169,10 @@ struct imsd_sip_ctx {
 	uint64_t playout_late, playout_filled, playout_resyncs;
 };
 
+struct imsd_isim_identity;
+/* Fills ctx from the SIM identity, the config and the PDN hand-off (no sockets). */
+int imsd_sip_setup(struct imsd_sip_ctx *ctx, const struct imsd_isim_identity *id,
+		   const struct imsroha_config *cfg, const struct imsroha_pdn *pdn);
 int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus);
 void imsd_sip_destroy(struct imsd_sip_ctx *ctx);
 

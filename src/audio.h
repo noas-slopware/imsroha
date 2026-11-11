@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #include <stdint.h>
@@ -6,9 +7,9 @@
 /*
  * Call audio hand-off to the user session.
  *
- * b2q-imsd runs as a system service and keeps RTP and the AMR-WB codec. The
- * PCM goes over a SOCK_SEQPACKET socket, /run/b2q-imsd/audio.sock (root:audio,
- * 0660), to b2q-ims-audio in the user's session, which plays and records it
+ * imsroha runs as a system service and keeps RTP and the AMR-WB codec. The
+ * PCM goes over a SOCK_SEQPACKET socket, /run/imsroha/audio.sock (root:audio,
+ * 0660), to imsroha-audio in the user's session, which plays and records it
  * through PipeWire. One datagram per message:
  *
  *   'S'                call audio starts: open playback and capture

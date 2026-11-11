@@ -1,8 +1,20 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * imsroha-vss-samsung: Samsung's modem firmware keeps IMS registration gated
+ * until its own IMS stack (rild, over the vendor QMI service 227 "VSS",
+ * which tunnels Samsung IPC) says it registered. With no Android, nothing
+ * says so and the modem holds the IMS PDN back. This sends that IPC once
+ * (IMS_REG_SET, VoLTE over LTE), then the two SDM P-CSCF queries, and stays
+ * to log what the modem answers.
+ *
+ * On a modem without service 227 (anything not Samsung) it exits 0 at once.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <libqmi-glib.h>
-#include <libqrtr-glib.h>
+#include "config.h"
+#include "qmidev.h"
 
 static GMainLoop *loop;
 static QmiDevice *g_dev;
@@ -11,7 +23,7 @@ static guint8 g_cid;
 static int exit_code;
 
 static void quit_fail(const char *why) {
-    g_printerr("b2q-vss-manager: %s\n", why);
+    g_printerr("imsroha-vss-samsung: %s\n", why);
     exit_code = 1;
     if (loop)
         g_main_loop_quit(loop);
@@ -173,13 +185,7 @@ static void client_ready(QmiDevice *device, GAsyncResult *res, gpointer user_dat
 }
 
 static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data) {
-    GError *error = NULL;
-    if (!qmi_device_open_finish(device, res, &error)) {
-        g_print("Open failed: %s\n", error ? error->message : "?");
-        if (error) g_error_free(error);
-        quit_fail("failed to open QMI device");
-        return;
-    }
+    (void)res; (void)user_data;
     g_dev = device;
     g_signal_connect(g_dev, "indication", G_CALLBACK(on_indication), NULL);
     g_signal_connect(g_dev, QMI_DEVICE_SIGNAL_REMOVED, G_CALLBACK(on_device_removed), NULL);
@@ -187,32 +193,31 @@ static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data)
     qmi_device_allocate_client(device, (QmiService)227, QMI_CID_NONE, 10, NULL, (GAsyncReadyCallback)client_ready, NULL);
 }
 
-static void device_ready(GObject *unused, GAsyncResult *res, gpointer user_data) {
-    QmiDevice *dev = qmi_device_new_from_node_finish(res, NULL);
+static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
+    GError *error = NULL;
+    (void)src; (void)user_data;
+    QmiDevice *dev = imsroha_qmi_open_finish(res, &error);
     if (!dev) {
-        quit_fail("qmi_device_new_from_node failed");
+        g_printerr("imsroha-vss-samsung: opening the modem's QMI device: %s\n", error->message);
+        g_error_free(error);
+        quit_fail("no QMI device");
         return;
     }
-    qmi_device_open(dev, QMI_DEVICE_OPEN_FLAGS_EXPECT_INDICATIONS, 10, NULL, (GAsyncReadyCallback)open_ready, NULL);
+    if (imsroha_qmi_has_service(dev, (QmiService)227) == 0) {
+        g_print("imsroha-vss-samsung: the modem has no Samsung VSS service, nothing to do\n");
+        g_object_unref(dev);
+        g_main_loop_quit(loop);
+        return;
+    }
+    open_ready(dev, NULL, NULL);
 }
 
-static void bus_ready(GObject *unused, GAsyncResult *res, gpointer user_data) {
-    QrtrBus *bus = qrtr_bus_new_finish(res, NULL);
-    if (!bus) {
-        quit_fail("qrtr_bus_new failed");
-        return;
-    }
-    QrtrNode *node = qrtr_bus_peek_node(bus, 0);
-    if (!node) {
-        quit_fail("modem QRTR node 0 not found");
-        return;
-    }
-    qmi_device_new_from_node(node, NULL, (GAsyncReadyCallback)device_ready, NULL);
-}
-
-int main() {
+int main(void) {
+    struct imsroha_device dev;
+    if (imsroha_config_load_device(&dev) < 0)
+        return 1;
     loop = g_main_loop_new(NULL, FALSE);
-    qrtr_bus_new(3000, NULL, (GAsyncReadyCallback)bus_ready, NULL);
+    imsroha_qmi_open(&dev, QMI_DEVICE_OPEN_FLAGS_EXPECT_INDICATIONS, NULL, on_open, NULL);
     g_main_loop_run(loop);
     return exit_code;
 }

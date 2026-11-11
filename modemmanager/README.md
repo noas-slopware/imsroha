@@ -2,14 +2,14 @@
 
 Upstream project: ModemManager, https://gitlab.freedesktop.org/mobile-broadband/ModemManager
 
-Apply to: **1.24.2** (the tag the phone's `modemmanager` package is built from).
+Apply to: **1.24.2**.
 Upstream license: GPL-2.0-or-later.
 
 Patches, in order:
 
-- `0001-broadband-modem-qmi-add-b2q-imsd-backend-for-voice-a.patch` connects the
-  Voice and Messaging interfaces to `b2q-imsd` over D-Bus when the modem port carries
-  `ID_MM_B2Q_IMS`.
+- `0001-broadband-modem-qmi-add-imsroha-backend-for-voice-and-messaging.patch` connects the
+  Voice and Messaging interfaces to `imsroha` over D-Bus when the modem port carries
+  `ID_MM_IMSROHA`.
 - `0002-port-qmi-reset-only-the-default-mux-link-on-IPA.patch` is kept for reference
   and is **not** applied. Skipping the parent reset and deleting only `qmapmux0.0`
   preserves `qmapmux0.3` but makes WDA report `raw-ip` with aggregation disabled for
@@ -19,8 +19,8 @@ Patches, in order:
 - `0003-iface-modem-do-not-abort-when-the-bearer-count-exceeds.patch` turns the
   `max >= ctx.count` assertion into a warning when ModemManager is stopped with an
   active bearer, so it does not dump core during a restart.
-- `0004-call-ims-send-DTMF-through-b2q-imsd.patch` implements `SendDtmf` on the IMS
-  call: it forwards the digits to `org.b2q.Imsd.SendDtmf`, which sends them as RFC 4733
+- `0004-call-ims-send-DTMF-through-imsroha.patch` implements `SendDtmf` on the IMS
+  call: it forwards the digits to `codes.noa.IMSroha.SendDtmf`, which sends them as RFC 4733
   `telephone-event` packets. Without it ModemManager answers every `SendDtmf` with
   "Sending dtmf is not supported by this modem".
 - `0005-port-qmi-keep-the-IPA-QMAP-data-path-when-another-PDN.patch` is option 4 of
@@ -30,16 +30,20 @@ Patches, in order:
   visible at every boot). If the modem already runs raw-ip with QMAP aggregation, it
   keeps that and deletes only its own `qmapmux0.0`; otherwise it runs the full setup as
   before. The first version (1.24.2-12) kept the path whenever the IMS link existed: on a
-  boot where `b2q-ims-bearer` came up before ModemManager's first connect, the modem was
+  boot where `imsroha-bearer` came up before ModemManager's first connect, the modem was
   never switched to QMAP, rmnet dropped every downlink packet, and IMS did not register
   (2026-11-11 04:05-04:12).
+
+- `0006-broadband-modem-qmi-leave-SMS-with-the-modem-where-the-carrier-has-no-SMS-over-IP.patch`
+  keeps Messaging on the modem's own WMS path when imsroha's carrier profile for the
+  SIM says `sms-over-ip=false` (SKT), and hands only Voice to imsroha there.
 
 ## What 0002 tried, and why it is not applied
 
 `internal_reset()` used to bring `rmnet_ipa0` down and call
-`qmi_device_delete_all_links()`. On b2q the IPA data path carries more than one PDN:
-`b2q-ims-bearer` keeps profile 4 on mux id 3 as `qmapmux0.3` on the same parent.
-Deleting every link destroyed the IMS bearer, `b2q-imsd` deregistered, and VoLTE went
+`qmi_device_delete_all_links()`. On the Galaxy Z Flip3 the IPA data path carries more than one PDN:
+`imsroha-bearer` keeps the IMS profile on mux id 3 as `imsroha0` (then `qmapmux0.3`) on the same parent.
+Deleting every link destroyed the IMS bearer, `imsroha` deregistered, and VoLTE went
 away whenever ModemManager restarted.
 
 For the `ipa` net driver 0002 skips the parent reset and deletes only
@@ -50,33 +54,30 @@ and the WDA and DPM negotiation sequence is unchanged.
 
 That keeps `qmapmux0.3`, but WDA then reports the wrong data format for the default
 endpoint (see the 0002 entry above), so the shipped package keeps the full reset: a
-ModemManager restart still deletes `qmapmux0.3`, and `b2q-ims-bearer` and `b2q-imsd`
+ModemManager restart still deletes `qmapmux0.3`, and `imsroha-bearer` and `imsroha`
 come back on their own a few seconds later. The real fix needs the WDA/DPM rework
 described in `PLAN-IMS-COEXISTENCE.md`. If 0002 is revived, do not skip the reset task
 completion, or the data format setup machine does not start.
 
 ## Build
 
-`PKGBUILD` is the local b2q recipe at `pkgrel=11`, with 0001, 0003 and 0004 applied in
-`prepare()`. Build on the phone as the `build` user:
+`PKGBUILD` builds 1.24.2 with 0001, 0003, 0004, 0005 and 0006 applied in `prepare()`:
 
 ```sh
-su build -c 'cd /home/build/modmgr-links && makepkg -s --noconfirm'
+makepkg -s
 ```
 
-Install as root with `pacman -U`. Restart `ModemManager` and check:
+Install with `pacman -U`, restart `ModemManager` and check:
 
 ```sh
-ip -br link | grep qmapmux
-systemctl status b2q-ims-bearer b2q-imsd
+ip -br link | grep -e qmapmux -e imsroha
+systemctl status imsroha-bearer imsroha
 ```
 
-With the full reset, `qmapmux0.3` is deleted on the restart; `b2q-ims-bearer` brings it
-back within its restart delay and `b2q-imsd` registers again. `qmapmux0.0` comes back
-when ModemManager reconnects the data bearer.
-
-Authors: Noa Himesaka <himesaka@noa.codes>.
+With the full reset, the IMS link (`imsroha0`) is deleted on the restart;
+`imsroha-bearer` brings it back within its restart delay and `imsroha` registers
+again. `qmapmux0.0` comes back when ModemManager reconnects the data bearer.
 
 The patches are `git format-patch` output against the upstream release; apply with
-`patch -p1` or `git apply`. They are licensed like the project they patch. The
-PKGBUILD is MIT.
+`patch -p1` or `git apply`. They are licensed like the project they patch
+(GPL-2.0-or-later). The PKGBUILD is GPL-3.0-only like the rest of this repository.

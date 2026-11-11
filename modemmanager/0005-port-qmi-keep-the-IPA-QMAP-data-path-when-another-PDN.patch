@@ -5,7 +5,7 @@ Subject: [PATCH] port-qmi: keep the IPA QMAP data path when another PDN uses
  it
 
 On IPA the modem's QMAP data path can carry PDNs that ModemManager does
-not own: on the Galaxy Z Flip3, b2q-ims-bearer keeps the IMS PDN on its
+not own: on the Galaxy Z Flip3, imsroha-bearer keeps the IMS PDN on its
 own mux link of rmnet_ipa0. When ModemManager restarts, the port open
 query opens the DPM port again, which puts the endpoint back to raw-ip
 without aggregation, and the first multiplexed connect deletes every
@@ -40,7 +40,7 @@ index 80bde14..1e137c5 100644
 +
 +/*
 + * On IPA the modem's QMAP data path is shared with PDNs ModemManager does
-+ * not own: on the Galaxy Z Flip3, b2q-ims-bearer keeps the IMS PDN on its
++ * not own: on the Galaxy Z Flip3, imsroha-bearer keeps the IMS PDN on its
 + * own mux link of rmnet_ipa0. A DPM Open Port puts the endpoint back to
 + * raw-ip without aggregation, a WDA Set Data Format with that PDN up is not
 + * taken, and the full reset deletes every link, so a ModemManager restart

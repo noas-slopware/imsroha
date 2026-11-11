@@ -1,19 +1,19 @@
 From 113e8fc83bf205f5e068d2b784a0ec8638967be8 Mon Sep 17 00:00:00 2001
 From: Noa Himesaka <himesaka@noa.codes>
 Date: Sun, 8 Nov 2026 23:33:27 +0900
-Subject: [PATCH] broadband-modem-qmi: add b2q-imsd backend for voice and
+Subject: [PATCH] broadband-modem-qmi: add imsroha backend for voice and
  messaging
 
-Connect ModemManager Voice and Messaging interfaces to b2q-imsd
-over D-Bus when the modem port has ID_MM_B2Q_IMS set. This enables
+Connect ModemManager Voice and Messaging interfaces to imsroha
+over D-Bus when the modem port has ID_MM_IMSROHA set. This enables
 plasma-dialer and spacebar to work natively without requiring
 QMI VOICE or WMS services.
 
 Mobile-terminated SMS arrive as raw TPDUs (PduReceived, with the id of
-b2q-imsd's durable inbox entry) and are acknowledged with AckPdu once
+imsroha's durable inbox entry) and are acknowledged with AckPdu once
 the part is handed to the messaging interface. Entries stored while
 ModemManager was not running are fetched with GetPendingPdus when the
-org.b2q.Imsd name appears.
+codes.noa.IMSroha name appears.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01L5scTPdTNcEmdyRhJMbUHU
@@ -23,15 +23,15 @@ Claude-Session: https://claude.ai/code/session_01L5scTPdTNcEmdyRhJMbUHU
  src/mm-broadband-modem-qmi.h |   4 +
  src/mm-call-ims.c            | 245 +++++++++++
  src/mm-call-ims.h            |  47 +++
- src/mm-ims-backend-b2q.c     | 781 +++++++++++++++++++++++++++++++++++
- src/mm-ims-backend-b2q.h     |  97 +++++
+ src/mm-ims-backend-imsroha.c     | 781 +++++++++++++++++++++++++++++++++++
+ src/mm-ims-backend-imsroha.h     |  97 +++++
  src/mm-sms-ims.c             | 169 ++++++++
  src/mm-sms-ims.h             |  45 ++
  9 files changed, 1547 insertions(+)
  create mode 100644 src/mm-call-ims.c
  create mode 100644 src/mm-call-ims.h
- create mode 100644 src/mm-ims-backend-b2q.c
- create mode 100644 src/mm-ims-backend-b2q.h
+ create mode 100644 src/mm-ims-backend-imsroha.c
+ create mode 100644 src/mm-ims-backend-imsroha.h
  create mode 100644 src/mm-sms-ims.c
  create mode 100644 src/mm-sms-ims.h
 
@@ -43,7 +43,7 @@ index f2a5362..818c346 100644
      'mm-shared-qmi.c',
      'mm-sim-qmi.c',
      'mm-sms-qmi.c',
-+    'mm-ims-backend-b2q.c',
++    'mm-ims-backend-imsroha.c',
 +    'mm-call-ims.c',
 +    'mm-sms-ims.c',
    )
@@ -57,7 +57,7 @@ index 7ce39d5..08d1b23 100644
  #include "mm-sms-part-cdma.h"
  #include "mm-call-qmi.h"
  #include "mm-call-list.h"
-+#include "mm-ims-backend-b2q.h"
++#include "mm-ims-backend-imsroha.h"
 +#include "mm-call-ims.h"
 +#include "mm-sms-ims.h"
  
@@ -68,49 +68,49 @@ index 7ce39d5..08d1b23 100644
       * (not applicable when using NAS Serving System) */
      gboolean dsd_supported;
 +
-+    /* B2Q IMS backend */
-+    gboolean b2q_ims_checked;
-+    gboolean b2q_ims_enabled;
-+    GObject *b2q_ims_backend;
++    /* IMSroha backend */
++    gboolean imsroha_checked;
++    gboolean imsroha_enabled;
++    GObject *imsroha_backend;
  };
  
 +gboolean
-+mm_broadband_modem_qmi_is_b2q_ims_enabled (MMBroadbandModemQmi *self)
++mm_broadband_modem_qmi_is_imsroha_enabled (MMBroadbandModemQmi *self)
 +{
-+    if (!self->priv->b2q_ims_checked) {
++    if (!self->priv->imsroha_checked) {
 +        GList *ports;
 +        GList *l;
 +
-+        self->priv->b2q_ims_checked = TRUE;
-+        self->priv->b2q_ims_enabled = FALSE;
++        self->priv->imsroha_checked = TRUE;
++        self->priv->imsroha_enabled = FALSE;
 +
 +        ports = mm_base_modem_find_ports (MM_BASE_MODEM (self), MM_PORT_SUBSYS_UNKNOWN, MM_PORT_TYPE_UNKNOWN);
 +        for (l = ports; l; l = g_list_next (l)) {
 +            MMKernelDevice *kernel_device = mm_port_peek_kernel_device (MM_PORT (l->data));
 +            if (kernel_device) {
-+                if (mm_kernel_device_get_global_property_as_boolean (kernel_device, "ID_MM_B2Q_IMS") ||
-+                    mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_B2Q_IMS")) {
-+                    self->priv->b2q_ims_enabled = TRUE;
++                if (mm_kernel_device_get_global_property_as_boolean (kernel_device, "ID_MM_IMSROHA") ||
++                    mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_IMSROHA")) {
++                    self->priv->imsroha_enabled = TRUE;
 +                    break;
 +                }
 +            }
 +        }
 +        g_list_free_full (ports, g_object_unref);
 +
-+        if (self->priv->b2q_ims_enabled) {
-+            mm_obj_info (self, "b2q IMS support enabled via udev tag ID_MM_B2Q_IMS");
-+            self->priv->b2q_ims_backend = (GObject *) mm_ims_backend_b2q_new (self);
++        if (self->priv->imsroha_enabled) {
++            mm_obj_info (self, "IMSroha support enabled via udev tag ID_MM_IMSROHA");
++            self->priv->imsroha_backend = (GObject *) mm_ims_backend_imsroha_new (self);
 +        }
 +    }
 +
-+    return self->priv->b2q_ims_enabled;
++    return self->priv->imsroha_enabled;
 +}
 +
-+MMImsBackendB2q *
++MMImsBackendImsroha *
 +mm_broadband_modem_qmi_peek_ims_backend (MMBroadbandModemQmi *self)
 +{
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self))
-+        return MM_IMS_BACKEND_B2Q (self->priv->b2q_ims_backend);
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self))
++        return MM_IMS_BACKEND_IMSROHA (self->priv->imsroha_backend);
 +    return NULL;
 +}
 +
@@ -121,8 +121,8 @@ index 7ce39d5..08d1b23 100644
  
      task = g_task_new (self, NULL, callback, user_data);
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
-+        mm_obj_dbg (self, "messaging capabilities supported via b2q IMS");
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++        mm_obj_dbg (self, "messaging capabilities supported via IMSroha");
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
 +        return;
@@ -137,7 +137,7 @@ index 7ce39d5..08d1b23 100644
      QmiClient *client = NULL;
 +    GTask *task;
 +
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        task = g_task_new (self, NULL, callback, user_data);
 +        g_task_return_int (task, (gssize)MM_SMS_STORAGE_ME);
 +        g_object_unref (task);
@@ -152,7 +152,7 @@ index 7ce39d5..08d1b23 100644
      QmiMessageWmsSetRoutesInputRouteListElement route;
 +    GTask *task;
 +
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        task = g_task_new (self, NULL, callback, user_data);
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
@@ -166,13 +166,13 @@ index 7ce39d5..08d1b23 100644
  }
  
 +static void
-+b2q_load_initial_sms_ready (MMImsBackendB2q *backend,
++imsroha_load_initial_sms_ready (MMImsBackendImsroha *backend,
 +                            GAsyncResult    *res,
 +                            GTask           *task)
 +{
 +    GError *error = NULL;
 +
-+    if (!mm_ims_backend_b2q_load_initial_sms_finish (backend, res, &error))
++    if (!mm_ims_backend_imsroha_load_initial_sms_finish (backend, res, &error))
 +        g_task_return_error (task, error);
 +    else
 +        g_task_return_boolean (task, TRUE);
@@ -186,11 +186,11 @@ index 7ce39d5..08d1b23 100644
      GTask *task;
      QmiClient *client = NULL;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
-+        /* b2q-imsd's inbox holds what arrived while ModemManager was not listening. */
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
++        /* imsroha's inbox holds what arrived while ModemManager was not listening. */
 +        task = g_task_new (self, NULL, callback, user_data);
-+        mm_ims_backend_b2q_load_initial_sms (MM_IMS_BACKEND_B2Q (self->priv->b2q_ims_backend),
-+                                             (GAsyncReadyCallback) b2q_load_initial_sms_ready,
++        mm_ims_backend_imsroha_load_initial_sms (MM_IMS_BACKEND_IMSROHA (self->priv->imsroha_backend),
++                                             (GAsyncReadyCallback) imsroha_load_initial_sms_ready,
 +                                             task);
 +        return;
 +    }
@@ -202,7 +202,7 @@ index 7ce39d5..08d1b23 100644
  {
      QmiClient *client = NULL;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self))
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self))
 +        return TRUE;
 +
      client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
@@ -212,7 +212,7 @@ index 7ce39d5..08d1b23 100644
      QmiMessageWmsSetEventReportInput *input;
      GError *error = NULL;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
 +        return;
@@ -225,7 +225,7 @@ index 7ce39d5..08d1b23 100644
  {
      MMBroadbandModemQmi *self = MM_BROADBAND_MODEM_QMI (_self);
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        return mm_sms_ims_new (MM_BASE_MODEM (self));
 +    }
 +
@@ -236,12 +236,12 @@ index 7ce39d5..08d1b23 100644
  
      task = g_task_new (self, NULL, callback, user_data);
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (MM_BROADBAND_MODEM_QMI (self))) {
 +        g_object_set (self,
 +                      MM_IFACE_MODEM_VOICE_PERIODIC_CALL_LIST_CHECK_DISABLED, TRUE,
 +                      MM_IFACE_MODEM_VOICE_INDICATION_CALL_LIST_RELOAD_ENABLED, FALSE,
 +                      NULL);
-+        mm_obj_dbg (self, "Voice capabilities supported via b2q IMS");
++        mm_obj_dbg (self, "Voice capabilities supported via IMSroha");
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
 +        return;
@@ -254,7 +254,7 @@ index 7ce39d5..08d1b23 100644
      GTask     *task;
      QmiClient *client = NULL;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        task = g_task_new (self, NULL, callback, user_data);
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
@@ -268,7 +268,7 @@ index 7ce39d5..08d1b23 100644
      GTask     *task;
      QmiClient *client;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        task = g_task_new (self, NULL, callback, user_data);
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
@@ -282,7 +282,7 @@ index 7ce39d5..08d1b23 100644
      GTask     *task;
      QmiClient *client = NULL;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (self)) {
 +        task = g_task_new (self, NULL, callback, user_data);
 +        g_task_return_boolean (task, TRUE);
 +        g_object_unref (task);
@@ -296,9 +296,9 @@ index 7ce39d5..08d1b23 100644
      QmiClient *client = NULL;
      GTask *task;
  
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
-+        MMImsBackendB2q *backend = mm_broadband_modem_qmi_peek_ims_backend (MM_BROADBAND_MODEM_QMI (self));
-+        GList *call_list = backend ? mm_ims_backend_b2q_get_call_list (backend) : NULL;
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++        MMImsBackendImsroha *backend = mm_broadband_modem_qmi_peek_ims_backend (MM_BROADBAND_MODEM_QMI (self));
++        GList *call_list = backend ? mm_ims_backend_imsroha_get_call_list (backend) : NULL;
 +
 +        task = g_task_new (self, NULL, callback, user_data);
 +        g_task_return_pointer (task, call_list, (GDestroyNotify) mm_3gpp_call_info_list_free);
@@ -313,7 +313,7 @@ index 7ce39d5..08d1b23 100644
                           MMCallDirection    direction,
                           const gchar       *number)
  {
-+    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++    if (mm_broadband_modem_qmi_is_imsroha_enabled (MM_BROADBAND_MODEM_QMI (self))) {
 +        return mm_call_ims_new (MM_BASE_MODEM (self),
 +                                direction,
 +                                number);
@@ -326,7 +326,7 @@ index 7ce39d5..08d1b23 100644
      self->priv->firmware_list = NULL;
  
      g_clear_object (&self->priv->current_firmware);
-+    g_clear_object (&self->priv->b2q_ims_backend);
++    g_clear_object (&self->priv->imsroha_backend);
  
      G_OBJECT_CLASS (mm_broadband_modem_qmi_parent_class)->dispose (object);
  }
@@ -338,9 +338,9 @@ index 97a1a77..1b5b029 100644
                                                            MMQmiDataEndpoint    *out_endpoint,
                                                            GError              **error);
  
-+typedef struct _MMImsBackendB2q MMImsBackendB2q;
-+gboolean         mm_broadband_modem_qmi_is_b2q_ims_enabled (MMBroadbandModemQmi *self);
-+MMImsBackendB2q *mm_broadband_modem_qmi_peek_ims_backend   (MMBroadbandModemQmi *self);
++typedef struct _MMImsBackendImsroha MMImsBackendImsroha;
++gboolean         mm_broadband_modem_qmi_is_imsroha_enabled (MMBroadbandModemQmi *self);
++MMImsBackendImsroha *mm_broadband_modem_qmi_peek_ims_backend   (MMBroadbandModemQmi *self);
 +
  #endif /* MM_BROADBAND_MODEM_QMI_H */
 diff --git a/src/mm-call-ims.c b/src/mm-call-ims.c
@@ -362,7 +362,7 @@ index 0000000..f42c9b7
 +#include "config.h"
 +
 +#include "mm-call-ims.h"
-+#include "mm-ims-backend-b2q.h"
++#include "mm-ims-backend-imsroha.h"
 +#include "mm-broadband-modem-qmi.h"
 +#include "mm-log-object.h"
 +#include "mm-errors-types.h"
@@ -381,7 +381,7 @@ index 0000000..f42c9b7
 +}
 +
 +static void
-+create_call_ready (MMImsBackendB2q *backend,
++create_call_ready (MMImsBackendImsroha *backend,
 +                   GAsyncResult    *res,
 +                   GTask           *task)
 +{
@@ -391,7 +391,7 @@ index 0000000..f42c9b7
 +
 +    self = MM_BASE_CALL (g_task_get_source_object (task));
 +
-+    if (!mm_ims_backend_b2q_create_call_finish (backend, res, &call_id, &error)) {
++    if (!mm_ims_backend_imsroha_create_call_finish (backend, res, &call_id, &error)) {
 +        g_task_return_error (task, error);
 +    } else {
 +        mm_base_call_set_index (self, call_id);
@@ -407,7 +407,7 @@ index 0000000..f42c9b7
 +            gpointer             user_data)
 +{
 +    MMBroadbandModemQmi *modem = NULL;
-+    MMImsBackendB2q     *backend = NULL;
++    MMImsBackendImsroha     *backend = NULL;
 +    GTask               *task;
 +    const gchar         *number;
 +
@@ -422,7 +422,7 @@ index 0000000..f42c9b7
 +    }
 +
 +    backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
-+    if (!backend || !mm_ims_backend_b2q_is_available (backend)) {
++    if (!backend || !mm_ims_backend_imsroha_is_available (backend)) {
 +        g_object_unref (modem);
 +        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
 +                                 "IMS backend is not available");
@@ -433,7 +433,7 @@ index 0000000..f42c9b7
 +    number = mm_gdbus_call_get_number (MM_GDBUS_CALL (self));
 +    mm_obj_dbg (self, "starting IMS call to %s", number ? number : "");
 +
-+    mm_ims_backend_b2q_create_call (backend,
++    mm_ims_backend_imsroha_create_call (backend,
 +                                    number,
 +                                    cancellable,
 +                                    (GAsyncReadyCallback) create_call_ready,
@@ -453,13 +453,13 @@ index 0000000..f42c9b7
 +}
 +
 +static void
-+answer_call_ready (MMImsBackendB2q *backend,
++answer_call_ready (MMImsBackendImsroha *backend,
 +                   GAsyncResult    *res,
 +                   GTask           *task)
 +{
 +    GError *error = NULL;
 +
-+    if (!mm_ims_backend_b2q_answer_call_finish (backend, res, &error))
++    if (!mm_ims_backend_imsroha_answer_call_finish (backend, res, &error))
 +        g_task_return_error (task, error);
 +    else
 +        g_task_return_boolean (task, TRUE);
@@ -472,7 +472,7 @@ index 0000000..f42c9b7
 +             gpointer             user_data)
 +{
 +    MMBroadbandModemQmi *modem = NULL;
-+    MMImsBackendB2q     *backend = NULL;
++    MMImsBackendImsroha     *backend = NULL;
 +    GTask               *task;
 +    guint                call_id;
 +
@@ -482,9 +482,9 @@ index 0000000..f42c9b7
 +    g_object_get (self, MM_BASE_CALL_MODEM, &modem, NULL);
 +    if (modem) {
 +        backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
-+        if (backend && mm_ims_backend_b2q_is_available (backend)) {
++        if (backend && mm_ims_backend_imsroha_is_available (backend)) {
 +            mm_obj_dbg (self, "accepting IMS call %u", call_id);
-+            mm_ims_backend_b2q_answer_call (backend,
++            mm_ims_backend_imsroha_answer_call (backend,
 +                                            call_id,
 +                                            NULL,
 +                                            (GAsyncReadyCallback) answer_call_ready,
@@ -513,13 +513,13 @@ index 0000000..f42c9b7
 +}
 +
 +static void
-+hangup_call_ready (MMImsBackendB2q *backend,
++hangup_call_ready (MMImsBackendImsroha *backend,
 +                   GAsyncResult    *res,
 +                   GTask           *task)
 +{
 +    GError *error = NULL;
 +
-+    if (!mm_ims_backend_b2q_hangup_call_finish (backend, res, &error))
++    if (!mm_ims_backend_imsroha_hangup_call_finish (backend, res, &error))
 +        g_task_return_error (task, error);
 +    else
 +        g_task_return_boolean (task, TRUE);
@@ -532,7 +532,7 @@ index 0000000..f42c9b7
 +             gpointer             user_data)
 +{
 +    MMBroadbandModemQmi *modem = NULL;
-+    MMImsBackendB2q     *backend = NULL;
++    MMImsBackendImsroha     *backend = NULL;
 +    GTask               *task;
 +    guint                call_id;
 +
@@ -542,9 +542,9 @@ index 0000000..f42c9b7
 +    g_object_get (self, MM_BASE_CALL_MODEM, &modem, NULL);
 +    if (modem) {
 +        backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
-+        if (backend && mm_ims_backend_b2q_is_available (backend)) {
++        if (backend && mm_ims_backend_imsroha_is_available (backend)) {
 +            mm_obj_dbg (self, "hanging up IMS call %u", call_id);
-+            mm_ims_backend_b2q_hangup_call (backend,
++            mm_ims_backend_imsroha_hangup_call (backend,
 +                                            call_id,
 +                                            NULL,
 +                                            (GAsyncReadyCallback) hangup_call_ready,
@@ -647,11 +647,11 @@ index 0000000..2d1952a
 +                             const gchar     *number);
 +
 +#endif /* MM_CALL_IMS_H */
-diff --git a/src/mm-ims-backend-b2q.c b/src/mm-ims-backend-b2q.c
+diff --git a/src/mm-ims-backend-imsroha.c b/src/mm-ims-backend-imsroha.c
 new file mode 100644
 index 0000000..f58dc26
 --- /dev/null
-+++ b/src/mm-ims-backend-b2q.c
++++ b/src/mm-ims-backend-imsroha.c
 @@ -0,0 +1,781 @@
 +/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/*
@@ -667,7 +667,7 @@ index 0000000..f58dc26
 +
 +#include <string.h>
 +
-+#include "mm-ims-backend-b2q.h"
++#include "mm-ims-backend-imsroha.h"
 +#include "mm-log-object.h"
 +#include "mm-iface-modem-voice.h"
 +#include "mm-iface-modem-messaging.h"
@@ -675,9 +675,9 @@ index 0000000..f58dc26
 +#include "mm-sms-part-3gpp.h"
 +#include "mm-modem-helpers.h"
 +
-+G_DEFINE_TYPE (MMImsBackendB2q, mm_ims_backend_b2q, G_TYPE_OBJECT)
++G_DEFINE_TYPE (MMImsBackendImsroha, mm_ims_backend_imsroha, G_TYPE_OBJECT)
 +
-+struct _MMImsBackendB2qPrivate {
++struct _MMImsBackendImsrohaPrivate {
 +    MMBroadbandModemQmi *modem;
 +    GDBusConnection     *connection;
 +    guint                name_watch_id;
@@ -726,7 +726,7 @@ index 0000000..f58dc26
 +               GVariant        *parameters,
 +               gpointer         user_data)
 +{
-+    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    MMImsBackendImsroha *self = MM_IMS_BACKEND_IMSROHA (user_data);
 +    guint32 call_id = 0;
 +    const gchar *number = NULL;
 +    gint32 direction = 0;
@@ -740,7 +740,7 @@ index 0000000..f58dc26
 +    self->priv->call_number = g_strdup (number);
 +    self->priv->call_direction = (direction == 1) ? MM_CALL_DIRECTION_INCOMING : MM_CALL_DIRECTION_OUTGOING;
 +    self->priv->call_state = (direction == 1) ? MM_CALL_STATE_RINGING_IN : MM_CALL_STATE_DIALING;
-+    mm_obj_dbg (self->priv->modem, "b2q-ims: CallAdded signal (id %u, number %s, dir %d)",
++    mm_obj_dbg (self->priv->modem, "imsroha: CallAdded signal (id %u, number %s, dir %d)",
 +                call_id, number ? number : "", direction);
 +
 +    if (direction == 1) {
@@ -764,7 +764,7 @@ index 0000000..f58dc26
 +                       GVariant        *parameters,
 +                       gpointer         user_data)
 +{
-+    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    MMImsBackendImsroha *self = MM_IMS_BACKEND_IMSROHA (user_data);
 +    guint32 call_id = 0;
 +    gint32 state = 0;
 +    gint32 reason = 0;
@@ -776,7 +776,7 @@ index 0000000..f58dc26
 +    g_variant_get (parameters, "(uii)", &call_id, &state, &reason);
 +    if (call_id == self->priv->call_id)
 +        self->priv->call_state = map_imsd_call_state (state);
-+    mm_obj_dbg (self->priv->modem, "b2q-ims: CallStateChanged signal (id %u, state %d, reason %d)",
++    mm_obj_dbg (self->priv->modem, "imsroha: CallStateChanged signal (id %u, state %d, reason %d)",
 +                call_id, state, reason);
 +
 +    memset (&info, 0, sizeof (info));
@@ -791,19 +791,19 @@ index 0000000..f58dc26
 +static void
 +ack_pdu_ready (GDBusConnection *connection,
 +               GAsyncResult    *res,
-+               MMImsBackendB2q *self)
++               MMImsBackendImsroha *self)
 +{
 +    g_autoptr(GVariant) ret = NULL;
 +    g_autoptr(GError)   error = NULL;
 +
 +    ret = g_dbus_connection_call_finish (connection, res, &error);
 +    if (!ret && self->priv->modem)
-+        mm_obj_warn (self->priv->modem, "b2q-ims: AckPdu failed: %s", error->message);
++        mm_obj_warn (self->priv->modem, "imsroha: AckPdu failed: %s", error->message);
 +    g_object_unref (self);
 +}
 +
 +/*
-+ * Hand one inbox entry to the messaging interface, then tell b2q-imsd it can
++ * Hand one inbox entry to the messaging interface, then tell imsroha it can
 + * drop it. Live PduReceived signals and the GetPendingPdus backlog both land
 + * here; an id already taken in this ModemManager run is only acked again.
 + *
@@ -814,7 +814,7 @@ index 0000000..f58dc26
 + * handed over forever.
 + */
 +static void
-+take_pdu (MMImsBackendB2q *self,
++take_pdu (MMImsBackendImsroha *self,
 +          const gchar     *id,
 +          const gchar     *hexpdu)
 +{
@@ -825,28 +825,28 @@ index 0000000..f58dc26
 +        return;
 +
 +    if (!g_hash_table_contains (self->priv->taken_pdus, id)) {
-+        mm_obj_info (self->priv->modem, "b2q-ims: MT-SMS %s (%" G_GSIZE_FORMAT " PDU bytes)",
++        mm_obj_info (self->priv->modem, "imsroha: MT-SMS %s (%" G_GSIZE_FORMAT " PDU bytes)",
 +                     id, strlen (hexpdu) / 2);
 +        part = mm_sms_part_3gpp_new_from_pdu (SMS_PART_INVALID_INDEX, hexpdu,
 +                                              self->priv->modem, &error);
 +        if (!part) {
-+            mm_obj_warn (self->priv->modem, "b2q-ims: couldn't parse 3GPP PDU %s (%s): %s",
++            mm_obj_warn (self->priv->modem, "imsroha: couldn't parse 3GPP PDU %s (%s): %s",
 +                         id, hexpdu, error->message);
 +        } else if (!mm_iface_modem_messaging_take_part (MM_IFACE_MODEM_MESSAGING (self->priv->modem),
 +                                                       part,
 +                                                       MM_SMS_STATE_RECEIVED,
 +                                                       MM_SMS_STORAGE_UNKNOWN)) {
 +            mm_obj_info (self->priv->modem,
-+                         "b2q-ims: messaging not ready, MT-SMS %s stays in the b2q-imsd inbox", id);
++                         "imsroha: messaging not ready, MT-SMS %s stays in the imsroha inbox", id);
 +            return;
 +        }
 +        g_hash_table_add (self->priv->taken_pdus, g_strdup (id));
 +    }
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "AckPdu",
 +                            g_variant_new ("(s)", id),
 +                            NULL,
@@ -870,7 +870,7 @@ index 0000000..f58dc26
 +    const gchar *hexpdu = NULL;
 +
 +    g_variant_get (parameters, "(&s&s)", &id, &hexpdu);
-+    take_pdu (MM_IMS_BACKEND_B2Q (user_data), id, hexpdu);
++    take_pdu (MM_IMS_BACKEND_IMSROHA (user_data), id, hexpdu);
 +}
 +
 +static void
@@ -878,7 +878,7 @@ index 0000000..f58dc26
 +                        GAsyncResult    *res,
 +                        GTask           *task)
 +{
-+    MMImsBackendB2q        *self = g_task_get_source_object (task);
++    MMImsBackendImsroha        *self = g_task_get_source_object (task);
 +    g_autoptr(GVariant)     ret = NULL;
 +    g_autoptr(GVariantIter) iter = NULL;
 +    g_autoptr(GError)       error = NULL;
@@ -889,11 +889,11 @@ index 0000000..f58dc26
 +    if (!ret) {
 +        /* Not fatal for messaging: the entries stay in the inbox. */
 +        if (self->priv->modem)
-+            mm_obj_warn (self->priv->modem, "b2q-ims: GetPendingPdus failed: %s", error->message);
++            mm_obj_warn (self->priv->modem, "imsroha: GetPendingPdus failed: %s", error->message);
 +    } else {
 +        g_variant_get (ret, "(a(ss))", &iter);
 +        if (self->priv->modem && g_variant_iter_n_children (iter) > 0)
-+            mm_obj_info (self->priv->modem, "b2q-ims: %" G_GSIZE_FORMAT " pending MT-SMS in the inbox",
++            mm_obj_info (self->priv->modem, "imsroha: %" G_GSIZE_FORMAT " pending MT-SMS in the inbox",
 +                         g_variant_iter_n_children (iter));
 +        while (g_variant_iter_loop (iter, "(&s&s)", &id, &hexpdu))
 +            take_pdu (self, id, hexpdu);
@@ -903,16 +903,16 @@ index 0000000..f58dc26
 +}
 +
 +static void
-+fetch_pending_pdus (MMImsBackendB2q     *self,
++fetch_pending_pdus (MMImsBackendImsroha     *self,
 +                    GAsyncReadyCallback  callback,
 +                    gpointer             user_data)
 +{
 +    GTask *task = g_task_new (self, NULL, callback, user_data);
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "GetPendingPdus",
 +                            NULL,
 +                            G_VARIANT_TYPE ("(a(ss))"),
@@ -925,10 +925,10 @@ index 0000000..f58dc26
 +
 +/*
 + * Called from load_initial_sms_parts, the step where ModemManager loads stored
-+ * messages, once the SMS list exists: b2q-imsd's inbox is this modem's storage.
++ * messages, once the SMS list exists: imsroha's inbox is this modem's storage.
 + */
 +void
-+mm_ims_backend_b2q_load_initial_sms (MMImsBackendB2q     *self,
++mm_ims_backend_imsroha_load_initial_sms (MMImsBackendImsroha     *self,
 +                                     GAsyncReadyCallback  callback,
 +                                     gpointer             user_data)
 +{
@@ -937,14 +937,14 @@ index 0000000..f58dc26
 +        fetch_pending_pdus (self, callback, user_data);
 +        return;
 +    }
-+    /* b2q-imsd not on the bus yet: on_name_appeared fetches the inbox. */
++    /* imsroha not on the bus yet: on_name_appeared fetches the inbox. */
 +    GTask *task = g_task_new (self, NULL, callback, user_data);
 +    g_task_return_boolean (task, TRUE);
 +    g_object_unref (task);
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_load_initial_sms_finish (MMImsBackendB2q  *self,
++mm_ims_backend_imsroha_load_initial_sms_finish (MMImsBackendImsroha  *self,
 +                                            GAsyncResult     *res,
 +                                            GError          **error)
 +{
@@ -960,19 +960,19 @@ index 0000000..f58dc26
 +                      GVariant        *parameters,
 +                      gpointer         user_data)
 +{
-+    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    MMImsBackendImsroha *self = MM_IMS_BACKEND_IMSROHA (user_data);
 +    gint32 state = 0;
 +
 +    g_variant_get (parameters, "(i)", &state);
 +    self->priv->reg_state = state;
 +    if (self->priv->modem) {
-+        mm_obj_info (self->priv->modem, "b2q-ims: registration state changed to %d (%s)",
++        mm_obj_info (self->priv->modem, "imsroha: registration state changed to %d (%s)",
 +                     state, state == 2 ? "registered" : (state == 1 ? "registering" : "down"));
 +    }
 +}
 +
 +static void
-+subscribe_signals (MMImsBackendB2q *self)
++subscribe_signals (MMImsBackendImsroha *self)
 +{
 +    if (!self->priv->connection)
 +        return;
@@ -980,10 +980,10 @@ index 0000000..f58dc26
 +    if (self->priv->call_added_id == 0) {
 +        self->priv->call_added_id = g_dbus_connection_signal_subscribe (
 +            self->priv->connection,
-+            "org.b2q.Imsd",
-+            "org.b2q.Imsd",
++            "codes.noa.IMSroha",
++            "codes.noa.IMSroha",
 +            "CallAdded",
-+            "/org/b2q/Imsd",
++            "/codes/noa/IMSroha",
 +            NULL,
 +            G_DBUS_SIGNAL_FLAGS_NONE,
 +            on_call_added,
@@ -994,10 +994,10 @@ index 0000000..f58dc26
 +    if (self->priv->call_state_changed_id == 0) {
 +        self->priv->call_state_changed_id = g_dbus_connection_signal_subscribe (
 +            self->priv->connection,
-+            "org.b2q.Imsd",
-+            "org.b2q.Imsd",
++            "codes.noa.IMSroha",
++            "codes.noa.IMSroha",
 +            "CallStateChanged",
-+            "/org/b2q/Imsd",
++            "/codes/noa/IMSroha",
 +            NULL,
 +            G_DBUS_SIGNAL_FLAGS_NONE,
 +            on_call_state_changed,
@@ -1008,10 +1008,10 @@ index 0000000..f58dc26
 +    if (self->priv->pdu_received_id == 0) {
 +        self->priv->pdu_received_id = g_dbus_connection_signal_subscribe (
 +            self->priv->connection,
-+            "org.b2q.Imsd",
-+            "org.b2q.Imsd",
++            "codes.noa.IMSroha",
++            "codes.noa.IMSroha",
 +            "PduReceived",
-+            "/org/b2q/Imsd",
++            "/codes/noa/IMSroha",
 +            NULL,
 +            G_DBUS_SIGNAL_FLAGS_NONE,
 +            on_pdu_received,
@@ -1021,10 +1021,10 @@ index 0000000..f58dc26
 +    if (self->priv->reg_state_id == 0) {
 +        self->priv->reg_state_id = g_dbus_connection_signal_subscribe (
 +            self->priv->connection,
-+            "org.b2q.Imsd",
-+            "org.b2q.Imsd",
++            "codes.noa.IMSroha",
++            "codes.noa.IMSroha",
 +            "RegistrationStateChanged",
-+            "/org/b2q/Imsd",
++            "/codes/noa/IMSroha",
 +            NULL,
 +            G_DBUS_SIGNAL_FLAGS_NONE,
 +            on_reg_state_changed,
@@ -1034,7 +1034,7 @@ index 0000000..f58dc26
 +}
 +
 +static void
-+unsubscribe_signals (MMImsBackendB2q *self)
++unsubscribe_signals (MMImsBackendImsroha *self)
 +{
 +    if (!self->priv->connection)
 +        return;
@@ -1063,15 +1063,15 @@ index 0000000..f58dc26
 +                  const gchar     *name_owner,
 +                  gpointer         user_data)
 +{
-+    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    MMImsBackendImsroha *self = MM_IMS_BACKEND_IMSROHA (user_data);
 +
 +    if (self->priv->modem)
-+        mm_obj_info (self->priv->modem, "b2q-ims: %s appeared on system bus (owner %s)", name, name_owner);
++        mm_obj_info (self->priv->modem, "imsroha: %s appeared on system bus (owner %s)", name, name_owner);
 +    self->priv->is_available = TRUE;
 +    subscribe_signals (self);
 +
 +    /*
-+     * Messages b2q-imsd stored while nobody was listening. Before messaging
++     * Messages imsroha stored while nobody was listening. Before messaging
 +     * is enabled there is no SMS list to put them in; load_initial_sms_parts
 +     * fetches them then.
 +     */
@@ -1084,18 +1084,18 @@ index 0000000..f58dc26
 +                  const gchar     *name,
 +                  gpointer         user_data)
 +{
-+    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    MMImsBackendImsroha *self = MM_IMS_BACKEND_IMSROHA (user_data);
 +
 +    if (self->priv->modem)
-+        mm_obj_warn (self->priv->modem, "b2q-ims: %s vanished from system bus", name);
++        mm_obj_warn (self->priv->modem, "imsroha: %s vanished from system bus", name);
 +    self->priv->is_available = FALSE;
 +    unsubscribe_signals (self);
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_is_available (MMImsBackendB2q *self)
++mm_ims_backend_imsroha_is_available (MMImsBackendImsroha *self)
 +{
-+    g_return_val_if_fail (MM_IS_IMS_BACKEND_B2Q (self), FALSE);
++    g_return_val_if_fail (MM_IS_IMS_BACKEND_IMSROHA (self), FALSE);
 +    return self->priv->is_available;
 +}
 +
@@ -1122,7 +1122,7 @@ index 0000000..f58dc26
 +}
 +
 +void
-+mm_ims_backend_b2q_create_call (MMImsBackendB2q    *self,
++mm_ims_backend_imsroha_create_call (MMImsBackendImsroha    *self,
 +                                const gchar        *number,
 +                                GCancellable       *cancellable,
 +                                GAsyncReadyCallback callback,
@@ -1133,15 +1133,15 @@ index 0000000..f58dc26
 +    task = g_task_new (self, cancellable, callback, user_data);
 +    if (!self->priv->is_available || !self->priv->connection) {
 +        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-+                                 "b2q-imsd is not available");
++                                 "imsroha is not available");
 +        g_object_unref (task);
 +        return;
 +    }
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "CreateCall",
 +                            g_variant_new ("(s)", number ? number : ""),
 +                            G_VARIANT_TYPE ("(u)"),
@@ -1153,7 +1153,7 @@ index 0000000..f58dc26
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_create_call_finish (MMImsBackendB2q  *self,
++mm_ims_backend_imsroha_create_call_finish (MMImsBackendImsroha  *self,
 +                                       GAsyncResult     *res,
 +                                       guint32          *out_call_id,
 +                                       GError          **error)
@@ -1185,7 +1185,7 @@ index 0000000..f58dc26
 +}
 +
 +void
-+mm_ims_backend_b2q_answer_call (MMImsBackendB2q    *self,
++mm_ims_backend_imsroha_answer_call (MMImsBackendImsroha    *self,
 +                                guint32             call_id,
 +                                GCancellable       *cancellable,
 +                                GAsyncReadyCallback callback,
@@ -1196,15 +1196,15 @@ index 0000000..f58dc26
 +    task = g_task_new (self, cancellable, callback, user_data);
 +    if (!self->priv->is_available || !self->priv->connection) {
 +        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-+                                 "b2q-imsd is not available");
++                                 "imsroha is not available");
 +        g_object_unref (task);
 +        return;
 +    }
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "AnswerCall",
 +                            g_variant_new ("(u)", call_id),
 +                            G_VARIANT_TYPE ("()"),
@@ -1216,7 +1216,7 @@ index 0000000..f58dc26
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_answer_call_finish (MMImsBackendB2q  *self,
++mm_ims_backend_imsroha_answer_call_finish (MMImsBackendImsroha  *self,
 +                                       GAsyncResult     *res,
 +                                       GError          **error)
 +{
@@ -1240,7 +1240,7 @@ index 0000000..f58dc26
 +}
 +
 +void
-+mm_ims_backend_b2q_hangup_call (MMImsBackendB2q    *self,
++mm_ims_backend_imsroha_hangup_call (MMImsBackendImsroha    *self,
 +                                guint32             call_id,
 +                                GCancellable       *cancellable,
 +                                GAsyncReadyCallback callback,
@@ -1256,9 +1256,9 @@ index 0000000..f58dc26
 +    }
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "HangupCall",
 +                            g_variant_new ("(u)", call_id),
 +                            G_VARIANT_TYPE ("()"),
@@ -1270,7 +1270,7 @@ index 0000000..f58dc26
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_hangup_call_finish (MMImsBackendB2q  *self,
++mm_ims_backend_imsroha_hangup_call_finish (MMImsBackendImsroha  *self,
 +                                       GAsyncResult     *res,
 +                                       GError          **error)
 +{
@@ -1300,7 +1300,7 @@ index 0000000..f58dc26
 +}
 +
 +void
-+mm_ims_backend_b2q_send_sms (MMImsBackendB2q    *self,
++mm_ims_backend_imsroha_send_sms (MMImsBackendImsroha    *self,
 +                             const gchar        *number,
 +                             const gchar        *text,
 +                             GCancellable       *cancellable,
@@ -1312,15 +1312,15 @@ index 0000000..f58dc26
 +    task = g_task_new (self, cancellable, callback, user_data);
 +    if (!self->priv->is_available || !self->priv->connection) {
 +        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-+                                 "b2q-imsd is not available");
++                                 "imsroha is not available");
 +        g_object_unref (task);
 +        return;
 +    }
 +
 +    g_dbus_connection_call (self->priv->connection,
-+                            "org.b2q.Imsd",
-+                            "/org/b2q/Imsd",
-+                            "org.b2q.Imsd",
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
 +                            "SendSms",
 +                            g_variant_new ("(ss)", number ? number : "", text ? text : ""),
 +                            G_VARIANT_TYPE ("(s)"),
@@ -1332,7 +1332,7 @@ index 0000000..f58dc26
 +}
 +
 +gboolean
-+mm_ims_backend_b2q_send_sms_finish (MMImsBackendB2q  *self,
++mm_ims_backend_imsroha_send_sms_finish (MMImsBackendImsroha  *self,
 +                                    GAsyncResult     *res,
 +                                    gchar           **out_ref,
 +                                    GError          **error)
@@ -1352,7 +1352,7 @@ index 0000000..f58dc26
 +/*****************************************************************************/
 +
 +GList *
-+mm_ims_backend_b2q_get_call_list (MMImsBackendB2q *self)
++mm_ims_backend_imsroha_get_call_list (MMImsBackendImsroha *self)
 +{
 +    MMCallInfo *info;
 +
@@ -1369,13 +1369,13 @@ index 0000000..f58dc26
 +
 +/*****************************************************************************/
 +
-+MMImsBackendB2q *
-+mm_ims_backend_b2q_new (MMBroadbandModemQmi *modem)
++MMImsBackendImsroha *
++mm_ims_backend_imsroha_new (MMBroadbandModemQmi *modem)
 +{
-+    MMImsBackendB2q *self;
++    MMImsBackendImsroha *self;
 +    GDBusConnection *conn = NULL;
 +
-+    self = g_object_new (MM_TYPE_IMS_BACKEND_B2Q, NULL);
++    self = g_object_new (MM_TYPE_IMS_BACKEND_IMSROHA, NULL);
 +    self->priv->modem = modem;
 +
 +    g_object_get (modem, MM_BASE_MODEM_CONNECTION, &conn, NULL);
@@ -1386,7 +1386,7 @@ index 0000000..f58dc26
 +    if (self->priv->connection) {
 +        self->priv->name_watch_id = g_bus_watch_name_on_connection (
 +            self->priv->connection,
-+            "org.b2q.Imsd",
++            "codes.noa.IMSroha",
 +            G_BUS_NAME_WATCHER_FLAGS_NONE,
 +            on_name_appeared,
 +            on_name_vanished,
@@ -1398,9 +1398,9 @@ index 0000000..f58dc26
 +}
 +
 +static void
-+mm_ims_backend_b2q_init (MMImsBackendB2q *self)
++mm_ims_backend_imsroha_init (MMImsBackendImsroha *self)
 +{
-+    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self, MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2qPrivate);
++    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self, MM_TYPE_IMS_BACKEND_IMSROHA, MMImsBackendImsrohaPrivate);
 +    self->priv->is_available = FALSE;
 +    self->priv->reg_state = 0;
 +    self->priv->taken_pdus = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
@@ -1409,7 +1409,7 @@ index 0000000..f58dc26
 +static void
 +dispose (GObject *object)
 +{
-+    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (object);
++    MMImsBackendImsroha *self = MM_IMS_BACKEND_IMSROHA (object);
 +
 +    if (self->priv->name_watch_id != 0) {
 +        g_bus_unwatch_name (self->priv->name_watch_id);
@@ -1423,22 +1423,22 @@ index 0000000..f58dc26
 +    g_clear_pointer (&self->priv->call_number, g_free);
 +    self->priv->modem = NULL;
 +
-+    G_OBJECT_CLASS (mm_ims_backend_b2q_parent_class)->dispose (object);
++    G_OBJECT_CLASS (mm_ims_backend_imsroha_parent_class)->dispose (object);
 +}
 +
 +static void
-+mm_ims_backend_b2q_class_init (MMImsBackendB2qClass *klass)
++mm_ims_backend_imsroha_class_init (MMImsBackendImsrohaClass *klass)
 +{
 +    GObjectClass *object_class = G_OBJECT_CLASS (klass);
 +
-+    g_type_class_add_private (object_class, sizeof (MMImsBackendB2qPrivate));
++    g_type_class_add_private (object_class, sizeof (MMImsBackendImsrohaPrivate));
 +    object_class->dispose = dispose;
 +}
-diff --git a/src/mm-ims-backend-b2q.h b/src/mm-ims-backend-b2q.h
+diff --git a/src/mm-ims-backend-imsroha.h b/src/mm-ims-backend-imsroha.h
 new file mode 100644
 index 0000000..66d046e
 --- /dev/null
-+++ b/src/mm-ims-backend-b2q.h
++++ b/src/mm-ims-backend-imsroha.h
 @@ -0,0 +1,97 @@
 +/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/*
@@ -1450,8 +1450,8 @@ index 0000000..66d046e
 + * (at your option) any later version.
 + */
 +
-+#ifndef MM_IMS_BACKEND_B2Q_H
-+#define MM_IMS_BACKEND_B2Q_H
++#ifndef MM_IMS_BACKEND_IMSROHA_H
++#define MM_IMS_BACKEND_IMSROHA_H
 +
 +#include <glib.h>
 +#include <glib-object.h>
@@ -1462,81 +1462,81 @@ index 0000000..66d046e
 +
 +#include "mm-broadband-modem-qmi.h"
 +
-+#define MM_TYPE_IMS_BACKEND_B2Q            (mm_ims_backend_b2q_get_type ())
-+#define MM_IMS_BACKEND_B2Q(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2q))
-+#define MM_IMS_BACKEND_B2Q_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2qClass))
-+#define MM_IS_IMS_BACKEND_B2Q(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_IMS_BACKEND_B2Q))
-+#define MM_IS_IMS_BACKEND_B2Q_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_IMS_BACKEND_B2Q))
-+#define MM_IMS_BACKEND_B2Q_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2qClass))
++#define MM_TYPE_IMS_BACKEND_IMSROHA            (mm_ims_backend_imsroha_get_type ())
++#define MM_IMS_BACKEND_IMSROHA(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_IMS_BACKEND_IMSROHA, MMImsBackendImsroha))
++#define MM_IMS_BACKEND_IMSROHA_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_IMS_BACKEND_IMSROHA, MMImsBackendImsrohaClass))
++#define MM_IS_IMS_BACKEND_IMSROHA(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_IMS_BACKEND_IMSROHA))
++#define MM_IS_IMS_BACKEND_IMSROHA_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_IMS_BACKEND_IMSROHA))
++#define MM_IMS_BACKEND_IMSROHA_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_IMS_BACKEND_IMSROHA, MMImsBackendImsrohaClass))
 +
-+typedef struct _MMImsBackendB2q MMImsBackendB2q;
-+typedef struct _MMImsBackendB2qClass MMImsBackendB2qClass;
-+typedef struct _MMImsBackendB2qPrivate MMImsBackendB2qPrivate;
++typedef struct _MMImsBackendImsroha MMImsBackendImsroha;
++typedef struct _MMImsBackendImsrohaClass MMImsBackendImsrohaClass;
++typedef struct _MMImsBackendImsrohaPrivate MMImsBackendImsrohaPrivate;
 +
-+struct _MMImsBackendB2q {
++struct _MMImsBackendImsroha {
 +    GObject parent;
-+    MMImsBackendB2qPrivate *priv;
++    MMImsBackendImsrohaPrivate *priv;
 +};
 +
-+struct _MMImsBackendB2qClass {
++struct _MMImsBackendImsrohaClass {
 +    GObjectClass parent;
 +};
 +
-+GType mm_ims_backend_b2q_get_type (void);
-+G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMImsBackendB2q, g_object_unref)
++GType mm_ims_backend_imsroha_get_type (void);
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMImsBackendImsroha, g_object_unref)
 +
-+MMImsBackendB2q *mm_ims_backend_b2q_new (MMBroadbandModemQmi *modem);
++MMImsBackendImsroha *mm_ims_backend_imsroha_new (MMBroadbandModemQmi *modem);
 +
-+gboolean mm_ims_backend_b2q_is_available (MMImsBackendB2q *self);
-+void     mm_ims_backend_b2q_load_initial_sms        (MMImsBackendB2q     *self,
++gboolean mm_ims_backend_imsroha_is_available (MMImsBackendImsroha *self);
++void     mm_ims_backend_imsroha_load_initial_sms        (MMImsBackendImsroha     *self,
 +                                                     GAsyncReadyCallback  callback,
 +                                                     gpointer             user_data);
-+gboolean mm_ims_backend_b2q_load_initial_sms_finish (MMImsBackendB2q     *self,
++gboolean mm_ims_backend_imsroha_load_initial_sms_finish (MMImsBackendImsroha     *self,
 +                                                     GAsyncResult        *res,
 +                                                     GError             **error);
 +
-+GList *mm_ims_backend_b2q_get_call_list (MMImsBackendB2q *self);
++GList *mm_ims_backend_imsroha_get_call_list (MMImsBackendImsroha *self);
 +
-+void mm_ims_backend_b2q_create_call (MMImsBackendB2q    *self,
++void mm_ims_backend_imsroha_create_call (MMImsBackendImsroha    *self,
 +                                     const gchar        *number,
 +                                     GCancellable       *cancellable,
 +                                     GAsyncReadyCallback callback,
 +                                     gpointer            user_data);
-+gboolean mm_ims_backend_b2q_create_call_finish (MMImsBackendB2q  *self,
++gboolean mm_ims_backend_imsroha_create_call_finish (MMImsBackendImsroha  *self,
 +                                                GAsyncResult     *res,
 +                                                guint32          *out_call_id,
 +                                                GError          **error);
 +
-+void mm_ims_backend_b2q_answer_call (MMImsBackendB2q    *self,
++void mm_ims_backend_imsroha_answer_call (MMImsBackendImsroha    *self,
 +                                     guint32             call_id,
 +                                     GCancellable       *cancellable,
 +                                     GAsyncReadyCallback callback,
 +                                     gpointer            user_data);
-+gboolean mm_ims_backend_b2q_answer_call_finish (MMImsBackendB2q  *self,
++gboolean mm_ims_backend_imsroha_answer_call_finish (MMImsBackendImsroha  *self,
 +                                                GAsyncResult     *res,
 +                                                GError          **error);
 +
-+void mm_ims_backend_b2q_hangup_call (MMImsBackendB2q    *self,
++void mm_ims_backend_imsroha_hangup_call (MMImsBackendImsroha    *self,
 +                                     guint32             call_id,
 +                                     GCancellable       *cancellable,
 +                                     GAsyncReadyCallback callback,
 +                                     gpointer            user_data);
-+gboolean mm_ims_backend_b2q_hangup_call_finish (MMImsBackendB2q  *self,
++gboolean mm_ims_backend_imsroha_hangup_call_finish (MMImsBackendImsroha  *self,
 +                                                GAsyncResult     *res,
 +                                                GError          **error);
 +
-+void mm_ims_backend_b2q_send_sms (MMImsBackendB2q    *self,
++void mm_ims_backend_imsroha_send_sms (MMImsBackendImsroha    *self,
 +                                  const gchar        *number,
 +                                  const gchar        *text,
 +                                  GCancellable       *cancellable,
 +                                  GAsyncReadyCallback callback,
 +                                  gpointer            user_data);
-+gboolean mm_ims_backend_b2q_send_sms_finish (MMImsBackendB2q  *self,
++gboolean mm_ims_backend_imsroha_send_sms_finish (MMImsBackendImsroha  *self,
 +                                             GAsyncResult     *res,
 +                                             gchar           **out_ref,
 +                                             GError          **error);
 +
-+#endif /* MM_IMS_BACKEND_B2Q_H */
++#endif /* MM_IMS_BACKEND_IMSROHA_H */
 diff --git a/src/mm-sms-ims.c b/src/mm-sms-ims.c
 new file mode 100644
 index 0000000..d250c26
@@ -1556,7 +1556,7 @@ index 0000000..d250c26
 +#include "config.h"
 +
 +#include "mm-sms-ims.h"
-+#include "mm-ims-backend-b2q.h"
++#include "mm-ims-backend-imsroha.h"
 +#include "mm-broadband-modem-qmi.h"
 +#include "mm-log-object.h"
 +#include "mm-errors-types.h"
@@ -1575,7 +1575,7 @@ index 0000000..d250c26
 +}
 +
 +static void
-+send_sms_ready (MMImsBackendB2q *backend,
++send_sms_ready (MMImsBackendImsroha *backend,
 +                GAsyncResult    *res,
 +                GTask           *task)
 +{
@@ -1585,7 +1585,7 @@ index 0000000..d250c26
 +
 +    self = MM_BASE_SMS (g_task_get_source_object (task));
 +
-+    if (!mm_ims_backend_b2q_send_sms_finish (backend, res, &ref, &error)) {
++    if (!mm_ims_backend_imsroha_send_sms_finish (backend, res, &ref, &error)) {
 +        g_task_return_error (task, error);
 +    } else {
 +        GList *parts;
@@ -1608,7 +1608,7 @@ index 0000000..d250c26
 +          gpointer             user_data)
 +{
 +    MMBroadbandModemQmi *modem = NULL;
-+    MMImsBackendB2q     *backend = NULL;
++    MMImsBackendImsroha     *backend = NULL;
 +    GTask               *task;
 +    const gchar         *number;
 +    const gchar         *text;
@@ -1624,7 +1624,7 @@ index 0000000..d250c26
 +    }
 +
 +    backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
-+    if (!backend || !mm_ims_backend_b2q_is_available (backend)) {
++    if (!backend || !mm_ims_backend_imsroha_is_available (backend)) {
 +        g_object_unref (modem);
 +        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
 +                                 "IMS backend is not available");
@@ -1655,7 +1655,7 @@ index 0000000..d250c26
 +
 +    mm_obj_dbg (self, "sending IMS SMS to %s", number);
 +
-+    mm_ims_backend_b2q_send_sms (backend,
++    mm_ims_backend_imsroha_send_sms (backend,
 +                                 number,
 +                                 text,
 +                                 NULL,

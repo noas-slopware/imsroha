@@ -1,0 +1,14 @@
+[Unit]
+Description=IMSroha: ungate IMS registration on Samsung modems
+Documentation=https://github.com/noas-slopware/imsroha
+Before=imsroha-bearer.service imsroha.service
+
+[Service]
+# Exits 0 at once when the modem has no Samsung VSS service (227). On a
+# Samsung modem it stays, logging what the modem answers, and is restarted
+# with it (it exits nonzero when the QMI device goes away).
+Type=simple
+ExecStart=/usr/bin/imsroha-vss-samsung
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=8192

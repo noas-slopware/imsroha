@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: GPL-3.0-only
+project('imsroha', 'c',
+  version: '0.2.0',
+  license: 'GPL-3.0-only',
+  meson_version: '>= 1.0',
+  default_options: ['c_std=gnu11', 'warning_level=2', 'buildtype=debugoptimized'])
+
+add_project_arguments('-DIMSROHA_VERSION="@0@"'.format(meson.project_version()), language: 'c')
+
+glib = dependency('glib-2.0')
+gio = dependency('gio-2.0')
+qmi = dependency('qmi-glib', version: '>= 1.36')
+qrtr = dependency('qrtr-glib')
+systemd = dependency('libsystemd')
+alsa = dependency('alsa')
+cc = meson.get_compiler('c')
+amrwb = cc.find_library('opencore-amrwb')
+amrnb = cc.find_library('opencore-amrnb')
+amrwbenc = cc.find_library('vo-amrwbenc')
+
+common = static_library('imsroha-common',
+  'src/config.c', 'src/qmidev.c',
+  dependencies: [glib, gio, qmi, qrtr])
+
+executable('imsroha',
+  'src/imsroha.c', 'src/aka.c', 'src/sms.c', 'src/sip.c', 'src/dbus.c',
+  'src/inbox.c', 'src/audio.c', 'src/codec.c', 'src/dns.c',
+  link_with: common,
+  dependencies: [glib, gio, qmi, qrtr, systemd, amrwb, amrnb, amrwbenc],
+  install: true)
+
+executable('imsroha-bearer', 'src/imsroha_bearer.c',
+  link_with: common,
+  dependencies: [glib, gio, qmi, qrtr, systemd],
+  install: true)
+
+executable('imsroha-vss-samsung', 'src/vss_samsung.c',
+  link_with: common,
+  dependencies: [glib, gio, qmi, qrtr],
+  install: true)
+
+executable('imsroha-audio', 'src/imsroha_audio.c',
+  dependencies: [alsa],
+  install: true)
+
+prefix = get_option('prefix')
+unitdir = prefix / 'lib/systemd/system'
+userunitdir = prefix / 'lib/systemd/user'
+install_data('systemd/imsroha.service', 'systemd/imsroha-bearer.service',
+  'systemd/imsroha-vss-samsung.service', install_dir: unitdir)
+install_data('systemd/ModemManager.service.d/imsroha.conf',
+  install_dir: unitdir / 'ModemManager.service.d')
+install_data('systemd/imsroha-audio.service', install_dir: userunitdir)
+install_symlink('imsroha-audio.service',
+  pointing_to: '../imsroha-audio.service',
+  install_dir: userunitdir / 'graphical-session.target.wants')
+install_data('systemd/codes.noa.IMSroha.conf', install_dir: prefix / 'share/dbus-1/system.d')
+install_data('data/carriers.conf', install_dir: prefix / 'share/imsroha')
+install_data('data/imsroha.conf', install_dir: prefix / 'share/doc/imsroha',
+  rename: 'imsroha.conf.example')
+install_data('data/99-imsroha.rules', install_dir: prefix / 'lib/udev/rules.d')
+
+golden = executable('sip-golden', 'tests/sip-golden.c', 'src/sms.c', 'src/dns.c',
+  link_with: common,
+  c_args: ['-DGOLDEN_SRCDIR="@0@"'.format(meson.project_source_root()), '-Wno-unused-function'],
+  include_directories: include_directories('src'),
+  dependencies: [glib, gio, qmi, qrtr, systemd],
+  build_by_default: false)
+test('sip-golden', find_program('tests/run-golden.sh'),
+  args: [golden.full_path(), meson.project_source_root() / 'tests/golden-lguplus.txt',
+         meson.project_source_root() / 'tests/normalize.sh'],
+  depends: golden)

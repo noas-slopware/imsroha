@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
 #include "inbox.h"
 
 #include <dirent.h>
@@ -26,13 +26,13 @@ static unsigned int seen_n, seen_next;
 
 int imsd_inbox_init(void)
 {
-	/* systemd sets STATE_DIRECTORY from StateDirectory=b2q-imsd. */
+	/* systemd sets STATE_DIRECTORY from StateDirectory=imsroha. */
 	const char *state = getenv("STATE_DIRECTORY");
 	char path[512];
 	int base;
 
 	if (!state || !*state)
-		state = "/var/lib/b2q-imsd";
+		state = "/var/lib/imsroha";
 	/* STATE_DIRECTORY may list several paths separated by ':'; use the first. */
 	snprintf(path, sizeof(path), "%s", state);
 	char *colon = strchr(path, ':');
@@ -44,6 +44,22 @@ int imsd_inbox_init(void)
 	base = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (base < 0)
 		return -errno;
+	/*
+	 * Before the split out of linux-zflip3 the daemon kept its state in
+	 * /var/lib/b2q-imsd. Messages not yet acknowledged by ModemManager are
+	 * still there after an upgrade: move the inbox and the seen list over
+	 * once, while this directory has neither. Same filesystem, so rename()
+	 * moves them whole; afterwards the old paths no longer exist.
+	 */
+	if (faccessat(base, INBOX_SUBDIR, F_OK, 0) < 0 && errno == ENOENT) {
+		int old = open("/var/lib/b2q-imsd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		if (old >= 0) {
+			if (renameat(old, INBOX_SUBDIR, base, INBOX_SUBDIR) == 0)
+				fprintf(stderr, "imsroha: moved the inbox over from /var/lib/b2q-imsd\n");
+			renameat(old, "seen", base, "seen");
+			close(old);
+		}
+	}
 	if (mkdirat(base, INBOX_SUBDIR, 0700) < 0 && errno != EEXIST) {
 		int r = -errno;
 		close(base);

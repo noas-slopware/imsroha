@@ -1,9 +1,0 @@
-ACTION!="add|change", GOTO="b2q_ims_rules_end"
-
-# Ignore IMS dedicated mux netdev so ModemManager does not grab it as a data port
-SUBSYSTEM=="net", KERNEL=="qmapmux0.3", ENV{ID_MM_PORT_IGNORE}="1"
-
-# Tag Qualcomm SoC modem ports for b2q IMS support in ModemManager
-ENV{ID_MM_QCOM_SOC}=="1", ENV{ID_MM_B2Q_IMS}="1"
-
-LABEL="b2q_ims_rules_end"

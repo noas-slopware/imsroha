@@ -1,83 +1,98 @@
-# imsd — userspace IMS for the Galaxy Z Flip3 (b2q)
+# IMSroha
 
-`b2q-imsd` owns the IMS PDN and speaks SIP on it, so SMS and VoLTE signaling do not
-depend on the modem's absent IMS app. Dialers never talk to it directly: the
-ModemManager package carries a backend switch that delegates MM's Voice and Messaging
-paths to this daemon over D-Bus (Phase 1.5), so plasma-dialer and spacebar stay
-unmodified.
+Userspace IMS for Linux phones whose modem speaks Qualcomm QMI: VoLTE calls and SMS
+over IMS without Android, behind an unmodified dialer and SMS app. Named after Iroha
+Sakayori (CPK), with the IMS up front.
 
-State right now: registration (ISIM AKA), SMS both ways, MMS notifications,
-and VoLTE calls in and out work on LG U+. Received SMS go through a durable inbox
-before the RP-ACK (`inbox.c`) and reach ModemManager as raw TPDUs. Call audio is
-AMR-WB over RTP here, with the PCM handed to `b2q-ims-audio` in the user session,
-which plays and records it through PipeWire.
+The modem brings up the IMS PDN and runs AKA on the SIM. Everything above that
+(registration, SMS, calls, RTP and AMR) runs here. ModemManager, with the patches in
+`modemmanager/`, hands its Voice and Messaging interfaces to the daemon over D-Bus,
+so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager only.
 
-## Layout and where each file ships
+## Status
 
-```
-imsd/src/imsd.c                     daemon entry, D-Bus vtable (org.b2q.Imsd), event loop
-imsd/src/sip.c, sip.h               SIP: REGISTER, MESSAGE (SMS), INVITE/BYE/CANCEL, RTP, AMR-WB
-imsd/src/aka.c, aka.h               ISIM AKA: 401 RAND/AUTN -> UIM authenticate -> RES/CK/IK
-imsd/src/sms.c, sms.h               MO-SMS RP-DATA/SMS-SUBMIT encoder
-imsd/src/inbox.c, inbox.h           MT-SMS inbox in /var/lib/b2q-imsd/inbox (GetPendingPdus/AckPdu)
-imsd/src/audio.c, audio.h           call PCM over /run/b2q-imsd/audio.sock to the user session
-imsd/src/dbus.c, dbus.h             signal emitters + bus/path/error constants
-imsd/src/ims_audio.c                b2q-ims-audio: user-session bridge between the socket and PipeWire
-imsd/src/ims_bearer.c               b2q-ims-bearer: brings up and holds the IMS PDN on qmapmux0.3
-imsd/src/vss_manager.c              b2q-vss-manager: VSS registration ungate at boot
-imsd/systemd/b2q-imsd.service       ships to /usr/lib/systemd/system/b2q-imsd.service
-imsd/systemd/b2q-ims-bearer.service ships to /usr/lib/systemd/system/b2q-ims-bearer.service
-imsd/systemd/b2q-ims-audio.service  ships to /usr/lib/systemd/user/b2q-ims-audio.service
-imsd/systemd/ModemManager.service.d/b2q-ims.conf
-                                    ships to /usr/lib/systemd/system/ModemManager.service.d/b2q-ims.conf
-imsd/packaging/PKGBUILD             on-phone aarch64 package recipe
-```
+| carrier | PLMN | state |
+|---|---|---|
+| LG U+ | 450 06 | registers, SMS both ways, VoLTE in and out, DTMF (Galaxy Z Flip3, since 2026-11) |
+| KT | 450 08 | profile from the stock Samsung firmware; has never registered |
+| SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
+| anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
 
-For the repo's rootfs overlay the same two unit paths are written out as
-`userspace/rootfs/usr/lib/systemd/system/b2q-imsd.service` and
-`userspace/rootfs/usr/lib/systemd/system/ModemManager.service.d/b2q-ims.conf`. They are
-**not** duplicated there: the package installs them (the file contents below are the
-source of truth) and the overlay gets them from the package. `tools/build-rootfs.sh`
-copies `userspace/rootfs/.` over the staged rootfs, so once the imsd package is in the
-rootfs package list the copies come from `pacman`, not from this tree.
+SKT and KT also expect IPsec (sec-agree, TS 33.203) on the Gm interface. LG U+
+registers without it.
 
-Ordering mirrors `b2q-sim-provision.service`:
+Hardware it has run on: the Galaxy Z Flip3 (SM8350, IPA, QRTR) in
+[linux-zflip3](https://github.com/noas-slopware/linux-zflip3). Nothing in the code
+is tied to it any more. The modem is found as a QRTR node or a QMI device, the data
+path from the netdev's driver (`ipa`, `mhi_net`, `qmi_wwan`, `bam-dmux`), and the IMS
+profile by its APN.
 
-- `After=`/`Wants=` `rmtfs.service` and `b2q-sim-provision.service`
-- `Before=ModemManager.service`, with the reverse `After=`/`Wants=` in the MM drop-in
-- `WantedBy=multi-user.target`
+## Pieces
 
-`rmtfs.service` is not in this repo; it comes from the `rmtfs` package on the phone.
+| binary | unit | does |
+|---|---|---|
+| `imsroha-bearer` | `imsroha-bearer.service` | starts the IMS PDN (the 3GPP profile whose APN is `ims`) on its own QMAP mux id, creates the rmnet link `imsroha0`, puts the address on it, policy-routes traffic from that address over it, and writes `/run/imsroha/pdn` (interface, address, PCO P-CSCFs, DNS) |
+| `imsroha` | `imsroha.service` | reads the SIM (ISIM, else USIM: IMSI, EF_AD, EF_SMSP), picks the carrier profile, registers, and does SMS (TS 24.341) and VoLTE (INVITE, PRACK, UPDATE, AMR-WB/AMR over RTP, RFC 4733 DTMF). D-Bus `codes.noa.IMSroha` |
+| `imsroha-audio` | `imsroha-audio.service` (user, graphical session) | call PCM between `/run/imsroha/audio.sock` and PipeWire |
+| `imsroha-vss-samsung` | `imsroha-vss-samsung.service` | Samsung modems only: sends the IPC that ungates IMS registration (vendor QMI service 227). Exits at once on any other modem |
 
-## Packaging
+The bearer upholds the daemon: every new PDN gets a fresh `imsroha` and a fresh
+REGISTER. The MT-SMS inbox (`/var/lib/imsroha/inbox`) holds a message from before the
+RP-ACK until ModemManager has it (`AckPdu`).
 
-`packaging/PKGBUILD` builds `b2q-imsd` for `aarch64` and installs the binary plus the two
-unit files. It compiles all five `src/*.c` files in one gcc pass (there is no Makefile
-yet), linking `libpjproject` and `libsystemd` through `pkg-config`.
+## Configuration
 
-- `depends=('pjproject' 'systemd-libs')` (`libsystemd` for sd-bus).
-- `pjproject` 2.17-1 is installed on the phone (built there as `build`, installed
-  `2026-11-07`), so `pkg-config --exists libpjproject` resolves and the recipe builds.
-- `source=()` — the recipe takes the checkout path from `$B2Q_IMSD_SRC` because the tree
-  is copied to the phone, not fetched.
+`/etc/imsroha/imsroha.conf`, every key optional (`data/imsroha.conf` lists them):
 
-On-phone steps (phone side, **not** run from this checkout and never run by an agent
-without being asked):
+- `[device]`: `qrtr-node` or `qmi-device`, `data-netdev`, `data-endpoint-type`,
+  `data-endpoint-iface`, `mux-id` (3), `ims-netdev` (`imsroha0`), `profile` (0 = by
+  APN), `apn` (`ims`), `route-table` and `route-priority` (1042), and the User-Agent
+  placeholders `model` and `build`.
+- `[carrier]`: overrides any key of the carrier profile.
+
+`/usr/share/imsroha/carriers.conf` holds the carrier profiles, matched by the SIM's
+MCC+MNC: home domain, fallback P-CSCFs, User-Agent template, SMS over IP or not, how
+the MT-SMS RP-ACK goes back, SMSC, IPsec, payload types, Session-Expires, SIP and
+RTP ports, and the country code for national numbers. The comments at the top of the
+file explain each key and where the Korean values come from.
+
+Korean carriers check the User-Agent (TTA-VoLTE, TTAK.KO-06.0357) and want the
+Korean model number in it. Set `model=` (`SM-F711N`, not `SM-F711B`).
+
+## Building
 
 ```sh
-scp -r userspace/imsd root@<phone>:/home/build/
-su build -c 'cd /home/build/imsd/packaging && B2Q_IMSD_SRC=/home/build/imsd makepkg -s'
-pacman -U b2q-imsd-0.1.0-1-aarch64.pkg.tar.zst
-systemctl enable --now b2q-imsd.service
+meson setup build
+meson compile -C build
+meson test -C build
 ```
 
-The ModemManager patch gets its own package, same precedent as the phone's libqmi fork
-(Arch PKGBUILD, `provides`/`conflicts` against `modemmanager`, rebuilt as `build`).
-Design and package notes: `PHASE15-MM-BACKEND.md`.
+Needs glib, libqmi (1.36 or newer), libqrtr-glib, libsystemd, alsa-lib, opencore-amr
+and vo-amrwbenc. `packaging/PKGBUILD` builds the Arch package from this checkout.
+`modemmanager/PKGBUILD` builds ModemManager 1.24.2 with the backend. Enable with
+`systemctl enable --now imsroha-bearer.service`; the bearer starts the rest.
 
-## Rules
+`tests/sip-golden.c` runs the SIP layer against a fake P-CSCF on loopback: REGISTER,
+the AKA 401, MO and MT SMS, a cancelled MO call and an answered MT call. The output,
+with the random fields masked, must match `tests/golden-lguplus.txt`, which is
+byte for byte what the code sent before it left linux-zflip3.
 
-- No polling loops anywhere: sd-event I/O and timers, QMI indications, sd-bus, poll() in the audio bridge.
-- Never restart `rmtfs` while the modem is up.
-- Do not create MM-managed second bearers; MM's `count_bearers` assertion has crashed it
-  twice. The IMS PDN is this daemon's own WDS client.
+## Related work
+
+Other people doing IMS from userspace on Linux, none of them on a Korean carrier as
+far as I could find:
+
+- [Catcrafts/imsd](https://forgejo.catcrafts.net/Catcrafts/imsd): IMS daemon for
+  the Fairphone 6 on Nura, with IPsec, on several European carriers (GPL-3.0-only).
+  Also where the layout of the WDS IPv6 P-CSCF TLV (0x2E) used here comes from.
+- [MercuryWorkshop/NekoIMS](https://github.com/MercuryWorkshop/NekoIMS): IMS client on
+  BareSIP, VoWiFi and VoLTE.
+- [ajmwagar/hyphae](https://github.com/ajmwagar/hyphae),
+  [damonto/ims-go](https://github.com/damonto/ims-go),
+  [deeeeeeeeap/shannon-ims](https://github.com/deeeeeeeeap/shannon-ims): IMS stacks
+  in Rust and Go.
+
+## License
+
+GPL-3.0-only, see `LICENSE`. The ModemManager patches are GPL-2.0-or-later, like
+ModemManager.

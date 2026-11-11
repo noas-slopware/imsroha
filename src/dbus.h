@@ -1,11 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #include <stdint.h>
 #include <systemd/sd-bus.h>
 
-#define IMSD_BUS_NAME "org.b2q.Imsd"
-#define IMSD_BUS_PATH "/org/b2q/Imsd"
-#define IMSD_ERR_NOT_READY "org.b2q.Imsd.Error.NotReady"
+#define IMSD_BUS_NAME "codes.noa.IMSroha"
+#define IMSD_BUS_PATH "/codes/noa/IMSroha"
+#define IMSD_ERR_NOT_READY "codes.noa.IMSroha.Error.NotReady"
 
 enum imsd_state {
 	IMSD_DOWN = 0,

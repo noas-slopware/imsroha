@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "sms.h"
 
 #include <errno.h>
@@ -5,8 +6,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Carrier SMSC: +821020921827 (LG U+) */
-static const unsigned char SMSC_BCD[] = { 0x07, 0x91, 0x28, 0x01, 0x02, 0x29, 0x81, 0x72 };
 
 static int bcd_pack(const char *digits, unsigned char *out, size_t max_out)
 {
@@ -61,7 +60,7 @@ static size_t utf8_to_ucs2(const char *utf8, unsigned char *ucs2, size_t max_ucs
 }
 
 /* Convert UCS-2 Big-Endian byte buffer to UTF-8 null-terminated string. */
-static int normalize_phone_number(const char *in, char *out, size_t out_max,
+static int normalize_phone_number(const char *in, const char *cc, char *out, size_t out_max,
 				   uint8_t *out_ton, size_t *out_digits)
 {
 	if (!in || !out || out_max < 32)
@@ -80,9 +79,10 @@ static int normalize_phone_number(const char *in, char *out, size_t out_max,
 	if (c_idx == 0)
 		return -EINVAL;
 
-	/* If Korean country code +82: convert to domestic 0... */
-	if (has_plus && strncmp(cleaned, "82", 2) == 0 && c_idx > 2) {
-		snprintf(out, out_max, "0%s", cleaned + 2);
+	/* The home country code: national form, 0... */
+	size_t cc_len = cc ? strlen(cc) : 0;
+	if (has_plus && cc_len && strncmp(cleaned, cc, cc_len) == 0 && c_idx > cc_len) {
+		snprintf(out, out_max, "0%s", cleaned + cc_len);
 		*out_ton = 0x81; /* National / unknown */
 		*out_digits = strlen(out);
 		return 0;
@@ -104,7 +104,8 @@ static int normalize_phone_number(const char *in, char *out, size_t out_max,
 }
 
 int imsd_sms_encode_rp_data(const char *dest_number, const char *utf8_text,
-			    unsigned char mr,
+			    const char *country_code, unsigned char mr,
+			    const unsigned char *smsc, size_t smsc_len,
 			    unsigned char *out_buf, size_t max_len)
 {
 	if (!dest_number || !utf8_text || !out_buf || max_len < 64)
@@ -113,7 +114,7 @@ int imsd_sms_encode_rp_data(const char *dest_number, const char *utf8_text,
 	char norm_number[64];
 	uint8_t ton = 0x81;
 	size_t num_digits = 0;
-	int r = normalize_phone_number(dest_number, norm_number, sizeof(norm_number), &ton, &num_digits);
+	int r = normalize_phone_number(dest_number, country_code, norm_number, sizeof(norm_number), &ton, &num_digits);
 	if (r < 0)
 		return r;
 
@@ -155,8 +156,8 @@ int imsd_sms_encode_rp_data(const char *dest_number, const char *utf8_text,
 	out_buf[rp_idx++] = 0x00; /* RP-Originator Address len = 0 */
 
 	/* RP-Destination Address = SMSC (+821020921827) */
-	memcpy(&out_buf[rp_idx], SMSC_BCD, sizeof(SMSC_BCD));
-	rp_idx += sizeof(SMSC_BCD);
+	memcpy(&out_buf[rp_idx], smsc, smsc_len);
+	rp_idx += smsc_len;
 
 	/* RP-User-Data len + TPDU */
 	out_buf[rp_idx++] = (unsigned char)tpdu_idx;
@@ -166,4 +167,24 @@ int imsd_sms_encode_rp_data(const char *dest_number, const char *utf8_text,
 
 	memcpy(&out_buf[rp_idx], tpdu, tpdu_idx);
 	return (int)(rp_idx + tpdu_idx);
+}
+
+int imsd_sms_address_element(const char *number, unsigned char *out, size_t size)
+{
+	char digits[24];
+	size_t n = 0;
+	int intl = number[0] == '+';
+
+	for (const char *p = number + intl; *p && n + 1 < sizeof(digits); p++)
+		if (*p >= '0' && *p <= '9')
+			digits[n++] = *p;
+	digits[n] = '\0';
+	if (!n || (n + 1) / 2 + 2 > size)
+		return -EINVAL;
+	out[1] = intl ? 0x91 : 0x81;
+	int bcd = bcd_pack(digits, out + 2, size - 2);
+	if (bcd < 0)
+		return bcd;
+	out[0] = (unsigned char)(bcd + 1);
+	return bcd + 2;
 }
