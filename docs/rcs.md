@@ -15,8 +15,8 @@ and the Korean parts are data plus the TTA additions.
 
 ## TTAK.KO-06.0410/R9 (2025-11-21, 212 pages)
 
-Noa got the PDF; it lives at linux-zflip3 `scratch/tta/rcs/TTAK.KO-06.0410R9.pdf`
-(sha256 3c14a8a7…), with the text in `r9.txt`.
+TTA hands the PDF out after a login (sha256 3c14a8a7…); it is not redistributed
+here.
 
 - **Base and additions.** It builds on GSMA RCS 6.0 "Advanced Communications Services
   and Client Specification" v7.0 (6.1). Chapter 8 adds the Korean features: reply
@@ -86,7 +86,7 @@ All three carriers have the same shape. From `res/raw/imsprofile.json`
 The generic part works on any UP carrier with its own ACS. Jibe carriers are out: Jibe
 only provisions Google Messages.
 
-**Opt-in (Noa, 2026-11-11).** RCS is off unless the configuration turns it on: an
+**Opt-in.** RCS is off unless the configuration turns it on: an
 `[rcs]` section with `enable=true` in `/etc/imsroha/imsroha.conf`, default false, and
 nothing in `data/carriers.conf` switches it on. While it is off, imsroha never contacts
 the ACS: that request carries the IMSI and IMEI and can change the line's RCS state at
@@ -131,15 +131,15 @@ Will `connectrcs.com`'s ACS provision a client that is not Samsung Messages?
 - iPhones are provisioned since iOS 26, so the server does serve non-Samsung clients.
   Whether it checks vendor, model or client strings is unknown.
 
-The cheapest test is one ACS run (HTTP over the phone's LG U+ data, then HTTPS) with
-truthful terminal fields and imsroha's own client fields; it needs Noa's go. If it
-answers with a config, the rest is protocol work with public specs (RCC.07, RCC.14,
-RCC.71, OMA CPM) plus TTAK.KO-06.0410. If it refuses, the response says on what.
+Answered on 2026-11-11: yes, for LG U+. Its ACS provisioned imsroha-rcs on the first
+run, with truthful terminal fields (terminal_vendor `SEC`, model SM-F711N) and
+imsroha's own client fields (client_version `RCSLinux-0.2`, terminal_sw_version
+`IMSroha-0.2.0`). SKT and KT have not been asked.
 
 ## Design: imsroha-rcs
 
-Written 2026-11-11, before the code. Everything below was built and tested on loopback
-only; no request has gone to a carrier.
+Written 2026-11-11, before the code, and first tested on loopback only; the status
+below has the live run on LG U+.
 
 ### Components
 
@@ -335,13 +335,19 @@ namespace, ignored when received as RFC 3862 says).
 
 ### Status (2026-11-11)
 
-Built and tested on loopback only (`meson test`: `rcs-acs-request`, `rcs-acs-flow`,
-`rcs-smsport`, `rcs-daemon`, each in a network namespace with nothing but `lo`; also
-clean under ASan/UBSan). Covered: every ACS outcome, the first activation with the OTP
-SMS, the ACS floor with an unreachable P-CSCF and with two 403s to REGISTER, chat both
-ways with IMDNs and isComposing, presence (PUBLISH, anonymous fetch), the -4 request.
-No request has gone to any carrier. Spacebar's side is the patch series in
-linux-zflip3 `userspace/spacebar/` (0004-0006), compile-checked only.
+**Working on LG U+** (Galaxy Z Flip3, 0.2.0-4): the ACS run with the OTP SMS
+(configuration version 15, valid two weeks), registration over TLS to the P-CSCF
+from NAPTR/SRV, capabilities through presence, and a 1-to-1 chat both ways with a
+Samsung phone over MSRPoTLS, with delivered and displayed reports. SKT and KT are
+untried.
+
+On loopback (`meson test`: `rcs-acs-request`, `rcs-acs-flow`, `rcs-smsport`,
+`rcs-daemon`, `rcs-cert`, each in a network namespace with nothing but `lo`; also
+clean under ASan/UBSan): every ACS outcome, the first activation with the OTP SMS,
+the ACS floor with an unreachable P-CSCF and with two 403s to REGISTER, chat both ways
+with IMDNs and isComposing, presence (PUBLISH, anonymous fetch), the -4 request, the
+MSRP client certificate. A messaging app's side: Spacebar patches 0004-0006 in
+[linux-zflip3](https://github.com/noas-slopware/linux-zflip3) `userspace/spacebar/`.
 
 Not done yet, or different from R9's own examples:
 

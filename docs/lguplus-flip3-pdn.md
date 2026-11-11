@@ -4,7 +4,7 @@
 
 Source: ModemManager debug logs captured read-only on 2026-11-07 22:16 (same boot,
 no disconnect) plus the `ims_bearer.py` holder's logged `Get Current Settings` result.
-`evidence/SM-F711N-m0.md`, "Phase 0 MM-identical IMS setup confirms modem gate".
+linux-zflip3 `evidence/SM-F711N-m0.md`, "Phase 0 MM-identical IMS setup confirms modem gate".
 
 **These are recorded values, not choices.** Do not change, round, renumber or
 "correct" any of them to fit a convention; if the modem hands out something different

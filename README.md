@@ -13,9 +13,9 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 
 | carrier | PLMN | state |
 |---|---|---|
-| LG U+ | 450 06 | **tested, working** on the Galaxy Z Flip3 (2026-11-11): registers with TTAK.KO-06.0357/R6 sec-agree (IPsec ESP, `hmac-sha-1-96`/`aes-cbc`), SMS and VoLTE calls both ways, DTMF. LG U+ refuses the reg event (489 "REG EVENT OFF") and puts no P-CSCF in the PCO; the profile's is used |
-| KT | 450 08 | profile from the stock Samsung firmware; has never registered |
-| SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
+| LG U+ | 450 06 | **tested, working** on the Galaxy Z Flip3 (2026-11-11): registers with TTAK.KO-06.0357/R6 sec-agree (IPsec ESP, `hmac-sha-1-96`/`aes-cbc`), SMS and VoLTE calls both ways, DTMF. LG U+ refuses the reg event (489 "REG EVENT OFF") and puts no P-CSCF in the PCO; the profile's is used. **RCS (Chatting+) working** too: autoconfiguration with the OTP SMS, registration, 1-to-1 chat both ways with a Samsung phone, delivered and displayed reports |
+| KT | 450 08 | profile from the stock Samsung firmware; has never registered; RCS untried |
+| SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem, so RCS cannot get its OTP SMS yet (`docs/rcs.md`) |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
 
 All three Korean carriers get what TTAK.KO-06.0357/R6 (the Korean VoLTE terminal
@@ -50,8 +50,10 @@ RP-ACK until ModemManager has it (`AckPdu`).
 
 - `[device]`: `qrtr-node` or `qmi-device`, `data-netdev`, `data-endpoint-type`,
   `data-endpoint-iface`, `mux-id` (3), `ims-netdev` (`imsroha0`), `profile` (0 = by
-  APN), `apn` (`ims`), `route-table` and `route-priority` (1042), and the User-Agent
-  placeholders `model` and `build`.
+  APN), `apn` (`ims`), `route-table` and `route-priority` (1042), `mtu-fallback`
+  (1428, when the modem reports no MTU), the User-Agent placeholders `model`, `build`,
+  `operator` and `device-type`, and `vendor` (RCS's terminal_vendor).
+- `[rcs]`: `enable=true` turns RCS on (off by default); see `docs/rcs.md`.
 - `[carrier]`: overrides any key of the carrier profile.
 
 `/usr/share/imsroha/carriers.conf` holds the carrier profiles, matched by the SIM's
