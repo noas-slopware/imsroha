@@ -6,7 +6,7 @@ From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
 To: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 1 REGISTER
-Contact: <sip:450081234567890@[::1]:5080>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip
+Contact: <sip:450081234567890@[::1]:5080>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
 Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response="", algorithm=AKAv1-MD5
 Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084
 Require: sec-agree
@@ -35,7 +35,7 @@ From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
 To: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 2 REGISTER
-Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip
+Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
 Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response="233395195145334bf9b721930bd60bc9", algorithm=AKAv1-MD5
 Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084
 Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=4444;spi-s=5555;port-c=6101;port-s=6100
@@ -50,17 +50,36 @@ Content-Length: 0
 
 
 ===== step 3: after 200 OK to REGISTER
+----- <len> (to port-s)
+SUBSCRIBE sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
+Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
+Route: <sip:scscf.ims.mnc008.mcc450.3gppnetwork.org;lr>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+To: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
+Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 1 SUBSCRIBE
+Contact: <sip:450081234567890@[::1]:5084>
+Event: reg
+Accept: application/reginfo+xml
+Expires: 600000
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
+User-Agent: TTA-VoLTE/3.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone KTC
+Content-Length: 0
+
+
 ===== step 4: MO-SMS MESSAGE
 ----- <len> (to port-s)
 MESSAGE sip:01012345678@ims.mnc008.mcc450.3gppnetwork.org;user=phone SIP/2.0
 Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
-From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
 To: <sip:01012345678@ims.mnc008.mcc450.3gppnetwork.org;user=phone>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 1 MESSAGE
 Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
-P-Preferred-Identity: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
+P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
 P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel.smsip
 User-Agent: TTA-VoLTE/3.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone KTC
 Accept-Contact: *;+g.3gpp.smsip;require;explicit
@@ -73,14 +92,14 @@ Content-Length: 29
 INVITE tel:01012345678;phone-context=ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
 Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
 Route: <sip:scscf.ims.mnc008.mcc450.3gppnetwork.org;lr>
-From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
 To: <tel:01012345678;phone-context=ims.mnc008.mcc450.3gppnetwork.org>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 1 INVITE
 Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
 Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
-P-Preferred-Identity: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
+P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
 P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
 User-Agent: TTA-VoLTE/3.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone KTC
 P-Early-Media: supported
@@ -114,7 +133,7 @@ a=sendrecv
 ----- <len> (to port-s)
 CANCEL tel:01012345678;phone-context=ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
 Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
-From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
 To: <tel:01012345678;phone-context=ims.mnc008.mcc450.3gppnetwork.org>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 1 CANCEL
@@ -127,14 +146,14 @@ Content-Length: 0
 MESSAGE tel:+821020921827 SIP/2.0
 Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
 Route: <sip:scscf.ims.mnc008.mcc450.3gppnetwork.org;lr>
-From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
 To: <tel:+821020921827>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 1 MESSAGE
 In-Reply-To: mt-sms-1@ims.mnc008.mcc450.3gppnetwork.org
 Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
-P-Preferred-Identity: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
+P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
 User-Agent: TTA-VoLTE/3.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone KTC
 Content-Type: application/vnd.3gpp.sms
 Content-Length: 2

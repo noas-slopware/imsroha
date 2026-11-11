@@ -184,6 +184,8 @@ static void carrier_defaults(struct imsroha_carrier *car)
 	car->pt_dtmf = 101;
 	car->session_expires = 1800;
 	car->rtp_port = 40000;
+	car->reg_event = 1;
+	car->sip_instance = 1;
 }
 
 static void carrier_from(GKeyFile *kf, const char *g, struct imsroha_carrier *car)
@@ -215,6 +217,9 @@ static void carrier_from(GKeyFile *kf, const char *g, struct imsroha_carrier *ca
 	get_u16(kf, g, "rtp-port", &car->rtp_port);
 	get_str(kf, g, "country-code", car->country_code, sizeof(car->country_code));
 	get_str(kf, g, "smsc", car->smsc, sizeof(car->smsc));
+	get_str(kf, g, "sms-psi", car->sms_psi, sizeof(car->sms_psi));
+	get_bool(kf, g, "reg-event", &car->reg_event);
+	get_bool(kf, g, "sip-instance", &car->sip_instance);
 }
 
 /* The carriers.conf group whose plmn= list holds mcc+mnc, or NULL. */

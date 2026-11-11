@@ -62,12 +62,22 @@ struct imsd_sip_ctx {
 	int fd_c, fd_s;
 	char user_agent[256];
 	char pani[160];         /* P-Access-Network-Info value */
+	char instance[96];      /* ;+sip.instance="<urn:gsma:imei:...>" for Contact, or "" */
+
+	/* The reg event subscription (TS 24.229 5.1.1.3): -1 when the network said 489. */
+	int sub_state;
+	char sub_call_id[192];
+	char sub_from_tag[16];
+	char sub_to_tag[64];
+	uint32_t sub_cseq;
 	unsigned char smsc[12]; /* RP destination: the SC address element (length, TON/NPI, BCD) */
 	size_t smsc_len;
 
 	/* Subscriber identity, read from the ISIM at start (never compiled in). */
 	char impi[128];      /* private identity, the Digest username */
-	char impu[128];      /* public identity, sip:<user>@<domain> */
+	char impu[128];      /* public identity for everything but REGISTER */
+	char reg_impu[128];  /* the one REGISTER carries (a temporary one without an ISIM) */
+	int impu_temporary;  /* reg_impu is IMSI-derived: switch impu to P-Associated-URI's first */
 	char impu_user[64];  /* its user part, for Contact */
 
 	/* Registration state */

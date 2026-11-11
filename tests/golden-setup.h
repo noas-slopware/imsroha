@@ -69,4 +69,7 @@ static void golden_setup(struct imsd_sip_ctx *ctx, sd_event *event, int ue_fd,
 		fprintf(stderr, "golden: setup failed\n");
 		exit(1);
 	}
+	/* imsd_sip_init() reads the IMEI from the modem; the test has a made-up one. */
+	if (cfg.car.sip_instance)
+		snprintf(ctx->instance, sizeof(ctx->instance), ";+sip.instance=\"<urn:gsma:imei:35209900-176148-0>\"");
 }

@@ -6,6 +6,7 @@
 #include "dbus.h"
 #include "sms.h"
 #include "dns.h"
+#include "imei.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -551,6 +552,14 @@ static const char *contact_sms(const struct imsd_sip_ctx *ctx)
 	return ctx->cfg.car.sms_over_ip ? ";+g.3gpp.smsip" : "";
 }
 
+/* REGISTER's Contact parameters: smsip, and the IMEI instance id when the carrier wants it. */
+static const char *contact_reg(const struct imsd_sip_ctx *ctx)
+{
+	static char buf[160];
+	snprintf(buf, sizeof(buf), "%s%s", contact_sms(ctx), ctx->instance);
+	return buf;
+}
+
 /*
  * The Expires we ask for. 600000 s unless the registrar answered 423 Interval
  * Too Brief with a larger Min-Expires (RFC 3261 10.2.8), which then sticks.
@@ -630,8 +639,8 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 		"P-Access-Network-Info: %s\r\n"
 		"User-Agent: %s\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
-		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_sms(ctx), ctx->impi, ctx->domain, ctx->domain, alg,
+		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->reg_impu, ctx->reg_from_tag, ctx->reg_impu, ctx->reg_call_id, ctx->reg_cseq++,
+		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_reg(ctx), ctx->impi, ctx->domain, ctx->domain, alg,
 		sec, reg_req_expires(ctx), sec_supported(ctx), ctx->pani, ctx->user_agent);
 
 	/* A refresh keeps the account usable; only the first REGISTER is "registering". */
@@ -783,8 +792,8 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		"P-Access-Network-Info: %s\r\n"
 		"User-Agent: %s\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
-		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_sms(ctx), auth_line, sec,
+		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->reg_impu, ctx->reg_from_tag, ctx->reg_impu, ctx->reg_call_id, ctx->reg_cseq++,
+		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_reg(ctx), auth_line, sec,
 		reg_req_expires(ctx), sec_supported(ctx), ctx->pani, ctx->user_agent);
 
 	schedule_reg_retry(ctx);
@@ -1901,6 +1910,98 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 	return 0;
 }
 
+/*
+ * The reg event package (TS 24.229 5.1.1.3, RFC 3680): one subscription for
+ * the life of the registration, refreshed with it, in one dialog. A 489
+ * means the network has none; then never again (TTAK.KO-06.0357 5.2.1).
+ */
+static void reg_event_subscribe(struct imsd_sip_ctx *ctx)
+{
+	if (!ctx->cfg.car.reg_event || ctx->sub_state < 0)
+		return;
+	if (!ctx->sub_call_id[0]) {
+		char rnd[32];
+		rand_hex(rnd, 16);
+		snprintf(ctx->sub_call_id, sizeof(ctx->sub_call_id), "%s@%s", rnd, ctx->domain);
+		rand_hex(ctx->sub_from_tag, 8);
+		ctx->sub_to_tag[0] = '\0';
+		ctx->sub_cseq = 1;
+	}
+	char branch[32], route[300] = "", to_tag[80] = "";
+	rand_hex(branch, 8);
+	if (ctx->reg_service_route[0])
+		snprintf(route, sizeof(route), "Route: %s\r\n", ctx->reg_service_route);
+	if (ctx->sub_to_tag[0])
+		snprintf(to_tag, sizeof(to_tag), ";tag=%s", ctx->sub_to_tag);
+
+	char req[2048];
+	int len = snprintf(req, sizeof(req),
+		"SUBSCRIBE %s SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
+		"%s"
+		"From: <%s>;tag=%s\r\n"
+		"To: <%s>%s\r\n"
+		"Call-ID: %s\r\n"
+		"CSeq: %u SUBSCRIBE\r\n"
+		"Contact: <sip:%s@[%s]:%u>\r\n"
+		"Event: reg\r\n"
+		"Accept: application/reginfo+xml\r\n"
+		"Expires: %u\r\n"
+		"Max-Forwards: 70\r\n"
+		"P-Access-Network-Info: %s\r\n"
+		"P-Preferred-Identity: <%s>\r\n"
+		"User-Agent: %s\r\n"
+		"Content-Length: 0\r\n\r\n",
+		ctx->impu, ctx->local_ip, ctx->ua_port, branch, route, ctx->impu, ctx->sub_from_tag,
+		ctx->impu, to_tag, ctx->sub_call_id, ctx->sub_cseq++, ctx->impu_user, ctx->local_ip,
+		ctx->ua_port, reg_req_expires(ctx), ctx->pani, ctx->impu, ctx->user_agent);
+	if (len > 0 && (size_t)len < sizeof(req)) {
+		fprintf(stderr, "imsroha: subscribing to the reg event\n");
+		send_sip_msg(ctx, req, (size_t)len);
+	}
+}
+
+/*
+ * A reg event NOTIFY: if it says the contact we registered is gone
+ * (state="terminated"), register again (TS 24.229 5.1.1.3); a terminated
+ * subscription is started over at the next registration.
+ */
+static void reg_event_notify(struct imsd_sip_ctx *ctx, const char *msg)
+{
+	char ev[32] = "", ss[64] = "";
+	find_header(msg, "Event", ev, sizeof(ev));
+	if (strncasecmp(ev, "reg", 3) != 0)
+		return;
+	find_header(msg, "Subscription-State", ss, sizeof(ss));
+	if (!strncasecmp(ss, "terminated", 10)) {
+		ctx->sub_call_id[0] = '\0';
+		ctx->sub_to_tag[0] = '\0';
+	}
+	const char *body = strstr(msg, "\r\n\r\n");
+	if (!body)
+		return;
+	char needle[INET6_ADDRSTRLEN + 3];
+	snprintf(needle, sizeof(needle), "[%s]", ctx->local_ip);
+	for (const char *c = strstr(body, "<contact"); c; c = strstr(c + 8, "<contact")) {
+		const char *end = strstr(c, "</contact>");
+		const char *tag_end = strchr(c, '>');
+		if (!end || !tag_end)
+			break;
+		size_t n = (size_t)(end - c);
+		char el[1024];
+		snprintf(el, sizeof(el), "%.*s", (int)(n < sizeof(el) - 1 ? n : sizeof(el) - 1), c);
+		char head[512];
+		snprintf(head, sizeof(head), "%.*s", (int)(tag_end - c), c);
+		if (strstr(el, needle) && strstr(head, "state=\"terminated\"")) {
+			fprintf(stderr, "imsroha: the network ended our registration (reg event), registering again\n");
+			ctx->reg_state = IMSD_REGISTERING;
+			imsd_emit_state_changed(ctx->bus, IMSD_REGISTERING);
+			imsd_sip_register(ctx);
+			return;
+		}
+	}
+}
+
 static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *userdata)
 {
 	(void)s; (void)revents;
@@ -1947,6 +2048,19 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				if (!ctx->reg_expires) ctx->reg_expires = 10800;
 				find_header(buf, "Service-Route", ctx->reg_service_route, sizeof(ctx->reg_service_route));
 				find_header(buf, "P-Associated-URI", ctx->reg_associated_uri, sizeof(ctx->reg_associated_uri));
+				/*
+				 * A temporary IMPU (derived from the IMSI) is barred outside
+				 * REGISTER: everything else goes out as the default public
+				 * identity, the first URI in P-Associated-URI (TS 24.229 5.1.1.2.1).
+				 */
+				if (ctx->impu_temporary && ctx->reg_associated_uri[0]) {
+					char first[256];
+					sip_uri_of(ctx->reg_associated_uri, first, sizeof(first));
+					if (first[0] && strcmp(first, ctx->impu)) {
+						snprintf(ctx->impu, sizeof(ctx->impu), "%s", first);
+						fprintf(stderr, "imsroha: using %s as the public identity\n", "the default one from P-Associated-URI");
+					}
+				}
 				ctx->reg_state = IMSD_UP;
 				fprintf(stderr, "imsroha: registered successfully! (expires %u s)\n", ctx->reg_expires);
 				fprintf(stderr, "imsroha: REGISTER 200 OK headers:\n%s\n", buf);
@@ -1956,6 +2070,14 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					fprintf(stderr, "imsroha: learned P-Associated-URI: %s\n", ctx->reg_associated_uri);
 				imsd_emit_state_changed(ctx->bus, IMSD_UP);
 				schedule_reg_refresh(ctx, ctx->reg_expires);
+				reg_event_subscribe(ctx);
+			} else if (strstr(cseq, "SUBSCRIBE")) {
+				char to[256] = "", tag[64] = "";
+				find_header(buf, "To", to, sizeof(to));
+				find_param(to, "tag", tag, sizeof(tag));
+				snprintf(ctx->sub_to_tag, sizeof(ctx->sub_to_tag), "%s", tag);
+				ctx->sub_state = 1;
+				fprintf(stderr, "imsroha: reg event subscription active\n");
 			} else if (strstr(cseq, "PRACK")) {
 				fprintf(stderr, "imsroha: PRACK acknowledged (200 OK)\n");
 			} else if (strstr(cseq, "INVITE")) {
@@ -2097,6 +2219,14 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				ctx->call_state = IMSD_CALL_TERMINATED;
 				imsd_rtp_stop(ctx);
 				imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 6, 0);
+			}
+			if (strstr(cseq, "SUBSCRIBE")) {
+				/* 489 Bad Event: the network has no reg event package. */
+				if (status_code == 489)
+					ctx->sub_state = -1;
+				ctx->sub_call_id[0] = '\0';
+				fprintf(stderr, "imsroha: reg event SUBSCRIBE refused (SIP %d)%s\n", status_code,
+					status_code == 489 ? ", not subscribing again" : "");
 			}
 			if (strstr(cseq, "REGISTER"))
 				handle_register_rejected(ctx, buf, status_code);
@@ -2270,6 +2400,8 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			send_sip_msg(ctx, ok_resp, ok_len);
 			fprintf(stderr, "imsroha: answered in-dialog/request with 200 OK (CSeq %s)\n", cseq);
 		}
+		if (strncmp(buf, "NOTIFY ", 7) == 0)
+			reg_event_notify(ctx, buf);
 	}
 
 	return 0;
@@ -2338,9 +2470,20 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 		snprintf(sip_dest, sizeof(sip_dest), "%s", clean_dest);
 	}
 
+	/*
+	 * TS 24.341 5.3.1.2 and TTAK.KO-06.0357 9.3: the Request-URI is the SC's
+	 * PSI when the carrier gives one; otherwise the Korean form, the
+	 * destination as a local number in a SIP URI (LG U+ routes on it).
+	 */
+	char ruri[256];
+	if (ctx->cfg.car.sms_psi[0])
+		snprintf(ruri, sizeof(ruri), "%s", ctx->cfg.car.sms_psi);
+	else
+		snprintf(ruri, sizeof(ruri), "sip:%s@%s;user=phone", sip_dest, ctx->domain);
+
 	char req_hdr[2048];
 	int hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-		"MESSAGE sip:%s@%s;user=phone SIP/2.0\r\n"
+		"MESSAGE %s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
 		"From: <%s>;tag=%s\r\n"
 		"To: <sip:%s@%s;user=phone>\r\n"
@@ -2354,7 +2497,7 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 		"Accept-Contact: *;+g.3gpp.smsip;require;explicit\r\n"
 		"Content-Type: application/vnd.3gpp.sms\r\n"
 		"Content-Length: %d\r\n\r\n",
-		sip_dest, ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->impu, tag, sip_dest, ctx->domain,
+		ruri, ctx->local_ip, ctx->ua_port, branch, ctx->impu, tag, sip_dest, ctx->domain,
 		cid, ctx->domain, ctx->pani, ctx->impu, ctx->user_agent, rp_len);
 
 	unsigned char full_msg[2560];
@@ -2692,6 +2835,8 @@ int imsd_sip_setup(struct imsd_sip_ctx *ctx, const struct imsd_isim_identity *id
 	ctx->cfg = *cfg;
 	snprintf(ctx->impi, sizeof(ctx->impi), "%s", id->impi);
 	snprintf(ctx->impu, sizeof(ctx->impu), "%s", id->impu);
+	snprintf(ctx->reg_impu, sizeof(ctx->reg_impu), "%s", id->impu);
+	ctx->impu_temporary = !id->has_isim;
 	if (strncmp(id->impu, "sip:", 4) != 0 || !strchr(id->impu, '@')) {
 		fprintf(stderr, "imsroha: public identity is not a SIP URI\n");
 		return -EPROTO;
@@ -2831,6 +2976,14 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	r = imsd_sip_setup(ctx, &id, &cfg, &pdn);
 	if (r < 0)
 		return r;
+
+	if (cfg.car.sip_instance) {
+		char imei[32], urn[64];
+		if (imsroha_read_imei(&cfg.dev, imei, sizeof(imei)) == 0 && imsroha_imei_urn(imei, urn, sizeof(urn)) == 0)
+			snprintf(ctx->instance, sizeof(ctx->instance), ";+sip.instance=\"<%s>\"", urn);
+		else
+			fprintf(stderr, "imsroha: no IMEI from the modem, registering without +sip.instance\n");
+	}
 
 	ctx->fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (ctx->fd < 0) {
