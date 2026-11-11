@@ -42,6 +42,17 @@ Patches, in order:
   freed the transaction through the hash table before calling its `completion_fn`. On
   the Flip3 a NetworkManager restart made ModemManager reconnect and crash there (a jump
   to 0x30), and LTE stayed down for 30 s while it restarted and probed again.
+- `0008-broadband-modem-qmi-hand-port-addressed-SMS-to-imsroha.patch` is for the
+  carriers of 0006: there the modem receives the RCS OTP (a binary SMS to application
+  port 37273) over WMS, and ModemManager, which ignored the port header, showed it in
+  the messaging app while imsroha-rcs never got it. It parses the application port IEs
+  (TS 23.040 9.2.3.24.4/5, IEI 0x04 and 0x05) into the `MMSmsPart`. With the imsroha
+  backend, a received SMS-DELIVER part for any port but WAP push (2948, 2949) goes to
+  `codes.noa.IMSroha.TakePortPdu` as `00` (no SMSC address) plus the TPDU in hex, the
+  form `PortPduReceived` carries, instead of the SMS list, and is then deleted from
+  modem storage. Every part of a concatenated one goes on its own. If imsroha is not
+  there or refuses it, the part becomes a message as before. WAP push and modems
+  without `ID_MM_IMSROHA` are unchanged.
 
 ## What 0002 tried, and why it is not applied
 
@@ -66,7 +77,7 @@ completion, or the data format setup machine does not start.
 
 ## Build
 
-`PKGBUILD` builds 1.24.2 with 0001, 0003, 0004, 0005, 0006 and 0007 applied in `prepare()`:
+`PKGBUILD` builds 1.24.2 with 0001 and 0003 to 0008 applied in `prepare()`:
 
 ```sh
 makepkg -s

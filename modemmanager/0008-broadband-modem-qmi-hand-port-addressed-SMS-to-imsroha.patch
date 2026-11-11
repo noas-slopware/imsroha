@@ -1,0 +1,609 @@
+From cdc9902fa63ef95ca63d61f01df069138a8a7c74 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 22:21:33 +0900
+Subject: [PATCH] broadband-modem-qmi: hand port-addressed SMS to imsroha
+
+SMS with application port addressing (3GPP TS 23.040 9.2.3.24.4 and
+9.2.3.24.5) are meant for an application, not for the user's inbox: the
+RCS OTP and configuration requests on port 37273, visual voicemail. When
+SMS goes over IMS, imsroha keeps them from ModemManager and emits them
+on its PortPduReceived signal, where imsroha-rcs takes the OTP. Where the
+carrier has no SMS over IP (SKT), the modem receives them over WMS and
+ModemManager, which ignored the port header, exposed them as plain
+messages: the OTP showed up in the messaging app and never reached
+imsroha-rcs.
+
+Parse the 8-bit (IEI 0x04) and 16-bit (IEI 0x05) application port IEs
+in the UDH and keep the destination port in the MMSmsPart (-1 without
+one). When a QMI modem with the imsroha backend receives an SMS-DELIVER
+part for a port other than WAP push (2948, 2949), from storage at load
+time, from an MT message indication or as a transfer-route message,
+hand it to imsroha's new TakePortPdu method instead of the SMS list,
+as "00" (no SMSC address) followed by the TPDU in hex, the form
+PortPduReceived already carries. Once imsroha has taken it, delete the
+part from modem storage, since no SMS object will ever do so. If imsroha
+is not on the bus or refuses the part, it goes to the SMS list as
+before, so nothing is lost.
+
+Each part of a concatenated port-addressed message is handed over on
+its own; the application reassembles them.
+
+WAP push, other SMS, and modems without the imsroha backend are handled
+exactly as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/mm-broadband-modem-qmi.c   | 138 ++++++++++++++++++++++++++++
+ src/mm-ims-backend-imsroha.c   |  60 ++++++++++++
+ src/mm-ims-backend-imsroha.h   |  13 +++
+ src/mm-sms-part-3gpp.c         |  49 ++++++++++
+ src/mm-sms-part-3gpp.h         |   7 ++
+ src/mm-sms-part.c              |   6 ++
+ src/mm-sms-part.h              |   5 +
+ src/tests/test-sms-part-3gpp.c | 162 +++++++++++++++++++++++++++++++++
+ 8 files changed, 440 insertions(+)
+
+diff --git a/src/mm-broadband-modem-qmi.c b/src/mm-broadband-modem-qmi.c
+index a8fc8d3..93e4fe4 100644
+--- a/src/mm-broadband-modem-qmi.c
++++ b/src/mm-broadband-modem-qmi.c
+@@ -8035,6 +8035,140 @@ load_initial_sms_parts_finish (MMIfaceModemMessaging *_self,
+ 
+ static void read_next_sms_part (GTask *task);
+ 
++/*
++ * Port-addressed SMS (TS 23.040 9.2.3.24.4/5) are for applications, not for
++ * the user's inbox: RCS's OTP and configuration requests, visual voicemail.
++ * With the imsroha backend they go to imsroha, which emits them on
++ * PortPduReceived as it does for SMS over IMS, and they never become an SMS
++ * object. WAP push (2948, 2949: MMS notifications) stays a message. Once
++ * imsroha has the part, it is deleted from modem storage, as nothing else
++ * would ever remove it. If imsroha cannot take it, the part goes to the SMS
++ * list as without the backend, so nothing is lost.
++ */
++typedef struct {
++    MMBroadbandModemQmi  *self;
++    MMSmsPart            *part;
++    QmiWmsStorageType     storage;
++    guint32               index;
++    QmiWmsMessageTagType  tag;
++    guint16               port;
++} ImsrohaPortPartContext;
++
++static void
++imsroha_port_part_delete_ready (QmiClientWms        *client,
++                                GAsyncResult        *res,
++                                MMBroadbandModemQmi *self)
++{
++    g_autoptr(QmiMessageWmsDeleteOutput) output = NULL;
++    g_autoptr(GError)                    error = NULL;
++
++    output = qmi_client_wms_delete_finish (client, res, &error);
++    if (output)
++        qmi_message_wms_delete_output_get_result (output, &error);
++    if (error)
++        mm_obj_warn (self, "couldn't delete the SMS part imsroha took from modem storage: %s",
++                     error->message);
++    g_object_unref (self);
++}
++
++static void
++imsroha_take_port_pdu_ready (MMImsBackendImsroha    *backend,
++                             GAsyncResult           *res,
++                             ImsrohaPortPartContext *ctx)
++{
++    g_autoptr(GError) error = NULL;
++
++    if (!mm_ims_backend_imsroha_take_port_pdu_finish (backend, res, &error)) {
++        mm_obj_warn (ctx->self, "imsroha did not take the SMS part for application port %u: %s; "
++                     "keeping it as a message", ctx->port, error->message);
++        mm_iface_modem_messaging_take_part (MM_IFACE_MODEM_MESSAGING (ctx->self),
++                                            ctx->part,
++                                            mm_sms_state_from_qmi_message_tag (ctx->tag),
++                                            mm_sms_storage_from_qmi_storage_type (ctx->storage));
++    } else {
++        mm_obj_info (ctx->self, "SMS part for application port %u handed to imsroha", ctx->port);
++        mm_sms_part_free (ctx->part);
++
++        if (ctx->storage != QMI_WMS_STORAGE_TYPE_NONE && ctx->index != SMS_PART_INVALID_INDEX) {
++            g_autoptr(QmiMessageWmsDeleteInput) input = NULL;
++            QmiClient                          *client;
++            g_autoptr(GError)                   client_error = NULL;
++
++            client = mm_shared_qmi_peek_client (MM_SHARED_QMI (ctx->self),
++                                                QMI_SERVICE_WMS,
++                                                MM_PORT_QMI_FLAG_DEFAULT,
++                                                &client_error);
++            if (!client) {
++                mm_obj_warn (ctx->self, "couldn't delete the SMS part imsroha took from modem storage: %s",
++                             client_error->message);
++            } else {
++                input = qmi_message_wms_delete_input_new ();
++                qmi_message_wms_delete_input_set_memory_storage (input, ctx->storage, NULL);
++                qmi_message_wms_delete_input_set_memory_index (input, ctx->index, NULL);
++                qmi_message_wms_delete_input_set_message_mode (input, QMI_WMS_MESSAGE_MODE_GSM_WCDMA, NULL);
++                qmi_client_wms_delete (QMI_CLIENT_WMS (client),
++                                       input,
++                                       5,
++                                       NULL,
++                                       (GAsyncReadyCallback)imsroha_port_part_delete_ready,
++                                       g_object_ref (ctx->self));
++            }
++        }
++    }
++
++    g_object_unref (ctx->self);
++    g_slice_free (ImsrohaPortPartContext, ctx);
++}
++
++/* TRUE if the part (a 3GPP one) was handed to imsroha and is no longer the caller's. */
++static gboolean
++imsroha_take_port_part (MMBroadbandModemQmi  *self,
++                        MMSmsPart            *part,
++                        QmiWmsStorageType     storage,
++                        guint32               index,
++                        QmiWmsMessageTagType  tag,
++                        gboolean              transfer_route,
++                        GArray               *data)
++{
++    MMImsBackendImsroha    *backend;
++    ImsrohaPortPartContext *ctx;
++    g_autofree gchar       *hexpdu = NULL;
++    g_autoptr(GError)       error = NULL;
++    gint                    port;
++
++    backend = mm_broadband_modem_qmi_peek_ims_backend (self);
++    if (!backend)
++        return FALSE;
++
++    port = mm_sms_part_get_destination_port (part);
++    if (port < 0 || mm_sms_part_get_pdu_type (part) != MM_SMS_PDU_TYPE_DELIVER)
++        return FALSE;
++    if (port == 2948 || port == 2949)
++        return FALSE;
++
++    hexpdu = mm_sms_part_3gpp_get_tpdu_hex ((const guint8 *)data->data, data->len, transfer_route, &error);
++    if (!hexpdu) {
++        mm_obj_dbg (self, "keeping SMS part for application port %d as a message: %s", port, error->message);
++        return FALSE;
++    }
++
++    mm_obj_info (self, "received SMS part for application port %d: for imsroha, not the SMS list", port);
++    ctx = g_slice_new0 (ImsrohaPortPartContext);
++    ctx->self = g_object_ref (self);
++    ctx->part = part;
++    ctx->storage = storage;
++    ctx->index = index;
++    ctx->tag = tag;
++    ctx->port = (guint16)port;
++    mm_ims_backend_imsroha_take_port_pdu (backend,
++                                          ctx->port,
++                                          hexpdu,
++                                          NULL,
++                                          (GAsyncReadyCallback)imsroha_take_port_pdu_ready,
++                                          ctx);
++    return TRUE;
++}
++
+ static void
+ add_new_read_sms_part (MMIfaceModemMessaging *self,
+                        QmiWmsStorageType storage,
+@@ -8075,6 +8209,10 @@ add_new_read_sms_part (MMIfaceModemMessaging *self,
+ 
+     if (part) {
+         mm_obj_dbg (self, "correctly parsed PDU (%d)", index);
++        if (format == QMI_WMS_MESSAGE_FORMAT_GSM_WCDMA_POINT_TO_POINT &&
++            imsroha_take_port_part (MM_BROADBAND_MODEM_QMI (self), part, storage, index, tag,
++                                    transfer_route, data))
++            return;
+         mm_iface_modem_messaging_take_part (self,
+                                             part,
+                                             mm_sms_state_from_qmi_message_tag (tag),
+diff --git a/src/mm-ims-backend-imsroha.c b/src/mm-ims-backend-imsroha.c
+index e6decdd..eb47b53 100644
+--- a/src/mm-ims-backend-imsroha.c
++++ b/src/mm-ims-backend-imsroha.c
+@@ -754,6 +754,66 @@ mm_ims_backend_imsroha_send_sms_finish (MMImsBackendImsroha  *self,
+     return TRUE;
+ }
+ 
++/*****************************************************************************/
++/* Port-addressed SMS the modem received: for applications, through imsroha's
++ * PortPduReceived, not for the SMS list. */
++
++static void
++dbus_take_port_pdu_ready (GDBusConnection *connection,
++                          GAsyncResult    *res,
++                          GTask           *task)
++{
++    GError *error = NULL;
++    g_autoptr(GVariant) reply = NULL;
++
++    reply = g_dbus_connection_call_finish (connection, res, &error);
++    if (!reply)
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++void
++mm_ims_backend_imsroha_take_port_pdu (MMImsBackendImsroha *self,
++                                      guint16              port,
++                                      const gchar         *hexpdu,
++                                      GCancellable        *cancellable,
++                                      GAsyncReadyCallback  callback,
++                                      gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++    if (!self->priv->is_available || !self->priv->connection) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "imsroha is not available");
++        g_object_unref (task);
++        return;
++    }
++
++    g_dbus_connection_call (self->priv->connection,
++                            "codes.noa.IMSroha",
++                            "/codes/noa/IMSroha",
++                            "codes.noa.IMSroha",
++                            "TakePortPdu",
++                            g_variant_new ("(qs)", port, hexpdu),
++                            G_VARIANT_TYPE ("()"),
++                            G_DBUS_CALL_FLAGS_NONE,
++                            10000,
++                            cancellable,
++                            (GAsyncReadyCallback) dbus_take_port_pdu_ready,
++                            task);
++}
++
++gboolean
++mm_ims_backend_imsroha_take_port_pdu_finish (MMImsBackendImsroha  *self,
++                                             GAsyncResult         *res,
++                                             GError              **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
+ /*****************************************************************************/
+ 
+ GList *
+diff --git a/src/mm-ims-backend-imsroha.h b/src/mm-ims-backend-imsroha.h
+index 3c043be..ee2157d 100644
+--- a/src/mm-ims-backend-imsroha.h
++++ b/src/mm-ims-backend-imsroha.h
+@@ -104,4 +104,17 @@ gboolean mm_ims_backend_imsroha_send_sms_finish (MMImsBackendImsroha  *self,
+                                              gchar           **out_ref,
+                                              GError          **error);
+ 
++/* Hands a received SMS-DELIVER with application port addressing to imsroha
++ * ("00" for no SMSC address, then the TPDU, in hex), which emits it on
++ * PortPduReceived. */
++void mm_ims_backend_imsroha_take_port_pdu (MMImsBackendImsroha *self,
++                                           guint16              port,
++                                           const gchar         *hexpdu,
++                                           GCancellable        *cancellable,
++                                           GAsyncReadyCallback  callback,
++                                           gpointer             user_data);
++gboolean mm_ims_backend_imsroha_take_port_pdu_finish (MMImsBackendImsroha  *self,
++                                                      GAsyncResult         *res,
++                                                      GError              **error);
++
+ #endif /* MM_IMS_BACKEND_IMSROHA_H */
+diff --git a/src/mm-sms-part-3gpp.c b/src/mm-sms-part-3gpp.c
+index d91946c..9b1e85d 100644
+--- a/src/mm-sms-part-3gpp.c
++++ b/src/mm-sms-part-3gpp.c
+@@ -368,6 +368,40 @@ mm_sms_part_3gpp_new_from_pdu (guint         index,
+     return mm_sms_part_3gpp_new_from_binary_pdu (index, pdu, pdu_len, log_object, FALSE, error);
+ }
+ 
++gchar *
++mm_sms_part_3gpp_get_tpdu_hex (const guint8  *pdu,
++                               gsize          pdu_len,
++                               gboolean       transfer_route,
++                               GError       **error)
++{
++    GString *hex;
++    gsize    offset = 0;
++    gsize    i;
++
++    /* Stored and read messages start with the SMSC address; transfer-route
++     * ones are the bare TPDU. */
++    if (!transfer_route) {
++        if (pdu_len < 1) {
++            g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                         "PDU too short, cannot read SMSC address length");
++            return NULL;
++        }
++        offset = 1 + pdu[0];
++    }
++    if (offset >= pdu_len) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "PDU too short, no TPDU after the SMSC address: %" G_GSIZE_FORMAT " <= %" G_GSIZE_FORMAT,
++                     pdu_len, offset);
++        return NULL;
++    }
++
++    hex = g_string_sized_new (2 + 2 * (pdu_len - offset));
++    g_string_append (hex, "00");
++    for (i = offset; i < pdu_len; i++)
++        g_string_append_printf (hex, "%02x", pdu[i]);
++    return g_string_free (hex, FALSE);
++}
++
+ MMSmsPart *
+ mm_sms_part_3gpp_new_from_binary_pdu (guint         index,
+                                       const guint8  *pdu,
+@@ -738,6 +772,21 @@ mm_sms_part_3gpp_new_from_binary_pdu (guint         index,
+                     mm_sms_part_set_concat_max (sms_part,pdu[offset + 2]);
+                     mm_sms_part_set_concat_sequence (sms_part, pdu[offset + 3]);
+                     break;
++                case 0x04:
++                    /* Application port addressing, 8-bit (TS 23.040 9.2.3.24.4) */
++                    if (ie_len != 2 || offset + 2 > end)
++                        break;
++                    mm_sms_part_set_destination_port (sms_part, pdu[offset]);
++                    mm_obj_dbg (log_object, "  destination port: %u (8-bit)", (guint)pdu[offset]);
++                    break;
++                case 0x05:
++                    /* Application port addressing, 16-bit (TS 23.040 9.2.3.24.5) */
++                    if (ie_len != 4 || offset + 4 > end)
++                        break;
++                    mm_sms_part_set_destination_port (sms_part, (pdu[offset] << 8) | pdu[offset + 1]);
++                    mm_obj_dbg (log_object, "  destination port: %u (16-bit)",
++                                (guint)((pdu[offset] << 8) | pdu[offset + 1]));
++                    break;
+                 default:
+                     break;
+                 }
+diff --git a/src/mm-sms-part-3gpp.h b/src/mm-sms-part-3gpp.h
+index c74b963..30fa3fd 100644
+--- a/src/mm-sms-part-3gpp.h
++++ b/src/mm-sms-part-3gpp.h
+@@ -32,6 +32,13 @@ MMSmsPart *mm_sms_part_3gpp_new_from_binary_pdu (guint          index,
+                                                  gpointer       log_object,
+                                                  gboolean	transfer_route,
+                                                  GError       **error);
++/* The TPDU of a received PDU as hex, after "00" for "no SMSC address": what
++ * mm_sms_part_3gpp_new_from_pdu() reads, whether or not the modem gave the
++ * SMSC address (it does not for transfer-route messages). */
++gchar     *mm_sms_part_3gpp_get_tpdu_hex        (const guint8  *pdu,
++                                                 gsize          pdu_len,
++                                                 gboolean       transfer_route,
++                                                 GError       **error);
+ guint8    *mm_sms_part_3gpp_get_submit_pdu      (MMSmsPart     *part,
+                                                  guint         *out_pdulen,
+                                                  guint         *out_msgstart,
+diff --git a/src/mm-sms-part.c b/src/mm-sms-part.c
+index ee2cd9f..df703a5 100644
+--- a/src/mm-sms-part.c
++++ b/src/mm-sms-part.c
+@@ -50,6 +50,9 @@ struct _MMSmsPart {
+     guint concat_max;
+     guint concat_sequence;
+ 
++    /* Application port addressing (TS 23.040 9.2.3.24.4/5), -1 if none */
++    gint destination_port;
++
+     /* CDMA specific */
+     MMSmsCdmaTeleserviceId cdma_teleservice_id;
+     MMSmsCdmaServiceCategory cdma_service_category;
+@@ -116,6 +119,8 @@ PART_GET_FUNC (guint, concat_max)
+ PART_SET_FUNC (guint, concat_max)
+ PART_GET_FUNC (guint, concat_sequence)
+ PART_SET_FUNC (guint, concat_sequence)
++PART_GET_FUNC (gint, destination_port)
++PART_SET_FUNC (gint, destination_port)
+ PART_GET_FUNC (const gchar *, text)
+ PART_SET_TAKE_STR_FUNC (text)
+ PART_GET_FUNC (MMSmsEncoding, encoding)
+@@ -188,6 +193,7 @@ mm_sms_part_new (guint index,
+     sms_part->cdma_teleservice_id = MM_SMS_CDMA_TELESERVICE_ID_UNKNOWN;
+     sms_part->cdma_service_category = MM_SMS_CDMA_SERVICE_CATEGORY_UNKNOWN;
+     sms_part->class = -1;
++    sms_part->destination_port = -1;
+ 
+     return sms_part;
+ }
+diff --git a/src/mm-sms-part.h b/src/mm-sms-part.h
+index 2ea44a8..5d5746a 100644
+--- a/src/mm-sms-part.h
++++ b/src/mm-sms-part.h
+@@ -146,6 +146,11 @@ void              mm_sms_part_set_concat_sequence    (MMSmsPart *part,
+ 
+ gboolean          mm_sms_part_should_concat          (MMSmsPart *part);
+ 
++/* Destination application port (TS 23.040 9.2.3.24.4/5), -1 if the part has none */
++gint              mm_sms_part_get_destination_port   (MMSmsPart *part);
++void              mm_sms_part_set_destination_port   (MMSmsPart *part,
++                                                      gint destination_port);
++
+ /* CDMA specific */
+ MMSmsCdmaTeleserviceId   mm_sms_part_get_cdma_teleservice_id   (MMSmsPart *part);
+ void                     mm_sms_part_set_cdma_teleservice_id   (MMSmsPart *part,
+diff --git a/src/tests/test-sms-part-3gpp.c b/src/tests/test-sms-part-3gpp.c
+index f5590bd..b2e3e93 100644
+--- a/src/tests/test-sms-part-3gpp.c
++++ b/src/tests/test-sms-part-3gpp.c
+@@ -477,6 +477,162 @@ test_pdu_wrong_udh (void)
+     common_test_invalid_pdu (pdu, G_N_ELEMENTS (pdu));
+ }
+ 
++/********************* APPLICATION PORT TESTS *********************/
++
++/* SMSC +821019000, then an SMS-DELIVER from 1234 with UDHI, UCS-2, UDH
++ * 06 05 04 9199 0000 (16-bit ports, destination 37273, source 0) and the
++ * text "123456": the RCS OTP of TTAK.KO-06.0410/R9 6.3.1.1.2. */
++static const guint8 port16_pdu[] = {
++    0x06, 0x91, 0x28, 0x01, 0x91, 0x00, 0xf0,
++    0x40, 0x04, 0x81, 0x21, 0x43, 0x00, 0x08,
++    0x52, 0x11, 0x11, 0x31, 0x00, 0x00, 0x00,
++    0x13,
++    0x06, 0x05, 0x04, 0x91, 0x99, 0x00, 0x00,
++    0x00, 0x31, 0x00, 0x32, 0x00, 0x33, 0x00, 0x34, 0x00, 0x35, 0x00, 0x36 };
++
++#define PORT16_TPDU_HEX \
++    "00" "40" "04" "81" "2143" "00" "08" "52111131000000" "13" \
++    "06050491990000" "003100320033003400350036"
++
++static void
++test_pdu_port_16bit (void)
++{
++    MMSmsPart *part;
++    GError    *error = NULL;
++    gchar     *hex;
++
++    part = mm_sms_part_3gpp_new_from_binary_pdu (0, port16_pdu, sizeof (port16_pdu), NULL, FALSE, &error);
++    g_assert_no_error (error);
++    g_assert_nonnull (part);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, 37273);
++    g_assert_cmpstr (mm_sms_part_get_smsc (part), ==, "+821019000");
++    g_assert_cmpstr (mm_sms_part_get_text (part), ==, "123456");
++    g_assert_cmpuint (mm_sms_part_get_pdu_type (part), ==, MM_SMS_PDU_TYPE_DELIVER);
++    g_assert_false (mm_sms_part_should_concat (part));
++    mm_sms_part_free (part);
++
++    /* What goes to imsroha: no SMSC address, then the TPDU */
++    hex = mm_sms_part_3gpp_get_tpdu_hex (port16_pdu, sizeof (port16_pdu), FALSE, &error);
++    g_assert_no_error (error);
++    g_assert_cmpstr (hex, ==, PORT16_TPDU_HEX);
++    g_free (hex);
++
++    /* Transfer-route messages come without the SMSC address */
++    hex = mm_sms_part_3gpp_get_tpdu_hex (port16_pdu + 7, sizeof (port16_pdu) - 7, TRUE, &error);
++    g_assert_no_error (error);
++    g_assert_cmpstr (hex, ==, PORT16_TPDU_HEX);
++    g_free (hex);
++
++    /* And the converted PDU parses the same */
++    part = mm_sms_part_3gpp_new_from_pdu (0, PORT16_TPDU_HEX, NULL, &error);
++    g_assert_no_error (error);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, 37273);
++    g_assert_null (mm_sms_part_get_smsc (part));
++    mm_sms_part_free (part);
++}
++
++static void
++test_pdu_port_8bit (void)
++{
++    /* No SMSC, 8-bit data, UDH 04 04 02 10 00 (8-bit ports, destination 16), 3 data octets */
++    static const guint8 pdu[] = {
++        0x00,
++        0x40, 0x04, 0x81, 0x21, 0x43, 0x00, 0x04,
++        0x52, 0x11, 0x11, 0x31, 0x00, 0x00, 0x00,
++        0x08,
++        0x04, 0x04, 0x02, 0x10, 0x00,
++        0x01, 0x02, 0x03 };
++    static const guint8 expected_data[] = { 0x01, 0x02, 0x03 };
++    MMSmsPart        *part;
++    GError           *error = NULL;
++    const GByteArray *data;
++
++    part = mm_sms_part_3gpp_new_from_binary_pdu (0, pdu, sizeof (pdu), NULL, FALSE, &error);
++    g_assert_no_error (error);
++    g_assert_nonnull (part);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, 16);
++    data = mm_sms_part_get_data (part);
++    g_assert_nonnull (data);
++    g_assert_cmpmem (data->data, data->len, expected_data, sizeof (expected_data));
++    mm_sms_part_free (part);
++}
++
++static void
++test_pdu_port_wap_push (void)
++{
++    /* MMS notification: 8-bit data, UDH 06 05 04 0b84 23f0 */
++    static const gchar *hexpdu =
++        "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "0a"
++        "0605040b8423f0" "010203";
++    MMSmsPart *part;
++    GError    *error = NULL;
++
++    part = mm_sms_part_3gpp_new_from_pdu (0, hexpdu, NULL, &error);
++    g_assert_no_error (error);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, 2948);
++    mm_sms_part_free (part);
++}
++
++static void
++test_pdu_port_with_concat (void)
++{
++    /* UDH 0b 00 03 2a 02 01 05 04 9199 0000: part 1 of 2, ref 0x2a, then port 37273 */
++    static const gchar *hexpdu =
++        "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "0e"
++        "0b0003" "2a0201" "050491990000" "0102";
++    MMSmsPart *part;
++    GError    *error = NULL;
++
++    part = mm_sms_part_3gpp_new_from_pdu (0, hexpdu, NULL, &error);
++    g_assert_no_error (error);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, 37273);
++    g_assert_true (mm_sms_part_should_concat (part));
++    g_assert_cmpuint (mm_sms_part_get_concat_reference (part), ==, 0x2a);
++    g_assert_cmpuint (mm_sms_part_get_concat_max (part), ==, 2);
++    g_assert_cmpuint (mm_sms_part_get_concat_sequence (part), ==, 1);
++    mm_sms_part_free (part);
++}
++
++static void
++test_pdu_port_none (void)
++{
++    /* A plain 7-bit "hello" without a UDH, and a 16-bit port IE of the wrong length */
++    static const gchar *plain = "00" "04" "0591" "2801f0" "00" "00" "52111131000000" "05" "e8329bfd06";
++    static const gchar *bad_ie =
++        "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "08"
++        "050503919900" "0102";
++    MMSmsPart *part;
++    GError    *error = NULL;
++
++    part = mm_sms_part_3gpp_new_from_pdu (0, plain, NULL, &error);
++    g_assert_no_error (error);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, -1);
++    mm_sms_part_free (part);
++
++    part = mm_sms_part_3gpp_new_from_pdu (0, bad_ie, NULL, &error);
++    g_assert_no_error (error);
++    g_assert_cmpint (mm_sms_part_get_destination_port (part), ==, -1);
++    mm_sms_part_free (part);
++}
++
++static void
++test_tpdu_hex_too_short (void)
++{
++    static const guint8 smsc_only[] = { 0x06, 0x91, 0x28, 0x01, 0x91, 0x00, 0xf0 };
++    GError *error = NULL;
++    gchar  *hex;
++
++    hex = mm_sms_part_3gpp_get_tpdu_hex (smsc_only, sizeof (smsc_only), FALSE, &error);
++    g_assert_null (hex);
++    g_assert_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED);
++    g_clear_error (&error);
++
++    hex = mm_sms_part_3gpp_get_tpdu_hex (smsc_only, 0, TRUE, &error);
++    g_assert_null (hex);
++    g_assert_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED);
++    g_clear_error (&error);
++}
++
+ /********************* SMS ADDRESS ENCODER TESTS *********************/
+ 
+ static void
+@@ -777,6 +933,12 @@ int main (int argc, char **argv)
+     g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-wrong-address-size", test_pdu_wrong_address_size);
+     g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-wrong-user-data-elements-size", test_pdu_wrong_user_data_elements_size);
+     g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-wrong-udh", test_pdu_wrong_udh);
++    g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-port-16bit", test_pdu_port_16bit);
++    g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-port-8bit", test_pdu_port_8bit);
++    g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-port-wap-push", test_pdu_port_wap_push);
++    g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-port-with-concat", test_pdu_port_with_concat);
++    g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/pdu-port-none", test_pdu_port_none);
++    g_test_add_func ("/MM/SMS/3GPP/PDU-Parser/tpdu-hex-too-short", test_tpdu_hex_too_short);
+ 
+     g_test_add_func ("/MM/SMS/3GPP/Address-Encoder/smsc-intl", test_address_encode_smsc_intl);
+     g_test_add_func ("/MM/SMS/3GPP/Address-Encoder/smsc-unknown", test_address_encode_smsc_unknown);
+-- 
+2.56.0
+

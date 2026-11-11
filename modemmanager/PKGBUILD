@@ -4,8 +4,9 @@
 #
 # ModemManager 1.24.2 with the IMSroha backend (voice and messaging handed to
 # imsroha over D-Bus), the bearer-count crash fix, IMS DTMF, the kept IPA QMAP
-# path and per-carrier SMS (SKT keeps SMS on the modem), all from this directory (see README.md; 0002 is kept for
-# reference and not applied).
+# path, per-carrier SMS (SKT keeps SMS on the modem) and port-addressed SMS
+# from the modem handed to imsroha, all from this directory (see README.md;
+# 0002 is kept for reference and not applied).
 #
 #   makepkg -s
 #
@@ -14,7 +15,7 @@
 
 pkgname=modemmanager
 pkgver=1.24.2
-pkgrel=15
+pkgrel=16
 pkgdesc="Mobile broadband modem management service with IMSroha (userspace IMS) support"
 url="https://www.freedesktop.org/wiki/Software/ModemManager/"
 arch=(aarch64 x86_64)
@@ -51,6 +52,7 @@ source=(
   "0005-port-qmi-keep-the-IPA-QMAP-data-path-when-another-PDN.patch"
   "0006-broadband-modem-qmi-leave-SMS-with-the-modem-where-the-carrier-has-no-SMS-over-IP.patch"
   "0007-netlink-fix-use-after-free-calling-completion_fn-on-transaction-completion.patch"
+  "0008-broadband-modem-qmi-hand-port-addressed-SMS-to-imsroha.patch"
 )
 b2sums=(
   'SKIP'
@@ -60,6 +62,7 @@ b2sums=(
   'e215477136dac72d1ee429ee7297815ba35ed42d7c9c2ad125a0c4aee5f32e8a1965b69ffb0c70afab0cfaa4a85021c910cb7f4912fdeae1f8226b4068d8db67'
   '5a149bff976d549eb6e4195ab6fa97e05fd0166c8cec1fe52d3fa5e8b269b978e696a5e4b33fd587ffadca69b7ab1a06d9e4b33a056f605bda9939bb3e957c42'
   '6bc514c7b6c7a295a285f82019e5faae5f89d0c700c8da593e3cad505db6658b7a34b8a2436b198861f40d3eed7c95c73920ebb027e0a5d2f2af2e0f3cf8483f'
+  '50f11564a4850492e4ea488f6826bafe2688f9b759b335a3f50ccf1c547dcb05ae6c25c3c3396a6281a3f5145db5097c3b4c58624ac0400e9b1985b035692e4c'
 )
 
 prepare() {
@@ -71,6 +74,8 @@ prepare() {
   git apply "$srcdir/0006-broadband-modem-qmi-leave-SMS-with-the-modem-where-the-carrier-has-no-SMS-over-IP.patch"
   # upstream 9317cbc4 (after 1.24.2): ModemManager crashed on reconnect (2026-11-11)
   git apply "$srcdir/0007-netlink-fix-use-after-free-calling-completion_fn-on-transaction-completion.patch"
+  # RCS OTP where SMS stays with the modem (SKT): port SMS go to imsroha
+  git apply "$srcdir/0008-broadband-modem-qmi-hand-port-addressed-SMS-to-imsroha.patch"
 }
 
 build() {
