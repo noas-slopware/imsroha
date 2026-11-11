@@ -33,5 +33,9 @@ Patches, in order:
   ratio only for SVG/PDF, so photos were decoded at the logical size and looked blurry
   on a scaled display (2.6 on the Galaxy Z Flip3). Not IMS-specific; for upstream.
 
+- `0009-daemon-send-RCS-read-reports-when-the-app-shows-a-me.patch`: read reports.
+  0005 sent `MarkDisplayed` only from the chat list's "mark as read"; opening a chat
+  marks each message read through `markMessageRead`, which now sends it.
+
 0004-0007 are inert without imsroha-rcs on the bus. Build: `cd spacebar && makepkg -sC`
 (`-C`: 0004 creates a file, so a stale `src/` makes `prepare()` fail).
