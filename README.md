@@ -39,7 +39,7 @@ profile by its APN.
 | `imsroha-bearer` | `imsroha-bearer.service` | starts the IMS PDN (the 3GPP profile whose APN is `ims`) on its own QMAP mux id, creates the rmnet link `imsroha0`, puts the address on it, policy-routes traffic from that address over it, and writes `/run/imsroha/pdn` (interface, address, PCO P-CSCFs, DNS) |
 | `imsroha` | `imsroha.service` | reads the SIM (ISIM, else USIM: IMSI, EF_AD, EF_SMSP), picks the carrier profile, registers (IMS AKA, sec-agree with IPsec through `ip xfrm`, reg event), and does SMS (TS 24.341) and VoLTE (INVITE, PRACK, UPDATE, AMR-WB/AMR over RTP, RFC 4733 DTMF). D-Bus `codes.noa.IMSroha` |
 | `imsroha-audio` | `imsroha-audio.service` (user, graphical session) | call PCM between `/run/imsroha/audio.sock` and PipeWire |
-| `imsroha-rcs` | `imsroha-rcs.service` | RCS (GSMA Universal Profile chat, Korea's Chatting+), **off unless `[rcs] enable=true`**: autoconfiguration, its own SIP registration over TLS on the internet PDN, 1-to-1 chat over MSRP with IMDN and isComposing, file transfer over HTTP. D-Bus `codes.noa.IMSroha.Rcs`; `docs/rcs.md` |
+| `imsroha-rcs` | `imsroha-rcs.service` | RCS (GSMA Universal Profile chat, Korea's Chatting+), **off unless `[rcs] enable=true`**: autoconfiguration, its own SIP registration over TLS on the internet PDN, 1-to-1 chat over MSRP with IMDN and isComposing, file transfer over HTTP, chatbots and A2P (RCS 비즈메시지: rich cards, suggestions, botinfo; `[rcs] chatbot=`). D-Bus `codes.noa.IMSroha.Rcs`; `docs/rcs.md` |
 | `imsroha-vss-samsung` | `imsroha-vss-samsung.service` | Samsung modems only: sends the IPC that ungates IMS registration (vendor QMI service 227). Exits at once on any other modem |
 
 The bearer upholds the daemon: every new PDN gets a fresh `imsroha` and a fresh

@@ -161,6 +161,8 @@ glib-networking, GMarkup); the SIM and modem reads reuse `src/aka.c` and `src/im
 | `src/rcs/cpim.c` | CPIM (RFC 3862), IMDN (RFC 5438), isComposing (RFC 3994) |
 | `src/rcs/fthttp.c` | file transfer over HTTP: the FileTransfer configuration, the file-info XML, Digest, upload, download |
 | `src/rcs/ft.c` | file transfer in the daemon: `SendFile`, fetching what comes in, the download directory |
+| `src/rcs/bot.c` | chatbots and A2P: the Chatbot characteristic, feature tags and content types, multipart/mixed, the botinfo request |
+| `src/rcs/botinfo.c` | `GetBotInfo`: the botinfo query and its cache |
 | `src/rcs/rcsd.c` | the daemon: state machine, OTP from SMS, D-Bus service |
 
 ### Opt-in, and what "off" means
@@ -261,7 +263,8 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
   `urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session` (chat) and `+sip.instance`, and
   one `+g.3gpp.iari-ref` with `rcse.dp` (presence) and `rcs.fthttp` (file transfer,
   only when the configuration has `ftAuth=1` and an `ftHTTPCSURI`), comma separated
-  as in R9's examples. Geolocation and chatbot tags are added with those features.
+  as in R9's examples. The chatbot tags join that list when chatbots are on (see
+  "Chatbots and RCS A2P" below). Geolocation is added with that feature.
 - Digest (MD5, qop=auth) with the ACS credentials. AKA is not implemented (R9's sample
   configuration says Digest).
 - Capability discovery as the configuration's `CAPDISCOVERY/defaultDisc` says: 1 is
@@ -291,8 +294,91 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
 - isComposing (RFC 3994) in the session, not CPIM-wrapped (R9 7.2.3), unless the
   carrier says `rcs-iscomposing-cpim=true`.
 - Idle sessions end after `TimerIdle`; the next message opens a new one.
-- Standalone messaging (pager mode) is "X" in R9 table 7-1, so Korea gets none. It is
-  implemented for receiving (a MESSAGE with CPIM is a chat message) and for IMDNs.
+- Standalone messaging is "X" in R9 table 7-1, so nothing is sent in pager mode, but
+  R9 7.7.3.3 requires pager and large message mode for A2P. Both are taken: a pager
+  MESSAGE with CPIM is a message like one in a session, and an INVITE for the
+  `cpm.largemsg` ICSI is answered `a=recvonly` and kept apart from the peer's chat
+  (it neither replaces that chat nor carries what we send). IMDNs outside a session go
+  in a SIP MESSAGE.
+
+### Chatbots and RCS A2P (GSMA RCC.07 3.6, R9 7.7)
+
+Korea's "RCS 비즈메시지": chatbots and one-way A2P senders on the carriers' MaaP
+platform (`botplatform.maapservice.com`). `[rcs] chatbot=` (default true) switches it;
+with false, or when the configuration has no Chatbot characteristic, nothing chatbot is
+advertised or accepted.
+
+- **Advertised**, from the Chatbot characteristic as stock's `FeatureUpdater` does it:
+  - Chatbot session (`rcs.chatbot`): `ChatbotMsgTech` 1 or 2 (stock's default 1).
+  - Chatbot standalone (`rcs.chatbot.sa`): `ChatbotMsgTech` 2 or 3 and SERVICES
+    `standaloneMsgAuth` not 0 (2 is "receiving only" in stock; R9's sample has 2).
+  - Extended bot message (`rcs.xbotmessage`, R9 7.7.4.1): with either of them, when the
+    carrier's `rcs-xbotmessage` is true (the three Korean carriers; stock does it for
+    Korean SIMs only).
+  - In Contact (REGISTER, INVITE, our OPTIONS answers) they join the one `iari-ref`
+    list, followed by `+g.gsma.rcs.botversion="#=1"` (R9 tables 6-4 and 7-7).
+  - In PUBLISH they are tuples, version 1.0, with the service ids
+    `org.3gpp.urn:urn-7:3gpp-application.ims.iari.rcs.chatbot`, `...rcs.chatbot.sa` and
+    `...rcs.chatbot.xbotmessage`. The xbotmessage tag and its service id differ, as in
+    R9 table 7-7 and stock `ServiceTuple`.
+- **Who sent it** (R9 6.4.1, 7.7.3.1). P-Asserted-Identity is read before From.
+  - A tel URI makes it that number's conversation, so A2P merges into the SMS/MMS
+    thread.
+  - A chatbot known only by its SIP URI is a conversation keyed by that URI, without
+    URI parameters (`;tk=`).
+  - The chatbot service id (the signals' `bot_id`) is one of these, in order: that SIP
+    URI; a SIP URI on another domain next to the tel URI (when its user part is not a
+    phone number); or the entity of the capability NOTIFY (R9 7.7.3.2, stock
+    `PresenceUpdate`) or the PAI of an OPTIONS answer (stock `OptionsRequestController`)
+    from an earlier `GetCapabilities`. Otherwise it is "".
+  - A request is a chatbot's when its Contact has `+g.gsma.rcs.isbot` or it asks for
+    the chatbot IARI. With chatbots off, those get 606, as stock's "chat bot sessions /
+    slm not allowed".
+- **What comes in**, in a session, a pager MESSAGE or a large message session, inside
+  CPIM:
+  - `application/vnd.gsma.botmessage.v1.0+json` (rich card, carousel),
+    `application/vnd.gsma.xbotmessage.v*+json` and
+    `application/vnd.gsma.openrichcard.v*+json`: `RichMessageReceived`.
+  - `multipart/mixed` as stock's `ImMultipart` reads it: one message part plus an
+    optional `application/vnd.gsma.botsuggestion.v1.0+json` part (the signal's
+    `suggestions`). A text part with suggestions is a `RichMessageReceived` with
+    `text/plain`. A text part without them, or a bare text/plain, is a
+    `MessageReceived`.
+  - Delivered and displayed IMDNs work as for text.
+  - In pager mode, an xbotmessage or open rich card above version 1.0, or any of them
+    while xbotmessage is not advertised, gets 606 (R9 7.7.4.17.2, stock "doesn't have
+    the xbotmessage").
+- **Sessions with a chatbot** (to a sip: URI, or from a chatbot) also offer
+  `multipart/mixed`, the botmessage and botsuggestion types, and with xbotmessage
+  `application/vnd.gsma.xbotmessage.v1.0+json` and
+  `application/vnd.gsma.openrichcard.v1.0+json` in `accept-wrapped-types`. R9
+  7.7.4.17.3 has the platform read that list before it sends an open rich card. The
+  content-type strings are stock libsec-ims.so's.
+- **To a chatbot**, the INVITE adds the chatbot IARI and botversion to Accept-Contact.
+  That header comes from memory of RCC.07: stock builds it in libsec-ims.so, which has
+  the tags but not the header as a string. `SendSuggestionResponse` sends the app's JSON
+  as `application/vnd.gsma.botsuggestion.response.v1.0+json` in the chat, like any
+  message. Stock (Samsung Messages `ActionsFactory`) sends no reference to the message
+  it answers either, so `in_reply_to_message_id` stays in the log.
+- **The network check** (R9 7.7.3.3.1): a pager MESSAGE with a delivered IMDN for a
+  message id that never existed. It gets its 200 whoever it claims to be from and
+  however its XML looks (R9's own sample is malformed). No IMDN goes back. No status
+  signal is sent for an id we did not send this run that ends in `-bodiless`, as R9's
+  example does. Other unknown ids are still reported: they may be from before a
+  restart, and the app knows them.
+- **botinfo** (`GetBotInfo`, RCC.07 3.6.4.1.1, R9 7.7.3.2). The request is
+  `GET https://<BotinfoFQDNRoot>/bot?id=<service id>&hl=<lang>&ho=<MCC><MNC>&v=3`, or
+  the service id's domain when there is no root.
+  - The query is stock Samsung Messages' (`BotProfileLoaderV2`, `ki.k`): the MNC is
+    padded to three digits; `v=3` is the profile version of its bot API for Korea
+    (`bot_rcc07_version` 11.0); `hl` is the first two letters of `rcs-accept-language`.
+  - User-Agent is `rcs-http-user-agent` (stock sends okhttp's own).
+  - No credentials are sent. Stock's TTA loader has no Digest step.
+  - HTTPS with the certificate checked (stock may trust any CA there).
+  - The JSON goes to the app exactly as received, R9 7.7.2's extra fields included.
+  - It is cached in memory for Cache-Control's max-age and revalidated with
+    If-None-Match when there is an ETag. Errors are
+    `codes.noa.IMSroha.Rcs.Error.NotAvailable`.
 
 ### File transfer over HTTP (GSMA RCC.07, R9 7.4.1.1)
 
@@ -358,12 +444,30 @@ Bus name `codes.noa.IMSroha.Rcs`, object `/codes/noa/IMSroha/Rcs`, interface
 property  s State           "configuring" | "waiting-otp" | "registering" | "registered"
                             | "unregistered" | "disabled-by-network"
 method    SendMessage(s number, s text) -> (s message_id)
+                            number may be a chatbot's sip: URI too
 method    SetComposing(s number, b active)
 method    MarkDisplayed(s number, s message_id)
 method    SendFile(s number, s path) -> (s message_id)
                             path absolute, opened as the caller; status signals as for text
-method    GetCapabilities(s number) -> (a{sv} caps)   "chat": b, "ft-http": b, "known": b
+method    GetCapabilities(s number) -> (a{sv} caps)   "chat": b, "ft-http": b, "known": b,
+                            "chatbot": b (the peer has the bot role, isbot; not merely
+                            the chatbot tuple every phone has), "bot-id": s (its service
+                            id, when known); number may be a sip: URI
                             (anonymous fetch or OPTIONS, as the configuration says)
+method    SendSuggestionResponse(s number, s in_reply_to_message_id, s response_json)
+                            -> (s message_id)   the JSON as
+                            application/vnd.gsma.botsuggestion.response.v1.0+json in that
+                            conversation; status signals as for text
+method    GetBotInfo(s bot_id) -> (s json)   the botinfo JSON as the server sent it, cached
+signal    RichMessageReceived(s number, s message_id, s content_type, s body,
+                       s suggestions, s bot_id, x timestamp_ms)
+                            content_type: application/vnd.gsma.botmessage.v1.0+json,
+                            application/vnd.gsma.xbotmessage.v1.0+json,
+                            application/vnd.gsma.openrichcard.v1.0+json, or text/plain
+                            (bot text with suggestions); body and suggestions (the
+                            botsuggestion JSON, "" when none) exactly as received; number
+                            +E.164 for a tel URI, else the chatbot's sip: URI; bot_id ""
+                            when unknown
 signal    MessageReceived(s number, s message_id, s text, x timestamp_ms)
 signal    MessageStatusChanged(s message_id, s status)   "sent" | "delivered" | "displayed" | "failed"
 signal    ComposingChanged(s number, b active)
@@ -372,7 +476,12 @@ signal    FileReceived(s number, s message_id, s path, s content_type, t size,
 signal    FileReceiveFailed(s number, s message_id, s reason)
                             "expired" | "too-large" | "unauthorized" | "gone" | "invalid" | "failed"
 signal    StateChanged(s state)
+error     codes.noa.IMSroha.Rcs.Error.NotReady (not registered), .Failed,
+          .NotAvailable (chatbots off or not provisioned, no botinfo)
 ```
+
+Strings from the network that are not UTF-8 reach the signals with U+FFFD in place
+of the bad bytes.
 
 `SendMessage` returns when the message is handed to the session; "sent" follows the
 MSRP 200, "failed" an error or a session that could not be set up, so the app can fall
@@ -386,7 +495,7 @@ package) comes later on the same interface.
 `rcs-acs-url`, `rcs-otp-port`, `rcs-otp-type`, `rcs-otp-regex`, `rcs-profile`,
 `rcs-provisioning-version`, `rcs-version`, `rcs-app`, `rcs-user-agent`,
 `rcs-http-user-agent`, `rcs-sip-port`, `rcs-iscomposing-cpim`, `rcs-standalone`,
-`rcs-ft-auth-hosts`, `rcs-ft-auth-http`. The
+`rcs-ft-auth-hosts`, `rcs-ft-auth-http`, `rcs-xbotmessage`. The
 three Korean carriers get stock's values (globalsettings.json `SKT_KR`, `KT_KR`,
 `LGU+_KR`; imsprofile.json `SKT RCS`, `KT RCS`, `LGU RCS`).
 
@@ -395,7 +504,8 @@ three Korean carriers get stock's values (globalsettings.json `SKT_KR`, `KT_KR`,
 Generic (GSMA UP, RCC.07/RCC.14, OMA CPM): the whole flow above, the XML, SIP/TLS,
 MSRP, CPIM, IMDN, isComposing. Korean, all as data or behind a carrier key: the ACS URL,
 the OTP port and its UCS-2 text, `-rcscfg` requests, the TTA User-Agent, isComposing
-without CPIM, no standalone messaging, and the chapter 8 additions (reply, reaction,
+without CPIM, no standalone messaging sent (A2P's is received), R9 7.7.4's extended bot
+message (`rcs-xbotmessage`), and the chapter 8 additions (reply, reaction,
 cancel; not implemented yet: CPIM headers in the `Extended-RCS <http://www.tta.or.kr>`
 namespace, ignored when received as RFC 3862 says).
 
@@ -408,7 +518,8 @@ Samsung phone over MSRPoTLS, with delivered and displayed reports. SKT and KT ar
 untried.
 
 On loopback (`meson test`: `rcs-acs-request`, `rcs-acs-flow`, `rcs-smsport`,
-`rcs-daemon`, `rcs-cert`, each in a network namespace with nothing but `lo`; also
+`rcs-daemon`, `rcs-cert`, `rcs-bot`, `rcs-rbm`, each in a network namespace with
+nothing but `lo`; also
 clean under ASan/UBSan): every ACS outcome, the first activation with the OTP SMS,
 the ACS floor with an unreachable P-CSCF and with two 403s to REGISTER, chat both ways
 with IMDNs and isComposing, presence (PUBLISH, anonymous fetch), the -4 request, the
@@ -417,7 +528,24 @@ MSRP client certificate, and file transfer against a fake content server
 byte, the large-file server, the thumbnail over chunked coding, a file name that tries
 to leave the directory, an expired and an oversize file-info never fetched, no
 credentials for another host (`rcs-ft` covers the parsing, the limits and Digest
-against RFC 2617 and RFC 7616's examples). File transfer has not been tried on LG
+against RFC 2617 and RFC 7616's examples). Chatbots (`rcs-rbm` against a fake
+chatbot platform, `tests/rcs/fake-pcscf.py --rbm`, and `tests/rcs/fake-botinfo.py`):
+- The tags in REGISTER, our OPTIONS answer and PUBLISH.
+- A chat to `sip:bot@...` with its Accept-Contact and SDP, carrying R9 table 7-8's
+  rich card (without header and footer), the same card with them as an xbotmessage,
+  and a carousel with suggestions, then our suggestion response.
+- A chat from a chatbot: text with suggestions, then plain text.
+- From a tel URI: R9 table 7-8 b's open rich card in pager mode and a rich card in
+  large message mode, both in the number's thread, with their IMDNs to the tel URI.
+- The network check; an xbotmessage v1.3 refused.
+- "chatbot" and "bot-id" for bots, an A2P number and a phone.
+- botinfo fetched, cached, revalidated and unknown.
+- With `chatbot=false`, nothing advertised, chatbot traffic refused and a person's
+  message still taken.
+
+Every signal's arguments are checked exactly. `rcs-bot` covers the Chatbot
+characteristic, multipart/mixed, content-type versions, URIs and the botinfo request.
+Chatbots have not been tried on LG U+. File transfer has not been tried on LG
 U+. A messaging app's side: Spacebar patches 0004-0007 in `spacebar/`.
 
 Not done yet, or different from R9's own examples:
@@ -443,10 +571,10 @@ Not done yet, or different from R9's own examples:
   puts them out on `PortPduReceived` like the ones over IMS. The text OTP
   (`rcs-otp-type=text`) of such a carrier still goes to the messaging app, not to
   imsroha-rcs.
-- Group chat (conference factory, conference event package), revoke, chatbots,
+- Group chat (conference factory, conference event package), revoke,
   presence, the chapter 8 Korean additions.
 - File transfer: no thumbnail is made or sent (stock sends one), no pause and resume
-  (R9 7.4.3), no group file transfer, nothing for chatbots (`cbftHTTPCSURI`), and no
+  (R9 7.4.3), no group file transfer, no `cbftHTTPCSURI` for files to chatbots, and no
   MMS fallback inside imsroha-rcs (the app gets "failed"). `ftAutAccept=0` is not
   honoured: every file that fits is fetched. `ftWarnSize` is read but nothing warns.
   The data URL of a peer's file-info is fetched wherever it points (no credentials
@@ -455,3 +583,14 @@ Not done yet, or different from R9's own examples:
   has only root.
 - The ACS `rcsDisabledState` (UP 2.x) is not read; `-rcscfg` requests only arrive
   through SMS over IMS, like the OTP.
+- Chatbots, not done:
+  - Nothing is sent in pager mode, so a chatbot that only takes standalone messages
+    (`ChatbotMsgTech` 3) cannot be written to.
+  - No chatbot tokens or anonymization (`tk=`, `PrivacyDisable`, stock's
+    `RequestChatbotAnonymize`), no spam report, no `botsharedclientdata`, no search in
+    `ChatbotDirectory`, and no Deep Link handling (R9 7.7.5; that is the app's).
+  - botinfo is cached in memory only, so a restart asks again.
+  - An xbotmessage or open rich card above v1.0 that comes in a session is passed to
+    the app; only pager mode can refuse it.
+  - The Accept-Contact of an INVITE to a chatbot is from memory of RCC.07, not stock.
+  - The tests are loopback only.
