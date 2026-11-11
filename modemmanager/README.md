@@ -37,6 +37,11 @@ Patches, in order:
 - `0006-broadband-modem-qmi-leave-SMS-with-the-modem-where-the-carrier-has-no-SMS-over-IP.patch`
   keeps Messaging on the modem's own WMS path when imsroha's carrier profile for the
   SIM says `sms-over-ip=false` (SKT), and hands only Voice to imsroha there.
+- `0007-netlink-fix-use-after-free-calling-completion_fn-on-transaction-completion.patch`
+  is upstream 9317cbc4 (Dan Williams, 2026-10-04), after 1.24.2: `transaction_complete()`
+  freed the transaction through the hash table before calling its `completion_fn`. On
+  the Flip3 a NetworkManager restart made ModemManager reconnect and crash there (a jump
+  to 0x30), and LTE stayed down for 30 s while it restarted and probed again.
 
 ## What 0002 tried, and why it is not applied
 
@@ -61,7 +66,7 @@ completion, or the data format setup machine does not start.
 
 ## Build
 
-`PKGBUILD` builds 1.24.2 with 0001, 0003, 0004, 0005 and 0006 applied in `prepare()`:
+`PKGBUILD` builds 1.24.2 with 0001, 0003, 0004, 0005, 0006 and 0007 applied in `prepare()`:
 
 ```sh
 makepkg -s
