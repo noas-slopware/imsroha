@@ -2151,6 +2151,28 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		return 0;
 	buf[n] = '\0';
 
+	if (strncmp(buf, "SIP/2.0 ", 8) != 0) {
+		/*
+		 * Where a request came from and on which socket: our responses go
+		 * from the protected server port to the P-CSCF's protected client
+		 * port (TS 33.203 7.1), so a request from anywhere else would never
+		 * see them, and the network retransmits it.
+		 */
+		char src[INET6_ADDRSTRLEN] = "?";
+		inet_ntop(AF_INET6, &from_addr.sin6_addr, src, sizeof(src));
+		const char *sp = strchr(buf, ' ');
+		int mlen = sp && sp - buf < 16 ? (int)(sp - buf) : 7;
+		uint16_t sport = ntohs(from_addr.sin6_port);
+		const char *sock = fd == ctx->fd_s ? "protected server" :
+				   fd == ctx->fd_c ? "protected client" : "unprotected";
+		int expected = ctx->sec_state == IMSD_SEC_PROTECTED && fd == ctx->fd_s &&
+			       sport == ctx->sec.port_pc &&
+			       !memcmp(&from_addr.sin6_addr, &ctx->pcscf_addr.sin6_addr, 16);
+		fprintf(stderr, "imsroha: %.*s from [%s]:%u on the %s port%s\n", mlen, buf, src, sport,
+			sock, ctx->sec_state != IMSD_SEC_PROTECTED || expected ? "" :
+			", not where our responses go");
+	}
+
 	if (strncmp(buf, "SIP/2.0 ", 8) == 0) {
 		int status_code = atoi(buf + 8);
 		const char *eol = strstr(buf, "\r\n");
