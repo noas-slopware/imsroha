@@ -548,8 +548,12 @@ static void on_invite_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 	if (m && m->code < 200)
 		return;
 	if (!m || m->code >= 300) {
-		fprintf(stderr, "imsroha-rcs: chat INVITE to %s: %s\n", c->number,
-			m ? m->reason : "no answer");
+		/* Reason and Warning say why (a 403 from a chatbot platform does). */
+		const char *why = m ? sipmsg_header(m, "Reason") : NULL;
+		const char *warn = m ? sipmsg_header(m, "Warning") : NULL;
+		fprintf(stderr, "imsroha-rcs: chat INVITE to %s: %d %s%s%s%s%s\n", c->number,
+			m ? m->code : 0, m ? m->reason : "no answer",
+			why ? "; Reason: " : "", why ? why : "", warn ? "; Warning: " : "", warn ? warn : "");
 		close_chat(c, 0);
 		return;
 	}
