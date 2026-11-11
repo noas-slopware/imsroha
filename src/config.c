@@ -133,6 +133,7 @@ static void device_defaults(struct imsroha_device *dev)
 	snprintf(dev->apn, sizeof(dev->apn), "ims");
 	dev->route_table = 1042;
 	dev->route_priority = 1042;
+	dev->mtu_fallback = 1428;
 	snprintf(dev->model, sizeof(dev->model), "imsroha");
 	snprintf(dev->operator_, sizeof(dev->operator_), "OMD");
 	snprintf(dev->build, sizeof(dev->build), "IMSroha-%s", IMSROHA_VERSION);
@@ -153,6 +154,12 @@ static void device_from(GKeyFile *kf, struct imsroha_device *dev)
 	get_str(kf, g, "apn", dev->apn, sizeof(dev->apn));
 	get_int(kf, g, "route-table", &dev->route_table);
 	get_int(kf, g, "route-priority", &dev->route_priority);
+	get_int(kf, g, "mtu-fallback", &dev->mtu_fallback);
+	if (dev->mtu_fallback < 1280 || dev->mtu_fallback > 1500) {
+		fprintf(stderr, "imsroha: [device] mtu-fallback=%d is outside 1280..1500, using 1428\n",
+			dev->mtu_fallback);
+		dev->mtu_fallback = 1428;
+	}
 	get_str(kf, g, "model", dev->model, sizeof(dev->model));
 	get_str(kf, g, "operator", dev->operator_, sizeof(dev->operator_));
 	get_str(kf, g, "build", dev->build, sizeof(dev->build));

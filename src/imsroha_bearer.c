@@ -44,14 +44,6 @@
 #include "qmidev.h"
 #include "rmnet_links.h"
 
-/*
- * Used only when the modem reports no MTU for the PDN. 1428 is what the stock
- * LG U+ IMS profile (CSC customer.xml) uses; a fixed 1400 made every INVITE
- * to an 11-digit number IPv6-fragmented, and LG U+ answers those with
- * 404/503 most of the time.
- */
-#define IMS_MTU_FALLBACK 1428
-
 /* WDS Get Current Settings, raw: libqmi has no getter for the IPv6 P-CSCF list. */
 #define WDS_GET_CURRENT_SETTINGS 0x002D
 #define TLV_RESULT		0x02
@@ -467,8 +459,8 @@ static void on_settings_done(QmiDevice *d, GAsyncResult *res, gpointer user_data
 	if (!tlv_bytes(m, TLV_MTU, buf, sizeof(buf), &len) && len == 4)
 		mtu = buf[0] | buf[1] << 8 | buf[2] << 16 | (guint32)buf[3] << 24;
 	if (mtu < 1280 || mtu > 1500) {
-		printf("imsroha-bearer: no usable MTU from the modem (%u), using %u\n", mtu, IMS_MTU_FALLBACK);
-		mtu = IMS_MTU_FALLBACK;
+		printf("imsroha-bearer: no usable MTU from the modem (%u), using %d\n", mtu, dev.mtu_fallback);
+		mtu = (guint32)dev.mtu_fallback;
 	}
 
 	memset(&pdn, 0, sizeof(pdn));

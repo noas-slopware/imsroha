@@ -93,7 +93,7 @@ static void defaults(struct rcs_config *cfg)
 	snprintf(cfg->provisioning_version, sizeof(cfg->provisioning_version), "5.0");
 	snprintf(cfg->app, sizeof(cfg->app), "ap2001,ap2002,urn:oma:mo:ext-3gpp-ims:1.0");
 	snprintf(cfg->user_agent, sizeof(cfg->user_agent),
-		 "IM-client/OMA1.0 [PRODUCT_MODEL]/[BUILD_VERSION] imsroha-RCS/0.2");
+		 "IM-client/OMA1.0 [PRODUCT_MODEL]/[BUILD_VERSION] %s", cfg->client_version);
 	cfg->sip_port = 5061;
 	cfg->iscomposing_cpim = 1;
 	cfg->standalone = 1;

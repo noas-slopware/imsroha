@@ -37,6 +37,7 @@ struct imsroha_device {
 	char apn[64];
 	int route_table;            /* policy routing table for traffic from the IMS address */
 	int route_priority;         /* priority of the "from <IMS address>" rule */
+	int mtu_fallback;           /* the IMS link's MTU when the modem reports none */
 
 	/* User-Agent placeholders that describe this device. */
 	char model[64];             /* [PRODUCT_MODEL] */

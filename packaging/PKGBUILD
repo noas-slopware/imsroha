@@ -22,10 +22,6 @@ makedepends=('meson' 'gcc' 'pkgconf')
 checkdepends=('python' 'openssl' 'util-linux' 'dbus')
 optdepends=('modemmanager: with the IMSroha backend from modemmanager/, for dialers and SMS apps'
             'pipewire-alsa: call audio in the user session')
-# The daemon was b2q-imsd in linux-zflip3; this package takes its place.
-provides=('b2q-imsd')
-conflicts=('b2q-imsd')
-replaces=('b2q-imsd')
 backup=('etc/imsroha/imsroha.conf')
 install=imsroha.install
 source=()

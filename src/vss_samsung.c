@@ -224,7 +224,7 @@ static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
     }
     /*
      * The modem registers its services one by one while it boots (and it
-     * boots twice on the Flip3), so 227 may come after the node: wait for
+     * may boot twice), so 227 may come after the node: wait for
      * it rather than look once. A modem that has not shown it after 30 s
      * is not a Samsung one.
      */
