@@ -53,6 +53,28 @@ int main(void)
 			  "060504157b0000" "010203";
 	expect("8-bit port SMS is for an application (5499)", imsd_sms_app_port(vvm) == 5499);
 
+	/* 8-bit port addressing (IEI 0x04): UDH 04 04 02 10 00, destination 16. */
+	const char *port8 = "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "08"
+			    "0404021000" "010203";
+	expect("8-bit port IE is for an application (16)", imsd_sms_app_port(port8) == 16);
+
+	/*
+	 * TakePortPdu: what ModemManager hands over from the modem (patch 0008).
+	 * The modem stores the OTP with its SMSC address (+821019000) in front;
+	 * ModemManager replaces that with "00", which gives exactly otp.
+	 */
+	const char *stored = "06912801910" "0f0" "40" "04" "81" "2143" "00" "08" "52111131000000" "13"
+			     "06050491990000" "003100320033003400350036";
+	expect("stored with SMSC parses", sms_parse_deliver_hex(stored, &d) == 0 && d.dest_port == 37273);
+	expect("TakePortPdu: OTP for 37273", imsd_sms_port_pdu_check(37273, otp) == 0);
+	expect("TakePortPdu: 16-bit port 5499", imsd_sms_port_pdu_check(5499, vvm) == 0);
+	expect("TakePortPdu: 8-bit port 16", imsd_sms_port_pdu_check(16, port8) == 0);
+	expect("TakePortPdu: another port refused", imsd_sms_port_pdu_check(5499, otp) < 0);
+	expect("TakePortPdu: plain SMS refused", imsd_sms_port_pdu_check(0, plain) < 0);
+	expect("TakePortPdu: WAP push refused", imsd_sms_port_pdu_check(2948, wap) < 0);
+	expect("TakePortPdu: not a PDU refused", imsd_sms_port_pdu_check(37273, "zz") < 0);
+	expect("TakePortPdu: empty refused", imsd_sms_port_pdu_check(37273, "") < 0);
+
 	/* rcs-otp-type=text: the plain SMS matching rcs-otp-regex. */
 	expect("text OTP regex matches", imsd_sms_text_matches(plain, "^HELLO"));
 	expect("other text does not match", !imsd_sms_text_matches(plain, "verification code"));

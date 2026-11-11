@@ -17,7 +17,7 @@ RCS chat and file transfer reach the user through Spacebar with the patches in
 |---|---|---|
 | LG U+ | 450 06 | **tested, working** on the Galaxy Z Flip3 (2026-11-11): registers with TTAK.KO-06.0357/R6 sec-agree (IPsec ESP, `hmac-sha-1-96`/`aes-cbc`), SMS and VoLTE calls both ways, DTMF. LG U+ refuses the reg event (489 "REG EVENT OFF") and puts no P-CSCF in the PCO; the profile's is used. **RCS (Chatting+) working** too: autoconfiguration with the OTP SMS, registration, 1-to-1 chat both ways with a Samsung phone, delivered and displayed reports |
 | KT | 450 08 | profile from the stock Samsung firmware; has never registered; RCS untried |
-| SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem, so RCS cannot get its OTP SMS yet (`docs/rcs.md`) |
+| SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem, and ModemManager hands the port-addressed ones (RCS's OTP) to imsroha (`TakePortPdu`, ModemManager patch 0008), untested |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
 
 All three Korean carriers get what TTAK.KO-06.0357/R6 (the Korean VoLTE terminal
@@ -50,7 +50,12 @@ voicemail) is for an application, as on Android: it goes out on `PortPduReceived
 only and never reaches ModemManager or a messaging app. So does the RCS OTP of a
 carrier that sends it as plain text (`rcs-otp-type=text`), when `[rcs] enable=true`
 (port 0). WAP push (MMS notifications)
-stays with ModemManager. Both SMS signals are delivered to root only.
+stays with ModemManager. Both SMS signals are delivered to root only. Where SMS stays
+with the modem (`sms-over-ip=false`), ModemManager (patch 0008) does not expose a
+port-addressed SMS the modem received either: it calls `TakePortPdu(q port, s pdu)`,
+root only like every method, with the same PDU form (`00`, then the TPDU, in hex), and
+imsroha puts it out on `PortPduReceived`. Each part of a concatenated one comes on its
+own.
 
 ## Configuration
 

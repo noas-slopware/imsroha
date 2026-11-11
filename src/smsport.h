@@ -27,5 +27,12 @@ int sms_parse_deliver_hex(const char *hex, struct sms_deliver *out);
  */
 int imsd_sms_app_port(const char *hex);
 
+/*
+ * Whether hex (same form) is an SMS-DELIVER addressed to application port
+ * port, as TakePortPdu takes it from ModemManager: 0 if so, -EINVAL if it is
+ * not, is for another port, or is WAP push (which stays with ModemManager).
+ */
+int imsd_sms_port_pdu_check(int port, const char *hex);
+
 /* Whether a single-part SMS-DELIVER's text matches regex (caseless). */
 int imsd_sms_text_matches(const char *hex, const char *regex);

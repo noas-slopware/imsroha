@@ -21,6 +21,7 @@
 #include "dbus.h"
 #include "inbox.h"
 #include "sip.h"
+#include "smsport.h"
 
 static struct imsd_sip_ctx sip_ctx;
 
@@ -175,6 +176,39 @@ static int method_ack_pdu(sd_bus_message *m, void *userdata,
 	return sd_bus_reply_method_return(m, "");
 }
 
+/*
+ * A port-addressed MT-SMS the modem received itself, from ModemManager: on
+ * carriers without SMS over IP (sms-over-ip=false) SMS never comes over IMS,
+ * so ModemManager hands those over here instead of exposing them. They go out
+ * on PortPduReceived exactly like the ones that come over IMS.
+ */
+static int method_take_port_pdu(sd_bus_message *m, void *userdata,
+				sd_bus_error *ret_error)
+{
+	uint16_t port = 0;
+	const char *hex = NULL;
+	(void)userdata;
+
+	int r = sd_bus_message_read(m, "qs", &port, &hex);
+	if (r < 0)
+		return r;
+	if (imsd_sms_port_pdu_check(port, hex) < 0)
+		return sd_bus_error_setf(ret_error, SD_BUS_ERROR_INVALID_ARGS,
+					 "not an SMS-DELIVER for application port %u", port);
+
+	if (imsd_inbox_seen(hex)) {
+		/* ModemManager could not delete it from modem storage and read it again. */
+		fprintf(stderr, "imsroha: duplicate MT-SMS for application port %u from the modem, "
+			"already handed out\n", port);
+		return sd_bus_reply_method_return(m, "");
+	}
+	imsd_inbox_remember(hex);
+	fprintf(stderr, "imsroha: MT-SMS for application port %u from the modem (%zu bytes), "
+		"not for ModemManager\n", port, strlen(hex) / 2 - 1);
+	imsd_emit_port_pdu_received(sd_bus_message_get_bus(m), port, hex);
+	return sd_bus_reply_method_return(m, "");
+}
+
 static const sd_bus_vtable imsd_vtable[] = {
 	SD_BUS_VTABLE_START(0),
 	SD_BUS_METHOD("GetState", "", "i", method_get_state, 0),
@@ -187,6 +221,8 @@ static const sd_bus_vtable imsd_vtable[] = {
 	 * (ModemManager) may call them. */
 	SD_BUS_METHOD("GetPendingPdus", "", "a(ss)", method_get_pending_pdus, 0),
 	SD_BUS_METHOD("AckPdu", "s", "", method_ack_pdu, 0),
+	/* Puts a message out on PortPduReceived, which imsroha-rcs trusts. */
+	SD_BUS_METHOD("TakePortPdu", "qs", "", method_take_port_pdu, 0),
 	SD_BUS_SIGNAL("RegistrationStateChanged", "i", 0),
 	SD_BUS_SIGNAL("PduReceived", "ss", 0),
 	SD_BUS_SIGNAL("PortPduReceived", "qs", 0),

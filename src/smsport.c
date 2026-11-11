@@ -177,6 +177,13 @@ int imsd_sms_app_port(const char *hex)
 	return d.dest_port;
 }
 
+int imsd_sms_port_pdu_check(int port, const char *hex)
+{
+	if (!hex || port < 0 || imsd_sms_app_port(hex) != port)
+		return -EINVAL;
+	return 0;
+}
+
 int imsd_sms_text_matches(const char *hex, const char *regex)
 {
 	struct sms_deliver d;

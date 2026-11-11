@@ -438,9 +438,11 @@ Not done yet, or different from R9's own examples:
   one, against the configured name otherwise.
 
 - AKA for the RCS registration (only Digest, what R9's sample configuration has).
-- OTP for carriers whose SMS stays with the modem (SKT): imsroha-rcs takes the OTP
-  from imsroha's `PortPduReceived`, which only carries SMS over IMS. ModemManager drops
-  the application port, so that needs ModemManager to keep it, or a QMI WMS path.
+- OTP for carriers whose SMS stays with the modem (SKT) is untested: ModemManager
+  patch 0008 hands port-addressed SMS from the modem to imsroha's `TakePortPdu`, which
+  puts them out on `PortPduReceived` like the ones over IMS. The text OTP
+  (`rcs-otp-type=text`) of such a carrier still goes to the messaging app, not to
+  imsroha-rcs.
 - Group chat (conference factory, conference event package), revoke, chatbots,
   presence, the chapter 8 Korean additions.
 - File transfer: no thumbnail is made or sent (stock sends one), no pause and resume
