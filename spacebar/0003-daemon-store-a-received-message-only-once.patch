@@ -1,0 +1,122 @@
+From 1ef1ecc3f5d0841c0525f305ad501c5b6b5a0ad7 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Mon, 9 Nov 2026 00:55:46 +0900
+Subject: [PATCH] daemon: store a received message only once
+
+When a modem appears, modemConnected is emitted more than once:
+initMessaging() runs from init() and again from the interfaceAdded
+handler. Each emission runs checkMessages(), which hands every message
+ModemManager still lists to handleIncomingMessage(). Deleting a message
+from the modem is asynchronous, so the second pass still sees it and the
+same SMS is saved twice, with two notifications. This happens whenever
+messages are waiting when the daemon (or ModemManager) starts, e.g.
+SIM-stored ones.
+
+Remember the D-Bus paths of messages being handled and skip repeats.
+Forget a path when ModemManager reports the object deleted, and all of
+them when the modem is removed, since a restarted ModemManager numbers
+its SMS objects from 0 again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTPdTNcEmdyRhJMbUHU
+---
+ daemon/channellogger.cpp                 | 20 ++++++++++++++++++++
+ daemon/channellogger.h                   |  4 ++++
+ lib/telephonySupport/modemcontroller.cpp |  1 +
+ lib/telephonySupport/modemcontroller.h   |  1 +
+ 4 files changed, 26 insertions(+)
+
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index 76a7a8a..b48b6c4 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ 
+ #include "channellogger.h"
++
++#include <ModemManagerQt/Manager>
+ #include "modemcontroller.h"
+ #include "settingsmanager.h"
+ 
+@@ -54,6 +56,15 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+ 
+     connect(&ModemController::instance(), &ModemController::modemConnected, this, &ChannelLogger::checkMessages);
+ 
++    // Forget a message once ModemManager has deleted it, and everything when the
++    // modem goes away: a restarted ModemManager numbers its SMS objects from 0.
++    connect(&ModemController::instance(), &ModemController::messageDeleted, this, [this](const QString &uni) {
++        m_handledMessages.remove(uni);
++    });
++    connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, [this]() {
++        m_handledMessages.clear();
++    });
++
+     connect(&ModemController::instance(), &ModemController::modemDataConnectedChanged, this, [this](const bool isConnected) {
+         m_dataConnected = isConnected;
+ 
+@@ -173,6 +184,15 @@ QCoro::Task<void> ChannelLogger::handleIncomingMessage(ModemManager::Sms::Ptr ms
+         co_return;
+     }
+ 
++    // modemConnected fires more than once when a modem appears (initMessaging()
++    // runs from init() and again from interfaceAdded), and each run of
++    // checkMessages() walks every message still listed. Deleting one from the
++    // modem is asynchronous, so the same message must not be stored twice.
++    if (m_handledMessages.contains(msg->uni())) {
++        co_return;
++    }
++    m_handledMessages.insert(msg->uni());
++
+     const QString number = msg->number();
+     const QString text = msg->text();
+     const QDateTime datetime = msg->timestamp();
+diff --git a/daemon/channellogger.h b/daemon/channellogger.h
+index d9b0203..55012e6 100644
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <QObject>
++#include <QSet>
+ 
+ #include <optional>
+ 
+@@ -107,6 +108,9 @@ private:
+     PhoneNumberList m_disabledNotificationNumber;
+ 
+     PhoneNumber m_ownNumber;
++    // SMS objects being handled, by D-Bus path: checkMessages() can run more
++    // than once while ModemManager still lists a message we already took.
++    QSet<QString> m_handledMessages;
+ 
+     bool m_dataConnected;
+ 
+diff --git a/lib/telephonySupport/modemcontroller.cpp b/lib/telephonySupport/modemcontroller.cpp
+index 5716956..07f8573 100644
+--- a/lib/telephonySupport/modemcontroller.cpp
++++ b/lib/telephonySupport/modemcontroller.cpp
+@@ -134,6 +134,7 @@ void ModemController::initMessaging()
+     m_msgManager = m_modem->messagingInterface();
+ 
+     connect(m_msgManager.get(), &ModemManager::ModemMessaging::messageAdded, this, &ModemController::slotMessageAdded, Qt::UniqueConnection);
++    connect(m_msgManager.get(), &ModemManager::ModemMessaging::messageDeleted, this, &ModemController::messageDeleted, Qt::UniqueConnection);
+ 
+     Q_EMIT modemConnected();
+ }
+diff --git a/lib/telephonySupport/modemcontroller.h b/lib/telephonySupport/modemcontroller.h
+index 7317659..0565e70 100644
+--- a/lib/telephonySupport/modemcontroller.h
++++ b/lib/telephonySupport/modemcontroller.h
+@@ -36,6 +36,7 @@ public:
+ 
+ Q_SIGNALS:
+     void messageAdded(ModemManager::Sms::Ptr message);
++    void messageDeleted(const QString &uni);
+     void modemConnected();
+     void modemDataConnectedChanged(const bool isConnected);
+     void countryCodeChanged(const QString &code);
+-- 
+2.56.0
+

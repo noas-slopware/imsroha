@@ -1,0 +1,77 @@
+# Maintainer: Noa Himesaka <himesaka@noa.codes>
+# Contributor: Marcos_Chay <maktio@hotmail.com> (AUR spacebar, 252bc14)
+#
+# Spacebar with IMSroha's patches (README.md here): MMS and SMS fixes
+# (0001-0003), RCS chat (0004-0006) and RCS file transfer (0007) through
+# codes.noa.IMSroha.Rcs when imsroha-rcs runs; without it, SMS and MMS as
+# upstream.
+
+pkgname=spacebar
+pkgver=6.3.4
+pkgrel=6
+pkgdesc="SMS and messaging application for Mobile Devices running Plasma"
+arch=('x86_64' 'armv7h' 'aarch64')
+url="https://community.kde.org/Plasma/Mobile"
+license=('GPL-2.0-only OR GPL-3.0-only')
+depends=(
+  'c-ares'
+  'futuresql-qt6'
+  'kconfig'
+  'kcoreaddons'
+  'kcontacts'
+  'kdbusaddons'
+  'ki18n'
+  'kio'
+  'kirigami'
+  'kirigami-addons'
+  'knotifications'
+  'kpeople'
+  'kwindowsystem'
+  'libphonenumber'
+  'modemmanager-qt'
+  'qcoro-qt6'
+  'qt6-declarative'
+)
+makedepends=(
+  'cmake'
+  'extra-cmake-modules'
+)
+source=("https://download.kde.org/stable/plasma/$pkgver/$pkgname-$pkgver.tar.xz"
+        0001-daemon-close-the-connection-after-every-MMSC-request.patch
+        0002-Parse-national-own-numbers-and-late-modem-country-co.patch
+        0003-daemon-store-a-received-message-only-once.patch
+        0004-database-remember-the-transport-of-a-message-SMS-MMS.patch
+        0005-daemon-RCS-chat-through-IMSroha-when-it-is-there.patch
+        0006-app-mark-RCS-messages-show-when-the-other-side-is-ty.patch
+        0007-daemon-app-send-and-receive-files-over-RCS-through-I.patch)
+sha256sums=('fe1b7c5651baabcf580041cf1616ede4ad434ae84f0838464e9082d1e4f1e633'
+            '911e17ce5424becb661f9df69c863557d32b59fc56b76318f62eceb4aad246fe'
+            '150c1e68612360d3051c8a2f99337aa100a5f74cb4bca27856c2ba74976df428'
+            '3345c8590ceb1cb3537351026cefba0988c63233fb6ee0f13ce27970e432ab3c'
+            'b4e5cdbd6d76b547dddc63645a6bb9104344f77e9e1912132d2e9c0bb910c79d'
+            '3cf849ffdebd17657f6af5dde0337effae176c3cf49135ba9ff69c85f2d6f2d9'
+            'ac64b3e02ed13dca5a1fd322e319061f0dacfb090bf3c147e2413f1c8a892235'
+            '37a39f3d63828d57f2256fe0cf48ef91568a55f981e4cfb2153464df586f44d4')
+
+prepare() {
+  for p in 0001-daemon-close-the-connection-after-every-MMSC-request.patch \
+           0002-Parse-national-own-numbers-and-late-modem-country-co.patch \
+           0003-daemon-store-a-received-message-only-once.patch \
+           0004-database-remember-the-transport-of-a-message-SMS-MMS.patch \
+           0005-daemon-RCS-chat-through-IMSroha-when-it-is-there.patch \
+           0006-app-mark-RCS-messages-show-when-the-other-side-is-ty.patch \
+           0007-daemon-app-send-and-receive-files-over-RCS-through-I.patch; do
+    patch -d $pkgname-$pkgver -p1 < $p
+  done
+}
+
+build() {
+  cmake -B build -S $pkgname-$pkgver \
+    -DCMAKE_INSTALL_LIBEXECDIR=lib \
+    -DBUILD_TESTING=OFF
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

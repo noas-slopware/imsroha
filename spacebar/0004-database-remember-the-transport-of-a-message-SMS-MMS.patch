@@ -1,0 +1,197 @@
+From 2c828db7b740e548578f59ed59a69636d6d89e2e Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 17:20:23 +0900
+Subject: [PATCH 4/6] database: remember the transport of a message (SMS/MMS or
+ RCS)
+
+A transport column (NULL for SMS and MMS through ModemManager, 'rcs' for
+RCS chat through IMSroha), and the lookups the RCS transport needs: our id
+for an imdn.Message-ID, and the unread RCS messages of a chat (for their
+displayed notifications).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ lib/database/database.cpp                     | 43 ++++++++++++++++---
+ lib/database/database.h                       | 13 +++++-
+ lib/database/migrations.qrc                   |  2 +
+ .../2026-11-11-000000_transport/down.sql      |  3 ++
+ .../2026-11-11-000000_transport/up.sql        |  4 ++
+ 5 files changed, 59 insertions(+), 6 deletions(-)
+ create mode 100644 lib/database/migrations/2026-11-11-000000_transport/down.sql
+ create mode 100644 lib/database/migrations/2026-11-11-000000_transport/up.sql
+
+diff --git a/lib/database/database.cpp b/lib/database/database.cpp
+index dcc9252..6e7aa56 100644
+--- a/lib/database/database.cpp
++++ b/lib/database/database.cpp
+@@ -74,7 +74,8 @@ QCoro::Task<std::vector<Message>> Database::messagesForNumber(const PhoneNumberL
+             contentLocation,
+             expires,
+             size,
+-            tapbacks
++            tapbacks,
++            transport
+         FROM Messages
+     )");
+ 
+@@ -202,6 +203,34 @@ QCoro::Task<std::optional<int>> Database::unreadMessagesForNumber(const PhoneNum
+     });
+ }
+ 
++QCoro::Task<std::optional<QString>> Database::idForMessageId(const QString &messageId)
++{
++    auto id = co_await m_database->getResult<SingleValue<QString>>(SL("SELECT id FROM Messages WHERE messageId == ? AND transport == 'rcs' LIMIT 1"),
++                                                                   messageId);
++    co_return map(std::move(id), [](auto &&v) {
++        return v.value;
++    });
++}
++
++QCoro::Task<QStringList> Database::unreadRcsMessageIds(const PhoneNumberList &phoneNumberList)
++{
++    const auto rows = co_await m_database->getResults<SingleValue<QString>>(
++        SL("SELECT messageId FROM Messages WHERE phoneNumber == ? AND transport == 'rcs' AND sentByMe == False AND NOT read == True"),
++        phoneNumberList.toString());
++    QStringList ids;
++    for (const auto &r : rows) {
++        if (!r.value.isEmpty()) {
++            ids.append(r.value);
++        }
++    }
++    co_return ids;
++}
++
++QCoro::Task<> Database::updateMessageTransport(const QString &id, const QString &transport)
++{
++    co_await m_database->execute(SL("UPDATE Messages SET transport = ? WHERE id == ?"), transport.isEmpty() ? QVariant() : transport, id);
++}
++
+ QCoro::Task<> Database::markChatAsRead(const PhoneNumberList &phoneNumberList)
+ {
+     co_await m_database->execute(SL("UPDATE Messages SET read = True WHERE phoneNumber = ? AND NOT read == True"), phoneNumberList.toString());
+@@ -232,8 +261,9 @@ QCoro::Task<> Database::addMessage(const Message &message)
+             pendingDownload,
+             contentLocation,
+             expires,
+-            size)
+-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++            size,
++            transport)
++        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         )"),
+                                  message.id,
+                                  message.phoneNumberList.toString(),
+@@ -251,7 +281,8 @@ QCoro::Task<> Database::addMessage(const Message &message)
+                                  message.pendingDownload,
+                                  message.contentLocation,
+                                  message.expires.isNull() ? QVariant() : message.expires.toMSecsSinceEpoch(),
+-                                 message.size);
++                                 message.size,
++                                 message.transport.isEmpty() ? QVariant() : message.transport);
+ }
+ 
+ QCoro::Task<> Database::deleteMessage(const QString &id)
+@@ -522,7 +553,8 @@ Message Message::fromSql(ColumnTypes &&tuple)
+           contentLocation,
+           expires,
+           size,
+-          tapbacks] = tuple;
++          tapbacks,
++          transport] = tuple;
+ 
+     Message message;
+     message.id = id, message.phoneNumberList = PhoneNumberList(phoneNumberList);
+@@ -542,5 +574,6 @@ Message Message::fromSql(ColumnTypes &&tuple)
+     message.expires = QDateTime::fromMSecsSinceEpoch(expires);
+     message.size = size;
+     message.tapbacks = tapbacks;
++    message.transport = transport;
+     return message;
+ }
+diff --git a/lib/database/database.h b/lib/database/database.h
+index bf819c7..2f38c03 100644
+--- a/lib/database/database.h
++++ b/lib/database/database.h
+@@ -46,7 +46,7 @@ Q_DECLARE_METATYPE(StringMapList)
+ 
+ struct Message {
+     using ColumnTypes =
+-        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString>;
++        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString, QString>;
+ 
+     static Message fromSql(ColumnTypes &&tuple);
+ 
+@@ -68,6 +68,10 @@ struct Message {
+     QDateTime expires;
+     int size = 0;
+     QString tapbacks;
++    // How it went or came: empty for SMS/MMS through ModemManager, "rcs" for
++    // RCS chat through IMSroha (codes.noa.IMSroha.Rcs). For RCS, messageId is
++    // the imdn.Message-ID.
++    QString transport;
+ 
+     Message() = default;
+ 
+@@ -91,6 +95,7 @@ struct Message {
+         expires = QDateTime::fromString(map[SL("expires")]);
+         size = map[SL("size")].toInt();
+         tapbacks = map[SL("tapbacks")];
++        transport = map[SL("transport")];
+     }
+ 
+     StringMap toMap() const
+@@ -114,6 +119,7 @@ struct Message {
+             {SL("expires"), expires.toString()},
+             {SL("size"), QString::number(size)},
+             {SL("tapbacks"), tapbacks},
++            {SL("transport"), transport},
+         };
+     }
+ };
+@@ -171,6 +177,11 @@ public:
+     QCoro::Task<> updateMessageTapbacks(const QString &id, const QString tapbacks);
+     QCoro::Task<std::optional<QString>> lastMessageWithText(const PhoneNumberList &phoneNumberList, const QString &text);
+     QCoro::Task<std::optional<QString>> lastMessageWithAttachment(const PhoneNumberList &phoneNumberList);
++    // RCS: our id of the message with this imdn.Message-ID, and the IDs of
++    // received messages not read yet (for their displayed notifications).
++    QCoro::Task<std::optional<QString>> idForMessageId(const QString &messageId);
++    QCoro::Task<QStringList> unreadRcsMessageIds(const PhoneNumberList &phoneNumberList);
++    QCoro::Task<> updateMessageTransport(const QString &id, const QString &transport);
+ 
+     // Chats
+     QCoro::Task<QVector<Chat>> chats(const PhoneNumberList &phoneNumberList) const;
+diff --git a/lib/database/migrations.qrc b/lib/database/migrations.qrc
+index 135c173..8f4de05 100644
+--- a/lib/database/migrations.qrc
++++ b/lib/database/migrations.qrc
+@@ -2,5 +2,7 @@
+     <qresource prefix="/">
+         <file>migrations/2023-05-07-102621_init/down.sql</file>
+         <file>migrations/2023-05-07-102621_init/up.sql</file>
++        <file>migrations/2026-11-11-000000_transport/down.sql</file>
++        <file>migrations/2026-11-11-000000_transport/up.sql</file>
+     </qresource>
+ </RCC>
+diff --git a/lib/database/migrations/2026-11-11-000000_transport/down.sql b/lib/database/migrations/2026-11-11-000000_transport/down.sql
+new file mode 100644
+index 0000000..a2108bd
+--- /dev/null
++++ b/lib/database/migrations/2026-11-11-000000_transport/down.sql
+@@ -0,0 +1,3 @@
++-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++ALTER TABLE Messages DROP COLUMN transport;
+diff --git a/lib/database/migrations/2026-11-11-000000_transport/up.sql b/lib/database/migrations/2026-11-11-000000_transport/up.sql
+new file mode 100644
+index 0000000..6a0e0a5
+--- /dev/null
++++ b/lib/database/migrations/2026-11-11-000000_transport/up.sql
+@@ -0,0 +1,4 @@
++-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++-- NULL: SMS/MMS through ModemManager. 'rcs': RCS chat through IMSroha.
++ALTER TABLE Messages ADD COLUMN transport TEXT;
+-- 
+2.56.0
+

@@ -418,8 +418,7 @@ byte, the large-file server, the thumbnail over chunked coding, a file name that
 to leave the directory, an expired and an oversize file-info never fetched, no
 credentials for another host (`rcs-ft` covers the parsing, the limits and Digest
 against RFC 2617 and RFC 7616's examples). File transfer has not been tried on LG
-U+. A messaging app's side: Spacebar patches 0004-0006 in
-[linux-zflip3](https://github.com/noas-slopware/linux-zflip3) `userspace/spacebar/`.
+U+. A messaging app's side: Spacebar patches 0004-0007 in `spacebar/`.
 
 Not done yet, or different from R9's own examples:
 

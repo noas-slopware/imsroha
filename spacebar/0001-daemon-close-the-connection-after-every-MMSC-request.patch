@@ -1,0 +1,62 @@
+From b3be1de890ef20f67a703e48165d53d6ef66fd0f Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Sun, 8 Nov 2026 23:19:58 +0900
+Subject: [PATCH] daemon: close the connection after every MMSC request
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+LG U+'s MMSC (Resin/2.1.9 at omammsc.uplus.co.kr:9084) answers every
+M-Send.req that arrives on a keep-alive HTTP/1.1 connection with
+X-Mms-Response-Status 0xe2 (format corrupt, "메시지 포맷이 잘못되었습니다."),
+even a well-formed one. The same PDU with Connection: close is accepted.
+Android's MmsService closes the connection after each MMS transaction too.
+
+Also free the header list, which leaked on every POST.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTPdTNcEmdyRhJMbUHU
+---
+ daemon/ecurl.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/daemon/ecurl.cpp b/daemon/ecurl.cpp
+index 36babec..c615e54 100644
+--- a/daemon/ecurl.cpp
++++ b/daemon/ecurl.cpp
+@@ -91,17 +91,22 @@ QByteArray ECurl::networkRequest(const QString &url, const QByteArray &data) con
+         curl_easy_setopt(curl, CURLOPT_PROXY, proxy.toUtf8().constData());
+     }
+ 
++    // Every MMS transaction is a single request, and some MMSCs (LG U+'s
++    // Resin server) answer "format corrupt" to any M-Send.req on a kept-alive
++    // connection. Android's MmsService closes the connection for the same reason.
++    struct curl_slist *headers = NULL;
++    headers = curl_slist_append(headers, "Connection: close");
++
+     if (!data.isEmpty()) {
+         curl_easy_setopt(curl, CURLOPT_POST, 1L);
+         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.constData());
+         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.length());
+ 
+         QString len = QString::number(data.length());
+-        struct curl_slist *headers = NULL;
+         headers = curl_slist_append(headers, "Content-Type: application/vnd.wap.mms-message");
+         headers = curl_slist_append(headers, (SL("Content-Length: ") + len).toUtf8().constData());
+-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+     }
++    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+ 
+     QByteArray response;
+     const QByteArray *pointer = &response;
+@@ -111,6 +116,7 @@ QByteArray ECurl::networkRequest(const QString &url, const QByteArray &data) con
+     CURLcode res = curl_easy_perform(curl);
+     curl_easy_cleanup(curl);
+     curl_slist_free_all(host);
++    curl_slist_free_all(headers);
+ 
+     if (res != CURLE_OK) {
+         qDebug() << "Network Error:" << errbuf;
+-- 
+2.56.0
+

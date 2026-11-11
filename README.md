@@ -8,6 +8,8 @@ The modem brings up the IMS PDN and runs AKA on the SIM. Everything above that
 (registration, SMS, calls, RTP and AMR) runs here. ModemManager, with the patches in
 `modemmanager/`, hands its Voice and Messaging interfaces to the daemon over D-Bus,
 so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager only.
+RCS chat and file transfer reach the user through Spacebar with the patches in
+`spacebar/` (also MMS and SMS fixes for Korean carriers).
 
 ## Status
 

@@ -1,0 +1,237 @@
+From 069a9418034ccbed3caa1212ae7cab1d717082a9 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 17:26:34 +0900
+Subject: [PATCH 6/6] app: mark RCS messages, show when the other side is
+ typing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Messages that went or came over RCS say "Chat" next to their time, and a
+sent one says "Delivered" or "Read" from its IMDNs. A "Typing…" line
+above the compose area follows the other side's isComposing (and clears on
+their message or after RFC 3994's 60 s refresh); editing the text sends our
+own, idle again after 15 s without an edit or when the message is sent.
+SMS conversations look and behave as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ src/contents/ui/MessagesPage.qml | 25 ++++++++++++-
+ src/messagemodel.cpp             | 60 +++++++++++++++++++++++++++++++-
+ src/messagemodel.h               | 20 ++++++++++-
+ 3 files changed, 102 insertions(+), 3 deletions(-)
+
+diff --git a/src/contents/ui/MessagesPage.qml b/src/contents/ui/MessagesPage.qml
+index b9b2e67..32bff82 100644
+--- a/src/contents/ui/MessagesPage.qml
++++ b/src/contents/ui/MessagesPage.qml
+@@ -629,7 +629,19 @@ Kirigami.ScrollablePage {
+                     anchors.bottom: parent.bottom
+                     padding: Kirigami.Units.smallSpacing
+                     bottomPadding: 0
+-                    text: Qt.formatTime(model.time, Qt.DefaultLocaleShortDate)
++                    text: {
++                        let t = Qt.formatTime(model.time, Qt.DefaultLocaleShortDate)
++                        // RCS (IMSroha): say so, and how far a sent one got.
++                        if (model.transport === "rcs") {
++                            t += " · " + i18nc("an RCS chat message, not SMS", "Chat")
++                            if (model.sentByMe && model.readReport) {
++                                t += " · " + i18nc("RCS message status", "Read")
++                            } else if (model.sentByMe && model.deliveryReport > 0) {
++                                t += " · " + i18nc("RCS message status", "Delivered")
++                            }
++                        }
++                        return t
++                    }
+                     font: Kirigami.Theme.smallFont
+                     color: Kirigami.Theme.disabledTextColor
+ 
+@@ -1088,6 +1100,15 @@ Kirigami.ScrollablePage {
+             }
+         }
+ 
++        Controls.Label {
++            // RCS: the other side is typing.
++            visible: !!(messageModel && messageModel.remoteComposing)
++            Layout.leftMargin: Kirigami.Units.largeSpacing
++            text: i18nc("the other person is typing a message", "Typing…")
++            font: Kirigami.Theme.smallFont
++            color: Kirigami.Theme.disabledTextColor
++        }
++
+         RowLayout {
+             id: composeArea
+ 
+@@ -1123,6 +1144,8 @@ Kirigami.ScrollablePage {
+                     color: Kirigami.Theme.backgroundColor
+                 }
+                 inputMethodHints: Qt.ImhNoPredictiveText
++                // RCS isComposing; nothing happens for SMS.
++                onTextChanged: if (messageModel) messageModel.setComposing(text.length > 0)
+             }
+ 
+             Controls.Action {
+diff --git a/src/messagemodel.cpp b/src/messagemodel.cpp
+index 2dcbe7e..35344cb 100644
+--- a/src/messagemodel.cpp
++++ b/src/messagemodel.cpp
+@@ -36,6 +36,40 @@ MessageModel::MessageModel(ChannelHandler &handler, const PhoneNumberList &phone
+ 
+     connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::messageUpdated, this, &MessageModel::messageUpdated);
+ 
++    m_composingIdle.setSingleShot(true);
++    m_composingIdle.setInterval(15000);
++    connect(&m_composingIdle, &QTimer::timeout, this, [this] {
++        setComposing(false);
++    });
++    m_remoteExpiry.setSingleShot(true);
++    m_remoteExpiry.setInterval(60000);
++    connect(&m_remoteExpiry, &QTimer::timeout, this, [this] {
++        m_remoteComposing = false;
++        Q_EMIT remoteComposingChanged();
++    });
++    connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::composingChanged, this, [this](const QString &numbers, bool active) {
++        if (PhoneNumberList(numbers) != m_phoneNumberList) {
++            return;
++        }
++        if (active) {
++            m_remoteExpiry.start();
++        } else {
++            m_remoteExpiry.stop();
++        }
++        if (m_remoteComposing != active) {
++            m_remoteComposing = active;
++            Q_EMIT remoteComposingChanged();
++        }
++    });
++    // A message from them ends their typing (RFC 3994 3.3).
++    connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::messageAdded, this, [this](const QString &numbers, const QString &) {
++        if (m_remoteComposing && PhoneNumberList(numbers) == m_phoneNumberList) {
++            m_remoteComposing = false;
++            m_remoteExpiry.stop();
++            Q_EMIT remoteComposingChanged();
++        }
++    });
++
+     connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::manualDownloadFinished, this, [this](const QString &id, const bool isEmpty) {
+         if (isEmpty) {
+             updateMessageState(id, MessageState::Failed, true);
+@@ -125,7 +159,8 @@ QHash<int, QByteArray> MessageModel::roleNames() const
+             {Role::ExpiresRole, BL("expires")},
+             {Role::ExpiresDateTimeRole, BL("expiresDateTime")},
+             {Role::SizeRole, BL("size")},
+-            {Role::TapbacksRole, BL("tapbacks")}};
++            {Role::TapbacksRole, BL("tapbacks")},
++            {Role::TransportRole, BL("transport")}};
+ }
+ 
+ QVariant MessageModel::data(const QModelIndex &index, int role) const
+@@ -175,6 +210,8 @@ QVariant MessageModel::data(const QModelIndex &index, int role) const
+         return message.size;
+     case Role::TapbacksRole:
+         return message.tapbacks;
++    case Role::TransportRole:
++        return message.transport;
+     }
+ 
+     return {};
+@@ -253,8 +290,29 @@ void MessageModel::sendTapback(const QString &id, const QString &tapback, const
+     m_handler.interface()->sendTapback(m_phoneNumberList.toString(), id, tapback, isRemoved);
+ }
+ 
++bool MessageModel::remoteComposing() const
++{
++    return m_remoteComposing;
++}
++
++void MessageModel::setComposing(bool active)
++{
++    if (active) {
++        m_composingIdle.start();
++    } else {
++        m_composingIdle.stop();
++    }
++    if (active == m_composing) {
++        return;
++    }
++    m_composing = active;
++    m_handler.interface()->setComposing(m_phoneNumberList.toString(), active);
++}
++
+ void MessageModel::sendMessage(const QString &text, const QStringList &files, const qint64 &totalSize)
+ {
++    m_composingIdle.stop();
++    m_composing = false;
+     Message message;
+     message.id = Database::generateRandomId();
+     message.phoneNumberList = m_phoneNumberList;
+diff --git a/src/messagemodel.h b/src/messagemodel.h
+index 53fb8e5..31ff03f 100644
+--- a/src/messagemodel.h
++++ b/src/messagemodel.h
+@@ -6,6 +6,7 @@
+ 
+ #include <QAbstractListModel>
+ #include <QObject>
++#include <QTimer>
+ 
+ #include <KPeople/PersonData>
+ 
+@@ -34,6 +35,8 @@ class MessageModel : public QAbstractListModel
+     Q_PROPERTY(QString sendingNumber READ sendingNumber CONSTANT)
+     Q_PROPERTY(QVector<Person> people READ people NOTIFY peopleChanged)
+     Q_PROPERTY(QString attachmentsFolder READ attachmentsFolder CONSTANT)
++    // RCS: the other side is typing (isComposing through IMSroha).
++    Q_PROPERTY(bool remoteComposing READ remoteComposing NOTIFY remoteComposingChanged)
+ 
+ public:
+     enum Role {
+@@ -55,7 +58,8 @@ public:
+         ExpiresRole,
+         ExpiresDateTimeRole,
+         SizeRole,
+-        TapbacksRole
++        TapbacksRole,
++        TransportRole
+     };
+     Q_ENUM(Role)
+ 
+@@ -129,6 +133,14 @@ public:
+      */
+     Q_INVOKABLE void disableNotifications(const PhoneNumberList &phoneNumberList);
+ 
++    bool remoteComposing() const;
++    /**
++     * @brief tells the other side we are typing (RCS only; nothing for SMS).
++     * Called on every edit: it goes out when the state changes, and turns
++     * idle by itself after a while without edits.
++     */
++    Q_INVOKABLE void setComposing(bool active);
++
+ private:
+     QPair<Message *, int> getMessageIndex(const QString &id);
+     void updateMessageState(const QString &id, MessageState state, const bool temp = false);
+@@ -140,6 +152,11 @@ private:
+     PhoneNumberList m_phoneNumberList;
+     QVector<Person> m_peopleData;
+ 
++    bool m_remoteComposing = false;
++    bool m_composing = false;
++    QTimer m_composingIdle;   // our own: idle after 15 s without an edit
++    QTimer m_remoteExpiry;    // theirs: RFC 3994's refresh (60 s) without news
++
+ private Q_SLOTS:
+     void fetchMessages(const QString &id, const int limit = 0);
+     void fetchUpdatedMessage(const QString &id);
+@@ -147,6 +164,7 @@ private Q_SLOTS:
+     void messageUpdated(const QString &numbers, const QString &id);
+ 
+ Q_SIGNALS:
++    void remoteComposingChanged();
+     void phoneNumberListChanged();
+     void peopleChanged();
+     void messagesFetched();
+-- 
+2.56.0
+

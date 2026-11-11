@@ -1,0 +1,74 @@
+From 04cde3193b6559f6df0e156e5676dcdd2af6cd7e Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Sun, 8 Nov 2026 23:26:19 +0900
+Subject: [PATCH] Parse national own numbers and late modem country codes
+ correctly
+
+Two bugs made an incoming MMS on a Korean SIM list the user's own number
+as a recipient and lose its attachments:
+
+- ModemController::ownNumber() prepended '+' to every number, because
+  QStringList::startsWith() compares the first element with "+" instead of
+  testing its first character. ModemManager reports what the SIM stores,
+  and a Korean SIM stores 010XXXXXXXX, so the own number became
+  +010XXXXXXXX: unparseable, never equal to the parsed sender list, and
+  never removed from it. Keep numbers that start with '+' or with a trunk
+  prefix '0' as they are; no E.164 country code starts with 0.
+
+- The daemon starts at login before the modem exists, so its constructor
+  sets the PhoneNumber country code from the locale fallback. When the
+  modem appears, checkMessages() refreshes the own number but not the
+  country code, so national numbers stay unparsed until the daemon is
+  restarted. The raw recipient list then hashes to a different
+  attachments folder than the one the app looks in, and pictures show as
+  "Cannot open". Refresh the country code in checkMessages() as well.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTPdTNcEmdyRhJMbUHU
+---
+ daemon/channellogger.cpp                 |  5 +++++
+ lib/telephonySupport/modemcontroller.cpp | 11 ++++++++---
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index e607a23..76a7a8a 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -72,6 +72,11 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+ 
+ void ChannelLogger::checkMessages()
+ {
++    // The daemon usually starts before ModemManager has a modem, so the
++    // country code set in the constructor came from the locale fallback.
++    // Take the modem's now, before any national number gets parsed.
++    PhoneNumber::setCountryCode(countryCode());
++
+     // update own number
+     m_ownNumber = PhoneNumber(ownNumber());
+ 
+diff --git a/lib/telephonySupport/modemcontroller.cpp b/lib/telephonySupport/modemcontroller.cpp
+index eba5f01..5716956 100644
+--- a/lib/telephonySupport/modemcontroller.cpp
++++ b/lib/telephonySupport/modemcontroller.cpp
+@@ -196,10 +196,15 @@ QString ModemController::ownNumber()
+     const QStringList numbers = m_interface->ownNumbers();
+ 
+     if (!numbers.isEmpty()) {
+-        if (numbers.startsWith(QStringLiteral("+"))) {
+-            return numbers.first();
++        const QString &number = numbers.first();
++        // ModemManager reports the MSISDN as the SIM stores it: E.164 with or
++        // without the '+', or a national number with its trunk prefix (Korean
++        // SIMs store 010...). No country code starts with 0, so only a number
++        // that starts with neither '+' nor '0' is an E.164 number missing its '+'.
++        if (number.startsWith(u'+') || number.startsWith(u'0')) {
++            return number;
+         }
+-        return QStringLiteral("+") + numbers.first();
++        return QStringLiteral("+") + number;
+     }
+ 
+     return QString();
+-- 
+2.56.0
+

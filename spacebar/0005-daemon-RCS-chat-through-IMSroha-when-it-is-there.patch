@@ -1,0 +1,497 @@
+From 4de3c8d81aecfec3d1fff50853c33395280ed173 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 17:23:32 +0900
+Subject: [PATCH 5/6] daemon: RCS chat through IMSroha when it is there
+
+A transport next to SMS/MMS: IMSroha's codes.noa.IMSroha.Rcs on the
+system bus (imsroha-rcs, opt-in there). While the service is absent or not
+registered nothing changes. When it is registered, a 1-to-1 text to a number
+whose capabilities say chat (IMSroha asks: presence or OPTIONS, at most
+5 s) goes as RCS; SendMessage refusing it, or a failed
+status before it was sent, sends the same message as SMS. Received RCS
+messages are stored with transport rcs; delivered and displayed IMDNs land
+in deliveryReport and readReport; reading the chat sends the displayed
+notifications. isComposing goes both ways: setComposing on the daemon's
+D-Bus interface, and a composingChanged signal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ daemon/CMakeLists.txt              |   2 +
+ daemon/channellogger.cpp           |  94 +++++++++++++++++-
+ daemon/channellogger.h             |  12 ++-
+ daemon/org.kde.spacebar.Daemon.xml |   8 ++
+ daemon/rcstransport.cpp            | 150 +++++++++++++++++++++++++++++
+ daemon/rcstransport.h              |  61 ++++++++++++
+ 6 files changed, 321 insertions(+), 6 deletions(-)
+ create mode 100644 daemon/rcstransport.cpp
+ create mode 100644 daemon/rcstransport.h
+
+diff --git a/daemon/CMakeLists.txt b/daemon/CMakeLists.txt
+index 6e4950b..6b2a380 100644
+--- a/daemon/CMakeLists.txt
++++ b/daemon/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(spacebar_daemon_SRCS
+     main.cpp
+     channellogger.cpp
+     ecurl.cpp
++    rcstransport.cpp
+ )
+ 
+ # generate DBus adaptor xml
+@@ -40,6 +41,7 @@ target_link_libraries(spacebar-daemon PRIVATE
+     CURL::libcurl
+     PkgConfig::c-ares
+     QCoro6::Core
++    QCoro6::DBus
+ )
+ 
+ 
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index b48b6c4..f774d7c 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -79,6 +79,17 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+     connect(&ModemController::instance(), &ModemController::countryCodeChanged, this, [](const QString &countryCode) {
+         PhoneNumber::setCountryCode(countryCode);
+     });
++
++    // RCS through IMSroha, when it is there and registered.
++    connect(&m_rcs, &RcsTransport::messageReceived, this, [this](const QString &number, const QString &messageId, const QString &text, const QDateTime &time) {
++        saveMessage(PhoneNumberList(number), time, text, QString(), QString(), QString(), messageId, false, QString(), QDateTime(), 0, SL("rcs"));
++    });
++    connect(&m_rcs, &RcsTransport::statusChanged, this, [this](const QString &messageId, const QString &status) {
++        handleRcsStatus(messageId, status);
++    });
++    connect(&m_rcs, &RcsTransport::composingChanged, this, [this](const QString &number, bool active) {
++        Q_EMIT composingChanged(PhoneNumberList(number).toString(), active);
++    });
+ }
+ 
+ void ChannelLogger::checkMessages()
+@@ -132,6 +143,13 @@ StringMapList ChannelLogger::chats(const QStringList &phoneNumberList)
+ void ChannelLogger::markChatAsRead(const QStringList &phoneNumberList)
+ {
+     PhoneNumberList phoneList{phoneNumberList};
++    // RCS: the sender asked to know when its messages were displayed.
++    if (phoneList.size() == 1) {
++        const auto ids = QCoro::waitFor(m_database.unreadRcsMessageIds(phoneList));
++        for (const auto &id : ids) {
++            m_rcs.markDisplayed(phoneList.first().toE164(), id);
++        }
++    }
+     QCoro::waitFor(m_database.markChatAsRead(phoneList));
+ }
+ 
+@@ -348,7 +366,8 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+                                              const bool pendingDownload,
+                                              const QString &contentLocation,
+                                              const QDateTime &expires,
+-                                             const int size)
++                                             const int size,
++                                             const QString &transport)
+ {
+     Message message;
+     message.text = text;
+@@ -366,6 +385,7 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+     message.contentLocation = contentLocation;
+     message.expires = expires;
+     message.size = size;
++    message.transport = transport;
+ 
+     // prevent chronologically misordered chat history
+     if (message.read && message.datetime.secsTo(QDateTime::currentDateTime()) < 60) {
+@@ -427,6 +447,8 @@ void ChannelLogger::sendMessage(const QString &numbers, const QString &id, const
+                 message.deliveryStatus = MessageState::Sent;
+                 updateMessage(message);
+             }
++        } else if (m_rcs.isRegistered() && co_await m_rcs.canChat(phoneNumberList.first().toE164())) {
++            result = co_await sendMessageRCS(phoneNumberList.first(), id, text);
+         } else {
+             result = co_await sendMessageSMS(phoneNumberList.first(), id, text);
+         }
+@@ -444,7 +466,66 @@ void ChannelLogger::sendTapback(const QString &numbers, const QString &id, const
+     sendTapbackHandler(numbers, id, tapback, isRemoved);
+ }
+ 
+-QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text)
++void ChannelLogger::setComposing(const QString &numbers, bool active)
++{
++    const PhoneNumberList list(numbers);
++    if (list.size() == 1) {
++        m_rcs.setComposing(list.first().toE164(), active);
++    }
++}
++
++QCoro::Task<QString> ChannelLogger::sendMessageRCS(const PhoneNumber &phoneNumber, const QString &id, const QString &text)
++{
++    Message message;
++    message.id = id;
++    message.phoneNumberList = PhoneNumberList(phoneNumber.toInternational());
++    message.text = text;
++    message.datetime = QDateTime::currentDateTime();
++    message.read = true;
++    message.sentByMe = true;
++    message.deliveryStatus = MessageState::Pending;
++    message.transport = SL("rcs");
++    co_await addMessage(message);
++
++    const auto rcsId = co_await m_rcs.send(phoneNumber.toE164(), text);
++    if (!rcsId) {
++        // RCS would not take it: the same message goes as SMS.
++        co_await m_database.updateMessageTransport(id, QString());
++        co_return co_await sendMessageSMS(phoneNumber, id, text, false);
++    }
++    co_await m_database.updateMessageSent(id, *rcsId, QString());
++    co_return QString();
++}
++
++QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString &messageId, const QString &status)
++{
++    const auto id = co_await m_database.idForMessageId(messageId);
++    if (!id) {
++        co_return;
++    }
++    const auto found = co_await m_database.messagesForNumber(PhoneNumberList(), *id);
++    if (found.empty()) {
++        co_return;
++    }
++    const Message message = found.front();
++    if (status == SL("sent")) {
++        co_await m_database.updateMessageDeliveryState(*id, MessageState::Sent);
++    } else if (status == SL("delivered")) {
++        co_await m_database.updateMessageDeliveryState(*id, MessageState::Sent);
++        co_await m_database.updateMessageDeliveryReport(messageId);
++    } else if (status == SL("displayed")) {
++        co_await m_database.updateMessageReadReport(messageId, message.phoneNumberList.first());
++    } else if (status == SL("failed") && message.deliveryStatus != MessageState::Sent) {
++        // Not delivered over RCS (no session, the far end is gone): fall back to SMS.
++        qDebug() << "RCS: message" << messageId << "failed, sending it as SMS";
++        co_await m_database.updateMessageTransport(*id, QString());
++        co_await sendMessageSMS(message.phoneNumberList.first(), *id, message.text, false);
++        co_return;
++    }
++    updateMessage(message);
++}
++
++QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, bool addToDatabase)
+ {
+     ModemManager::ModemMessaging::Message m;
+     m.number = phoneNumber.toE164();
+@@ -459,8 +540,13 @@ QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumbe
+     message.sentByMe = true;
+     message.deliveryStatus = MessageState::Pending;
+ 
+-    // add message to database
+-    co_await addMessage(message);
++    // add message to database (an RCS fallback is there already)
++    if (addToDatabase) {
++        co_await addMessage(message);
++    } else {
++        co_await m_database.updateMessageDeliveryState(message.id, MessageState::Pending);
++        updateMessage(message);
++    }
+ 
+     auto maybeReply = ModemController::instance().createMessage(m);
+ 
+diff --git a/daemon/channellogger.h b/daemon/channellogger.h
+index 55012e6..3ae138d 100644
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -11,6 +11,7 @@
+ 
+ #include "ecurl.h"
+ #include "modemcontroller.h"
++#include "rcstransport.h"
+ #include <database.h>
+ #include <mms.h>
+ 
+@@ -39,6 +40,7 @@ public:
+     Q_SCRIPTABLE void manualDownload(const QString &id, const QString &url, const QDateTime &expires);
+     Q_SCRIPTABLE void sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize);
+     Q_SCRIPTABLE void sendTapback(const QString &numbers, const QString &id, const QString &tapback, const bool &isRemoved);
++    Q_SCRIPTABLE void setComposing(const QString &numbers, bool active);
+     Q_SCRIPTABLE void syncSettings();
+     Q_SCRIPTABLE QString ownNumber();
+     Q_SCRIPTABLE QString countryCode();
+@@ -78,8 +80,11 @@ private:
+                                   const bool pendingDownload = false,
+                                   const QString &contentLocation = QString(),
+                                   const QDateTime &expires = QDateTime(),
+-                                  const int size = 0);
+-    QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text);
++                                  const int size = 0,
++                                  const QString &transport = QString());
++    QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, bool addToDatabase = true);
++    QCoro::Task<QString> sendMessageRCS(const PhoneNumber &phoneNumber, const QString &id, const QString &text);
++    QCoro::Task<void> handleRcsStatus(const QString &messageId, const QString &status);
+     QCoro::Task<QString>
+     sendMessageMMS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files, const qint64 totalSize);
+     QCoro::Task<void> sendCancelResponse(const QString &transactionId);
+@@ -103,6 +108,8 @@ private:
+ 
+     Mms m_mms;
+ 
++    RcsTransport m_rcs;
++
+     ECurl m_curl;
+ 
+     PhoneNumberList m_disabledNotificationNumber;
+@@ -120,4 +127,5 @@ Q_SIGNALS:
+     Q_SCRIPTABLE void messageAdded(const QString &phoneNumber, const QString &id);
+     Q_SCRIPTABLE void messageUpdated(const QString &phoneNumber, const QString &id);
+     Q_SCRIPTABLE void manualDownloadFinished(const QString &id, const bool isEmpty);
++    Q_SCRIPTABLE void composingChanged(const QString &phoneNumber, bool active);
+ };
+diff --git a/daemon/org.kde.spacebar.Daemon.xml b/daemon/org.kde.spacebar.Daemon.xml
+index c5559ac..89955dc 100644
+--- a/daemon/org.kde.spacebar.Daemon.xml
++++ b/daemon/org.kde.spacebar.Daemon.xml
+@@ -9,6 +9,10 @@
+       <arg name="phoneNumber" type="s" direction="out"/>
+       <arg name="id" type="s" direction="out"/>
+     </signal>
++    <signal name="composingChanged">
++      <arg name="phoneNumber" type="s" direction="out"/>
++      <arg name="active" type="b" direction="out"/>
++    </signal>
+     <signal name="manualDownloadFinished">
+       <arg name="id" type="s" direction="out"/>
+       <arg name="isEmpty" type="b" direction="out"/>
+@@ -35,6 +39,10 @@
+       <arg name="tapback" type="s" direction="in"/>
+       <arg name="isRemoved" type="b" direction="in"/>
+     </method>
++    <method name="setComposing">
++      <arg name="numbers" type="s" direction="in"/>
++      <arg name="active" type="b" direction="in"/>
++    </method>
+     <method name="syncSettings">
+     </method>
+     <method name="ownNumber">
+diff --git a/daemon/rcstransport.cpp b/daemon/rcstransport.cpp
+new file mode 100644
+index 0000000..6c05a6f
+--- /dev/null
++++ b/daemon/rcstransport.cpp
+@@ -0,0 +1,150 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#include "rcstransport.h"
++
++#include <QDBusConnection>
++#include <QDBusInterface>
++#include <QDBusMessage>
++#include <QDBusPendingCall>
++#include <QDBusPendingReply>
++#include <QDBusVariant>
++#include <QDebug>
++
++#include <QCoroDBusPendingReply>
++
++#include <global.h>
++
++static const QString RCS_SERVICE = SL("codes.noa.IMSroha.Rcs");
++static const QString RCS_PATH = SL("/codes/noa/IMSroha/Rcs");
++static const QString RCS_IFACE = SL("codes.noa.IMSroha.Rcs");
++
++RcsTransport::RcsTransport(QObject *parent)
++    : QObject(parent)
++    , m_watcher(RCS_SERVICE, QDBusConnection::systemBus(), QDBusServiceWatcher::WatchForOwnerChange)
++{
++    auto bus = QDBusConnection::systemBus();
++    bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("MessageReceived"), this, SLOT(onMessageReceived(QString, QString, QString, qlonglong)));
++    bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("MessageStatusChanged"), this, SLOT(onStatusChanged(QString, QString)));
++    bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("ComposingChanged"), this, SLOT(onComposingChanged(QString, bool)));
++    bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("StateChanged"), this, SLOT(onStateChanged(QString)));
++
++    connect(&m_watcher, &QDBusServiceWatcher::serviceOwnerChanged, this, [this](const QString &, const QString &, const QString &newOwner) {
++        m_caps.clear();
++        if (newOwner.isEmpty()) {
++            m_state.clear();
++            qDebug() << "RCS: IMSroha's RCS service is gone, SMS only";
++        } else {
++            fetchState();
++        }
++    });
++    fetchState();
++}
++
++void RcsTransport::fetchState()
++{
++    QDBusMessage get = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, SL("org.freedesktop.DBus.Properties"), SL("Get"));
++    get << RCS_IFACE << SL("State");
++    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(get), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<QDBusVariant> reply = *w;
++        if (reply.isValid()) {
++            onStateChanged(reply.value().variant().toString());
++        } else {
++            m_state.clear();
++        }
++        w->deleteLater();
++    });
++}
++
++bool RcsTransport::isRegistered() const
++{
++    return m_state == SL("registered");
++}
++
++void RcsTransport::onStateChanged(const QString &state)
++{
++    if (state != m_state) {
++        qDebug() << "RCS:" << state;
++    }
++    m_state = state;
++}
++
++QCoro::Task<bool> RcsTransport::canChat(const QString &e164)
++{
++    const auto now = QDateTime::currentDateTimeUtc();
++    const auto cached = m_caps.constFind(e164);
++    if (cached != m_caps.constEnd() && cached->until > now) {
++        co_return cached->chat;
++    }
++    if (!isRegistered()) {
++        co_return false;
++    }
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("GetCapabilities"));
++    call << e164;
++    // The message waits for this answer: not longer than a few seconds.
++    const QDBusPendingReply<QVariantMap> pending = QDBusConnection::systemBus().asyncCall(call, 5000);
++    const QDBusPendingReply<QVariantMap> reply = co_await pending;
++    if (!reply.isValid()) {
++        qDebug() << "RCS: capabilities of" << e164 << reply.error().message();
++        // Unknown: SMS for a minute, then ask again.
++        m_caps.insert(e164, Caps{false, now.addSecs(60)});
++        co_return false;
++    }
++    const auto caps = reply.value();
++    const bool known = caps.value(SL("known")).toBool();
++    const bool chat = caps.value(SL("chat")).toBool();
++    m_caps.insert(e164, Caps{chat, now.addSecs(!known ? 60 : chat ? 86400 : 600)});
++    co_return chat;
++}
++
++QCoro::Task<std::optional<QString>> RcsTransport::send(const QString &e164, const QString &text)
++{
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("SendMessage"));
++    call << e164 << text;
++    const QDBusPendingReply<QString> pending = QDBusConnection::systemBus().asyncCall(call);
++    const QDBusPendingReply<QString> reply = co_await pending;
++    if (!reply.isValid()) {
++        qDebug() << "RCS: SendMessage to" << e164 << reply.error().message();
++        co_return std::nullopt;
++    }
++    co_return reply.value();
++}
++
++void RcsTransport::setComposing(const QString &e164, bool active)
++{
++    if (!isRegistered()) {
++        return;
++    }
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("SetComposing"));
++    call << e164 << active;
++    QDBusConnection::systemBus().asyncCall(call);
++}
++
++void RcsTransport::markDisplayed(const QString &e164, const QString &messageId)
++{
++    if (!isRegistered()) {
++        return;
++    }
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("MarkDisplayed"));
++    call << e164 << messageId;
++    QDBusConnection::systemBus().asyncCall(call);
++}
++
++void RcsTransport::onMessageReceived(const QString &number, const QString &messageId, const QString &text, qlonglong timestampMs)
++{
++    // Whoever chats with us can chat.
++    m_caps.insert(number, Caps{true, QDateTime::currentDateTimeUtc().addSecs(86400)});
++    Q_EMIT messageReceived(number, messageId, text, QDateTime::fromMSecsSinceEpoch(timestampMs));
++}
++
++void RcsTransport::onStatusChanged(const QString &messageId, const QString &status)
++{
++    Q_EMIT statusChanged(messageId, status);
++}
++
++void RcsTransport::onComposingChanged(const QString &number, bool active)
++{
++    Q_EMIT composingChanged(number, active);
++}
+diff --git a/daemon/rcstransport.h b/daemon/rcstransport.h
+new file mode 100644
+index 0000000..2d4b92b
+--- /dev/null
++++ b/daemon/rcstransport.h
+@@ -0,0 +1,61 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#pragma once
++
++#include <QDBusServiceWatcher>
++#include <QDateTime>
++#include <QHash>
++#include <QObject>
++
++#include <QCoroTask>
++
++#include <optional>
++
++/*
++ * RCS chat through IMSroha's codes.noa.IMSroha.Rcs on the system bus.
++ * Inert while that service is absent or not registered: then everything goes
++ * the SMS/MMS way through ModemManager, as before.
++ */
++class RcsTransport : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit RcsTransport(QObject *parent = nullptr);
++
++    bool isRegistered() const;
++    // Whether the number can chat (IMSroha asks the network: presence or
++    // OPTIONS), cached a day when it can, ten minutes when it cannot, and a
++    // minute when nobody answered within 5 s.
++    QCoro::Task<bool> canChat(const QString &e164);
++    // The imdn.Message-ID, or nothing when RCS refused it (send it as SMS then).
++    QCoro::Task<std::optional<QString>> send(const QString &e164, const QString &text);
++    void setComposing(const QString &e164, bool active);
++    void markDisplayed(const QString &e164, const QString &messageId);
++
++Q_SIGNALS:
++    void messageReceived(const QString &number, const QString &messageId, const QString &text, const QDateTime &time);
++    // "sent", "delivered", "displayed" or "failed"
++    void statusChanged(const QString &messageId, const QString &status);
++    void composingChanged(const QString &number, bool active);
++
++private Q_SLOTS:
++    void onMessageReceived(const QString &number, const QString &messageId, const QString &text, qlonglong timestampMs);
++    void onStatusChanged(const QString &messageId, const QString &status);
++    void onComposingChanged(const QString &number, bool active);
++    void onStateChanged(const QString &state);
++
++private:
++    void connectService();
++    void fetchState();
++
++    QDBusServiceWatcher m_watcher;
++    QString m_state;
++    struct Caps {
++        bool chat;
++        QDateTime until;
++    };
++    QHash<QString, Caps> m_caps;
++};
+-- 
+2.56.0
+

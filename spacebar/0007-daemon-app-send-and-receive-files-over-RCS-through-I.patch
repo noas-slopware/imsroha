@@ -1,0 +1,723 @@
+From 85b1ed3975e0170ac9827c11e647d6d92e7d9372 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 21:15:11 +0900
+Subject: [PATCH] daemon, app: send and receive files over RCS through IMSroha
+
+A file to one number whose capabilities say chat and ft-http goes with
+IMSroha's SendFile, each file as an RCS message of its own and any text
+after them as an RCS chat message, with sent, delivered and displayed as
+for text. The first file keeps the id the app shows the message under.
+Each file is also copied into the conversation's attachments, the way a
+sent MMS keeps its parts, so it looks like one. SendFile refusing the
+first file sends the whole message as MMS, as before; refusing a later
+one sends that file as MMS of its own, and so does a failed status
+before sent (the upload failed). Several recipients, or no IMSroha, go
+the MMS way unchanged.
+
+A received file (FileReceived) is moved from IMSroha's download
+directory, which it creates as the directory's owner, into the
+conversation's attachments and stored like an MMS part, with transport
+rcs and the usual notification. Its thumbnail is removed: the
+conversation shows the file itself. Reading the chat sends the displayed
+notification, as for text. A file that did not arrive
+(FileReceiveFailed) becomes a short notice saying why, with no displayed
+notification for it.
+
+sendMessage now does its work in a member coroutine that takes copies,
+not in a capturing lambda: the lambda is destroyed at the first
+co_await and its captures with it, which a file send (several co_awaits
+before the message is built) crashed on. The coroutines started from
+IMSroha's signals take their arguments by value for the same reason.
+
+The app adds a message it does not have yet when the daemon updates it
+(the extra messages of an RCS send), and picks up a message's transport
+when it changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ daemon/channellogger.cpp | 313 ++++++++++++++++++++++++++++++++++-----
+ daemon/channellogger.h   |  14 +-
+ daemon/rcstransport.cpp  |  95 ++++++++++--
+ daemon/rcstransport.h    |  35 ++++-
+ src/messagemodel.cpp     |  28 ++++
+ 5 files changed, 437 insertions(+), 48 deletions(-)
+
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index f774d7c..faf90ca 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -12,8 +12,17 @@
+ #include <QCoroFuture>
+ #include <QDBusConnection>
+ #include <QDBusReply>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
+ #include <QLocale>
++#include <QMimeDatabase>
++#include <QStandardPaths>
+ #include <QTimer>
++#include <QUrl>
+ #include <QtConcurrent>
+ 
+ #include <KIO/CommandLauncherJob>
+@@ -27,6 +36,81 @@
+ #include <QCoroDBusPendingReply>
+ #include <QCoroFuture>
+ 
++#include <algorithm>
++
++// The conversation's attachment folder, where the app looks for its files.
++static QString attachmentsFolder(const PhoneNumberList &phoneNumberList)
++{
++    const QString folder = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + SL("/spacebar/attachments/")
++        + QString::number(hash(phoneNumberList.toString()));
++    QDir().mkpath(folder);
++    return folder;
++}
++
++// A file the app hands over for sending ("file://..."), as a local path.
++static QString localPath(const QString &file)
++{
++    const QUrl url(file);
++    return url.isLocalFile() ? url.toLocalFile() : file;
++}
++
++// Puts a file into the conversation's attachment folder under a new name, as
++// MMS does with its parts (moving it when it is ours to take, copying it
++// otherwise), and describes it the way MMS attachments are described.
++static QJsonObject storeAttachment(const PhoneNumberList &phoneNumberList, const QString &path, const QString &contentType, bool move)
++{
++    const QFileInfo info(path);
++    if (!info.isAbsolute() || info.isSymLink() || !info.isFile()) {
++        return {};
++    }
++    QMimeDatabase db;
++    QMimeType mime = db.mimeTypeForFile(path);
++    if (mime.isDefault() && !contentType.isEmpty()) {
++        const QMimeType given = db.mimeTypeForName(contentType);
++        if (given.isValid()) {
++            mime = given;
++        }
++    }
++    const QString suffix = mime.preferredSuffix();
++    const QString fileName = Database::generateRandomId() + (suffix.isEmpty() ? QString() : SL(".") + suffix);
++    const QString target = attachmentsFolder(phoneNumberList) + SL("/") + fileName;
++    if (!(move ? QFile::rename(path, target) : QFile::copy(path, target))) {
++        qDebug() << "Could not store" << path << "as" << target;
++        return {};
++    }
++    return QJsonObject{
++        {SL("name"), info.fileName()},
++        {SL("fileName"), fileName},
++        {SL("size"), QFileInfo(target).size()},
++        {SL("mimeType"), mime.name()},
++        {SL("iconName"), mime.iconName()},
++        {SL("text"), QString()},
++    };
++}
++
++static QString attachmentJson(const QJsonObject &attachment)
++{
++    return QString::fromUtf8(QJsonDocument(QJsonArray{attachment}).toJson(QJsonDocument::Compact));
++}
++
++// What the conversation says when a file was sent to us over RCS but did
++// not arrive.
++static QString rcsFileFailedText(const QString &reason)
++{
++    if (reason == u"expired") {
++        return i18nc("@info RCS file transfer", "A file was sent to you, but it expired before it could be downloaded.");
++    } else if (reason == u"too-large") {
++        return i18nc("@info RCS file transfer", "A file was sent to you, but it is too large to download.");
++    } else if (reason == u"unauthorized") {
++        return i18nc("@info RCS file transfer", "A file was sent to you, but the server refused to hand it out.");
++    } else if (reason == u"gone") {
++        return i18nc("@info RCS file transfer", "A file was sent to you, but it is no longer on the server.");
++    } else if (reason == u"invalid") {
++        return i18nc("@info RCS file transfer", "A file was sent to you, but its description could not be read.");
++    }
++    return i18nc("@info RCS file transfer", "A file was sent to you, but downloading it failed.");
++}
++
+ static bool isScreenSaverActive()
+ {
+     bool active = false;
+@@ -90,6 +174,34 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+     connect(&m_rcs, &RcsTransport::composingChanged, this, [this](const QString &number, bool active) {
+         Q_EMIT composingChanged(PhoneNumberList(number).toString(), active);
+     });
++    connect(&m_rcs,
++            &RcsTransport::fileReceived,
++            this,
++            [this](const QString &number,
++                   const QString &messageId,
++                   const QString &path,
++                   const QString &contentType,
++                   qulonglong size,
++                   const QString &thumbnailPath,
++                   const QDateTime &time) {
++                handleRcsFile(number, messageId, path, contentType, size, thumbnailPath, time);
++            });
++    connect(&m_rcs, &RcsTransport::fileReceiveFailed, this, [this](const QString &number, const QString &messageId, const QString &reason) {
++        // No messageId: nothing was displayed, so no displayed notification goes back.
++        qDebug() << "RCS: file" << messageId << "from" << number << "not received:" << reason;
++        saveMessage(PhoneNumberList(number),
++                    QDateTime::currentDateTime(),
++                    rcsFileFailedText(reason),
++                    QString(),
++                    QString(),
++                    QString(),
++                    QString(),
++                    false,
++                    QString(),
++                    QDateTime(),
++                    0,
++                    SL("rcs"));
++    });
+ }
+ 
+ void ChannelLogger::checkMessages()
+@@ -421,44 +533,62 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+ 
+ void ChannelLogger::sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize)
+ {
+-    PhoneNumberList phoneNumberList = PhoneNumberList(numbers);
++    sendMessageTask(PhoneNumberList(numbers), id, text, files, totalSize);
++}
+ 
+-    [this, phoneNumberList, id, text, files, totalSize]() -> QCoro::Task<void> {
+-        QString result;
++// A member taking copies, not a capturing lambda: the lambda is gone at the
++// first co_await, and its captures with it.
++QCoro::Task<void>
++ChannelLogger::sendMessageTask(const PhoneNumberList phoneNumberList, const QString id, const QString text, const QStringList files, const qint64 totalSize)
++{
++    QString result;
++    // RCS file transfer: one recipient who takes files, and only files
++    std::optional<QString> rcsResult;
++    if (phoneNumberList.size() == 1 && !files.isEmpty() && m_rcs.isRegistered()
++        && std::all_of(files.cbegin(),
++                       files.cend(),
++                       [](const QString &file) {
++                           const QFileInfo info(localPath(file));
++                           return info.isAbsolute() && info.isFile() && info.size() > 0;
++                       })
++        && co_await m_rcs.canSendFile(phoneNumberList.first().toE164())) {
++        rcsResult = co_await sendFilesRCS(phoneNumberList, id, text, files);
++    }
++    if (rcsResult) {
++        result = *rcsResult;
++    } else if (phoneNumberList.size() > 1 || files.length() > 0) {
+         // check if it is a MMS message
+-        if (phoneNumberList.size() > 1 || files.length() > 0) {
+-            if (SettingsManager::self()->groupConversation()) {
+-                sendMessageMMS(phoneNumberList, id, text, files, totalSize);
+-            } else {
+-                // send as individual messages
+-                for (const auto &phoneNumber : phoneNumberList) {
+-                    if (files.length() > 0) {
+-                        sendMessageMMS(PhoneNumberList(phoneNumber.toInternational()), Database::generateRandomId(), text, files, totalSize);
+-                    } else {
+-                        result = co_await sendMessageSMS(phoneNumber, Database::generateRandomId(), text);
+-                    }
++        if (SettingsManager::self()->groupConversation()) {
++            sendMessageMMS(phoneNumberList, id, text, files, totalSize);
++        } else {
++            // send as individual messages
++            for (const auto &phoneNumber : phoneNumberList) {
++                if (files.length() > 0) {
++                    sendMessageMMS(PhoneNumberList(phoneNumber.toInternational()), Database::generateRandomId(), text, files, totalSize);
++                } else {
++                    result = co_await sendMessageSMS(phoneNumber, Database::generateRandomId(), text);
+                 }
+-
+-                // update delivery status of original message
+-                Message message;
+-                message.id = id;
+-                message.phoneNumberList = phoneNumberList;
+-                message.datetime = QDateTime::currentDateTime();
+-                message.deliveryStatus = MessageState::Sent;
+-                updateMessage(message);
+             }
+-        } else if (m_rcs.isRegistered() && co_await m_rcs.canChat(phoneNumberList.first().toE164())) {
+-            result = co_await sendMessageRCS(phoneNumberList.first(), id, text);
+-        } else {
+-            result = co_await sendMessageSMS(phoneNumberList.first(), id, text);
+-        }
+ 
+-        if (result.isEmpty()) {
+-            qDebug() << "Message sent successfully";
+-        } else {
+-            qDebug() << "Failed successfully" << result;
++            // update delivery status of original message
++            Message message;
++            message.id = id;
++            message.phoneNumberList = phoneNumberList;
++            message.datetime = QDateTime::currentDateTime();
++            message.deliveryStatus = MessageState::Sent;
++            updateMessage(message);
+         }
+-    }();
++    } else if (m_rcs.isRegistered() && co_await m_rcs.canChat(phoneNumberList.first().toE164())) {
++        result = co_await sendMessageRCS(phoneNumberList.first(), id, text);
++    } else {
++        result = co_await sendMessageSMS(phoneNumberList.first(), id, text);
++    }
++
++    if (result.isEmpty()) {
++        qDebug() << "Message sent successfully";
++    } else {
++        qDebug() << "Failed successfully" << result;
++    }
+ }
+ 
+ void ChannelLogger::sendTapback(const QString &numbers, const QString &id, const QString &tapback, const bool &isRemoved)
+@@ -486,6 +616,9 @@ QCoro::Task<QString> ChannelLogger::sendMessageRCS(const PhoneNumber &phoneNumbe
+     message.deliveryStatus = MessageState::Pending;
+     message.transport = SL("rcs");
+     co_await addMessage(message);
++    // the open conversation: marked as chat now, or added when it is not the
++    // message the app sent (a text after files)
++    updateMessage(message);
+ 
+     const auto rcsId = co_await m_rcs.send(phoneNumber.toE164(), text);
+     if (!rcsId) {
+@@ -497,7 +630,103 @@ QCoro::Task<QString> ChannelLogger::sendMessageRCS(const PhoneNumber &phoneNumbe
+     co_return QString();
+ }
+ 
+-QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString &messageId, const QString &status)
++QCoro::Task<std::optional<QString>>
++ChannelLogger::sendFilesRCS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files)
++{
++    // Every file is a message of its own, and so is the text, after them. The
++    // first one takes the id the app shows the message under. Nothing when
++    // RCS did not take the first file: then it all goes the MMS way.
++    const QString e164 = phoneNumberList.first().toE164();
++    bool first = true;
++    for (const auto &file : files) {
++        const QString path = localPath(file);
++        const QJsonObject attachment = storeAttachment(phoneNumberList, path, QString(), false);
++        std::optional<QString> rcsId;
++        if (!attachment.isEmpty()) {
++            // under its own name, which the other side sees
++            rcsId = co_await m_rcs.sendFile(e164, path);
++        }
++        if (!rcsId) {
++            if (!attachment.isEmpty()) {
++                QFile::remove(attachmentsFolder(phoneNumberList) + SL("/") + attachment.value(SL("fileName")).toString());
++            }
++            if (first) {
++                co_return std::nullopt;
++            }
++            // Some went already: this one goes as MMS of its own.
++            co_await sendMessageMMS(phoneNumberList, Database::generateRandomId(), QString(), {file}, QFileInfo(path).size());
++            continue;
++        }
++
++        Message message;
++        message.id = first ? id : Database::generateRandomId();
++        message.phoneNumberList = phoneNumberList;
++        message.datetime = QDateTime::currentDateTime();
++        message.read = true;
++        message.sentByMe = true;
++        message.deliveryStatus = MessageState::Pending;
++        message.attachments = attachmentJson(attachment);
++        message.messageId = *rcsId;
++        message.transport = SL("rcs");
++        co_await addMessage(message);
++        updateMessage(message);
++        first = false;
++    }
++
++    if (!text.isEmpty()) {
++        co_return co_await sendMessageRCS(phoneNumberList.first(), Database::generateRandomId(), text);
++    }
++    co_return QString();
++}
++
++QCoro::Task<void> ChannelLogger::handleRcsFile(const QString number,
++                                               const QString messageId,
++                                               const QString path,
++                                               const QString contentType,
++                                               qulonglong size,
++                                               const QString thumbnailPath,
++                                               const QDateTime time)
++{
++    Q_UNUSED(size);
++    const PhoneNumberList phoneNumberList(number);
++    // The conversation shows the file itself, so its thumbnail has no use.
++    if (!thumbnailPath.isEmpty() && QFileInfo(thumbnailPath).absolutePath() == QFileInfo(path).absolutePath()) {
++        QFile::remove(thumbnailPath);
++    }
++    // IMSroha created it as the owner of its download directory: us. It
++    // moves into Spacebar's attachments, like an MMS part.
++    const QJsonObject attachment = storeAttachment(phoneNumberList, path, contentType, true);
++    if (attachment.isEmpty()) {
++        qDebug() << "RCS: file" << messageId << "from" << number << "could not be taken from" << path;
++        co_await saveMessage(phoneNumberList,
++                             time,
++                             rcsFileFailedText(SL("failed")),
++                             QString(),
++                             QString(),
++                             QString(),
++                             QString(),
++                             false,
++                             QString(),
++                             QDateTime(),
++                             0,
++                             SL("rcs"));
++        co_return;
++    }
++    co_await saveMessage(phoneNumberList,
++                         time,
++                         QString(),
++                         attachmentJson(attachment),
++                         QString(),
++                         QString(),
++                         messageId,
++                         false,
++                         QString(),
++                         QDateTime(),
++                         0,
++                         SL("rcs"));
++}
++
++QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString messageId, const QString status)
+ {
+     const auto id = co_await m_database.idForMessageId(messageId);
+     if (!id) {
+@@ -515,6 +744,24 @@ QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString &messageId, const
+         co_await m_database.updateMessageDeliveryReport(messageId);
+     } else if (status == SL("displayed")) {
+         co_await m_database.updateMessageReadReport(messageId, message.phoneNumberList.first());
++    } else if (status == SL("failed") && message.deliveryStatus != MessageState::Sent && !message.attachments.isEmpty()) {
++        // A file that did not go (the upload failed): it goes as MMS, which
++        // stores the attachments its own way.
++        qDebug() << "RCS: file" << messageId << "failed, sending it as MMS";
++        const QString folder = attachmentsFolder(message.phoneNumberList);
++        QStringList files;
++        qint64 totalSize = 0;
++        const QJsonArray items = QJsonDocument::fromJson(message.attachments.toUtf8()).array();
++        for (const auto &item : items) {
++            files.append(QUrl::fromLocalFile(folder + SL("/") + item.toObject().value(SL("fileName")).toString()).toString());
++            totalSize += item.toObject().value(SL("size")).toInteger();
++        }
++        co_await m_database.deleteMessage(*id);
++        co_await sendMessageMMS(message.phoneNumberList, *id, message.text, files, totalSize);
++        for (const auto &file : std::as_const(files)) {
++            QFile::remove(QUrl(file).toLocalFile());
++        }
++        co_return;
+     } else if (status == SL("failed") && message.deliveryStatus != MessageState::Sent) {
+         // Not delivered over RCS (no session, the far end is gone): fall back to SMS.
+         qDebug() << "RCS: message" << messageId << "failed, sending it as SMS";
+diff --git a/daemon/channellogger.h b/daemon/channellogger.h
+index 3ae138d..6c0b258 100644
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -82,9 +82,21 @@ private:
+                                   const QDateTime &expires = QDateTime(),
+                                   const int size = 0,
+                                   const QString &transport = QString());
++    QCoro::Task<void>
++    sendMessageTask(const PhoneNumberList phoneNumberList, const QString id, const QString text, const QStringList files, const qint64 totalSize);
+     QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, bool addToDatabase = true);
+     QCoro::Task<QString> sendMessageRCS(const PhoneNumber &phoneNumber, const QString &id, const QString &text);
+-    QCoro::Task<void> handleRcsStatus(const QString &messageId, const QString &status);
++    // Coroutines started from a signal take copies: the arguments are gone
++    // at their first co_await.
++    QCoro::Task<void> handleRcsStatus(const QString messageId, const QString status);
++    QCoro::Task<std::optional<QString>> sendFilesRCS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files);
++    QCoro::Task<void> handleRcsFile(const QString number,
++                                    const QString messageId,
++                                    const QString path,
++                                    const QString contentType,
++                                    qulonglong size,
++                                    const QString thumbnailPath,
++                                    const QDateTime time);
+     QCoro::Task<QString>
+     sendMessageMMS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files, const qint64 totalSize);
+     QCoro::Task<void> sendCancelResponse(const QString &transactionId);
+diff --git a/daemon/rcstransport.cpp b/daemon/rcstransport.cpp
+index 6c05a6f..1908ff8 100644
+--- a/daemon/rcstransport.cpp
++++ b/daemon/rcstransport.cpp
+@@ -29,6 +29,13 @@ RcsTransport::RcsTransport(QObject *parent)
+     bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("MessageStatusChanged"), this, SLOT(onStatusChanged(QString, QString)));
+     bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("ComposingChanged"), this, SLOT(onComposingChanged(QString, bool)));
+     bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("StateChanged"), this, SLOT(onStateChanged(QString)));
++    bus.connect(RCS_SERVICE,
++                RCS_PATH,
++                RCS_IFACE,
++                SL("FileReceived"),
++                this,
++                SLOT(onFileReceived(QString, QString, QString, QString, qulonglong, QString, qlonglong)));
++    bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("FileReceiveFailed"), this, SLOT(onFileReceiveFailed(QString, QString, QString)));
+ 
+     connect(&m_watcher, &QDBusServiceWatcher::serviceOwnerChanged, this, [this](const QString &, const QString &, const QString &newOwner) {
+         m_caps.clear();
+@@ -73,14 +80,33 @@ void RcsTransport::onStateChanged(const QString &state)
+ 
+ QCoro::Task<bool> RcsTransport::canChat(const QString &e164)
+ {
+-    const auto now = QDateTime::currentDateTimeUtc();
+     const auto cached = m_caps.constFind(e164);
+-    if (cached != m_caps.constEnd() && cached->until > now) {
++    if (cached != m_caps.constEnd() && cached->until > QDateTime::currentDateTimeUtc()) {
+         co_return cached->chat;
+     }
+     if (!isRegistered()) {
+         co_return false;
+     }
++    const Caps caps = co_await fetchCapabilities(e164);
++    co_return caps.chat;
++}
++
++QCoro::Task<bool> RcsTransport::canSendFile(const QString &e164)
++{
++    const auto cached = m_caps.constFind(e164);
++    if (cached != m_caps.constEnd() && cached->until > QDateTime::currentDateTimeUtc() && (cached->ftKnown || !cached->chat)) {
++        co_return cached->chat && cached->ft;
++    }
++    if (!isRegistered()) {
++        co_return false;
++    }
++    const Caps caps = co_await fetchCapabilities(e164);
++    co_return caps.chat && caps.ft;
++}
++
++QCoro::Task<RcsTransport::Caps> RcsTransport::fetchCapabilities(const QString &e164)
++{
++    const auto now = QDateTime::currentDateTimeUtc();
+     QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("GetCapabilities"));
+     call << e164;
+     // The message waits for this answer: not longer than a few seconds.
+@@ -89,14 +115,31 @@ QCoro::Task<bool> RcsTransport::canChat(const QString &e164)
+     if (!reply.isValid()) {
+         qDebug() << "RCS: capabilities of" << e164 << reply.error().message();
+         // Unknown: SMS for a minute, then ask again.
+-        m_caps.insert(e164, Caps{false, now.addSecs(60)});
+-        co_return false;
++        const Caps caps{false, false, true, now.addSecs(60)};
++        m_caps.insert(e164, caps);
++        co_return caps;
++    }
++    const auto values = reply.value();
++    const bool known = values.value(SL("known")).toBool();
++    const bool chat = values.value(SL("chat")).toBool();
++    const bool ft = values.value(SL("ft-http")).toBool();
++    const Caps caps{chat, ft, true, now.addSecs(!known ? 60 : chat ? 86400 : 600)};
++    m_caps.insert(e164, caps);
++    co_return caps;
++}
++
++void RcsTransport::sawChat(const QString &number, bool file)
++{
++    // Whoever chats with us can chat, and whoever sends a file can take one.
++    // A text says nothing about files: what is known about those stays.
++    const auto now = QDateTime::currentDateTimeUtc();
++    const auto it = m_caps.find(number);
++    if (it == m_caps.end() || it->until <= now || !it->chat) {
++        m_caps.insert(number, Caps{true, file, file, now.addSecs(86400)});
++    } else if (file) {
++        it->ft = true;
++        it->ftKnown = true;
+     }
+-    const auto caps = reply.value();
+-    const bool known = caps.value(SL("known")).toBool();
+-    const bool chat = caps.value(SL("chat")).toBool();
+-    m_caps.insert(e164, Caps{chat, now.addSecs(!known ? 60 : chat ? 86400 : 600)});
+-    co_return chat;
+ }
+ 
+ QCoro::Task<std::optional<QString>> RcsTransport::send(const QString &e164, const QString &text)
+@@ -112,6 +155,19 @@ QCoro::Task<std::optional<QString>> RcsTransport::send(const QString &e164, cons
+     co_return reply.value();
+ }
+ 
++QCoro::Task<std::optional<QString>> RcsTransport::sendFile(const QString &e164, const QString &path)
++{
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("SendFile"));
++    call << e164 << path;
++    const QDBusPendingReply<QString> pending = QDBusConnection::systemBus().asyncCall(call);
++    const QDBusPendingReply<QString> reply = co_await pending;
++    if (!reply.isValid()) {
++        qDebug() << "RCS: SendFile to" << e164 << reply.error().message();
++        co_return std::nullopt;
++    }
++    co_return reply.value();
++}
++
+ void RcsTransport::setComposing(const QString &e164, bool active)
+ {
+     if (!isRegistered()) {
+@@ -134,8 +190,7 @@ void RcsTransport::markDisplayed(const QString &e164, const QString &messageId)
+ 
+ void RcsTransport::onMessageReceived(const QString &number, const QString &messageId, const QString &text, qlonglong timestampMs)
+ {
+-    // Whoever chats with us can chat.
+-    m_caps.insert(number, Caps{true, QDateTime::currentDateTimeUtc().addSecs(86400)});
++    sawChat(number, false);
+     Q_EMIT messageReceived(number, messageId, text, QDateTime::fromMSecsSinceEpoch(timestampMs));
+ }
+ 
+@@ -148,3 +203,21 @@ void RcsTransport::onComposingChanged(const QString &number, bool active)
+ {
+     Q_EMIT composingChanged(number, active);
+ }
++
++void RcsTransport::onFileReceived(const QString &number,
++                                  const QString &messageId,
++                                  const QString &path,
++                                  const QString &contentType,
++                                  qulonglong size,
++                                  const QString &thumbnailPath,
++                                  qlonglong timestampMs)
++{
++    sawChat(number, true);
++    Q_EMIT fileReceived(number, messageId, path, contentType, size, thumbnailPath, QDateTime::fromMSecsSinceEpoch(timestampMs));
++}
++
++void RcsTransport::onFileReceiveFailed(const QString &number, const QString &messageId, const QString &reason)
++{
++    sawChat(number, true);
++    Q_EMIT fileReceiveFailed(number, messageId, reason);
++}
+diff --git a/daemon/rcstransport.h b/daemon/rcstransport.h
+index 2d4b92b..9d0be2d 100644
+--- a/daemon/rcstransport.h
++++ b/daemon/rcstransport.h
+@@ -14,7 +14,7 @@
+ #include <optional>
+ 
+ /*
+- * RCS chat through IMSroha's codes.noa.IMSroha.Rcs on the system bus.
++ * RCS chat and file transfer through IMSroha's codes.noa.IMSroha.Rcs on the system bus.
+  * Inert while that service is absent or not registered: then everything goes
+  * the SMS/MMS way through ModemManager, as before.
+  */
+@@ -30,8 +30,13 @@ public:
+     // OPTIONS), cached a day when it can, ten minutes when it cannot, and a
+     // minute when nobody answered within 5 s.
+     QCoro::Task<bool> canChat(const QString &e164);
++    // Whether the number can take a file (chat and ft-http), cached the same way.
++    QCoro::Task<bool> canSendFile(const QString &e164);
+     // The imdn.Message-ID, or nothing when RCS refused it (send it as SMS then).
+     QCoro::Task<std::optional<QString>> send(const QString &e164, const QString &text);
++    // The same for a file: IMSroha opens path with our rights and uploads it;
++    // nothing when it refused (not registered, too large: send it as MMS then).
++    QCoro::Task<std::optional<QString>> sendFile(const QString &e164, const QString &path);
+     void setComposing(const QString &e164, bool active);
+     void markDisplayed(const QString &e164, const QString &messageId);
+ 
+@@ -40,22 +45,46 @@ Q_SIGNALS:
+     // "sent", "delivered", "displayed" or "failed"
+     void statusChanged(const QString &messageId, const QString &status);
+     void composingChanged(const QString &number, bool active);
++    // A file is in IMSroha's download directory (path, and a thumbnail or "").
++    void fileReceived(const QString &number,
++                      const QString &messageId,
++                      const QString &path,
++                      const QString &contentType,
++                      qulonglong size,
++                      const QString &thumbnailPath,
++                      const QDateTime &time);
++    // A file was sent to us but not fetched: "expired", "too-large",
++    // "unauthorized", "gone", "invalid" or "failed".
++    void fileReceiveFailed(const QString &number, const QString &messageId, const QString &reason);
+ 
+ private Q_SLOTS:
+     void onMessageReceived(const QString &number, const QString &messageId, const QString &text, qlonglong timestampMs);
+     void onStatusChanged(const QString &messageId, const QString &status);
+     void onComposingChanged(const QString &number, bool active);
++    void onFileReceived(const QString &number,
++                        const QString &messageId,
++                        const QString &path,
++                        const QString &contentType,
++                        qulonglong size,
++                        const QString &thumbnailPath,
++                        qlonglong timestampMs);
++    void onFileReceiveFailed(const QString &number, const QString &messageId, const QString &reason);
+     void onStateChanged(const QString &state);
+ 
+ private:
+     void connectService();
+     void fetchState();
+ 
+-    QDBusServiceWatcher m_watcher;
+-    QString m_state;
+     struct Caps {
+         bool chat;
++        bool ft; // ft-http
++        bool ftKnown; // from GetCapabilities or a file, not only from a text
+         QDateTime until;
+     };
++    QCoro::Task<Caps> fetchCapabilities(const QString &e164);
++    void sawChat(const QString &number, bool file);
++
++    QDBusServiceWatcher m_watcher;
++    QString m_state;
+     QHash<QString, Caps> m_caps;
+ };
+diff --git a/src/messagemodel.cpp b/src/messagemodel.cpp
+index 35344cb..366a0ac 100644
+--- a/src/messagemodel.cpp
++++ b/src/messagemodel.cpp
+@@ -11,6 +11,8 @@
+ #include <QMimeDatabase>
+ #include <QMimeType>
+ 
++#include <algorithm>
++
+ #include <contactphonenumbermapper.h>
+ #include <database.h>
+ #include <global.h>
+@@ -129,6 +131,7 @@ void MessageModel::fetchUpdatedMessage(const QString &id)
+         message->deliveryReport = messages.front().deliveryReport;
+         message->readReport = messages.front().readReport;
+         message->tapbacks = messages.front().tapbacks;
++        message->transport = messages.front().transport;
+ 
+         Q_EMIT dataChanged(index(i), index(i));
+     }
+@@ -282,6 +285,31 @@ void MessageModel::messageUpdated(const QString &numbers, const QString &id)
+         return; // Message is not for this model
+     }
+ 
++    const bool known = std::any_of(m_messages.cbegin(), m_messages.cend(), [&id](const Message &message) {
++        return message.id == id;
++    });
++    if (!known) {
++        // One the daemon added to what we sent: RCS sends every file, and
++        // the text, as a message of its own. An older one is not loaded yet
++        // (the conversation opens with the last 30) and stays where it is.
++        const StringMapList serializedMessages = m_handler.interface()->messagesForNumber(m_phoneNumberList.toStringList(), id, 0);
++        if (serializedMessages.size() != 1) {
++            return;
++        }
++        const Message message{serializedMessages.front()};
++        const auto newest = std::find_if(m_messages.cbegin(), m_messages.cend(), [](const Message &m) {
++            return m.datetime.isValid();
++        });
++        if (newest != m_messages.cend() && message.datetime < newest->datetime) {
++            return;
++        }
++        beginInsertRows({}, m_messages.size(), m_messages.size());
++        m_messages.insert(m_messages.begin(), message);
++        endInsertRows();
++        Q_EMIT m_handler.messagesChanged(m_phoneNumberList);
++        return;
++    }
++
+     fetchUpdatedMessage(id);
+ }
+ 
+-- 
+2.56.0
+
