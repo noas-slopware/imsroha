@@ -49,7 +49,7 @@ void ft_config_from_xml(const struct acs_xml *x, struct ft_config *c)
 	c->aut_accept = (v = xv(x, "ftAutAccept")) ? atoi(v) : 0;
 	/*
 	 * What a peer may send us: the incoming limit when the server gives one
-	 * (stock's MaxSizeFileTrIncoming), else the larger of the two upload
+	 * (stock ConfigConstants IM_MAX_SIZE_FILE_TR_INCOMING), else the larger of the two upload
 	 * limits, since a peer on this network uploads to the same servers.
 	 */
 	int have;
@@ -60,7 +60,7 @@ void ft_config_from_xml(const struct acs_xml *x, struct ft_config *c)
 		c->incoming_max = c->extra_max ? MAX(c->extra_max, c->max_size) : 0;
 	else
 		c->incoming_max = c->max_size;
-	/* ftAuth: 0 the user may not use file transfer, 1 may (RCC.07 A.1.4). */
+	/* ftAuth: 0 the user may not use file transfer, 1 may (R9 table B.2-1). */
 	v = xv(x, "ftAuth");
 	c->enabled = v && atoi(v) == 1 && c->cs_uri[0] && !strncmp(c->cs_uri, "http", 4);
 }
@@ -77,23 +77,45 @@ const char *ft_upload_uri(const struct ft_config *c, guint64 size)
 	return NULL;
 }
 
-static int same_server(const char *a, const char *b)
+static int host_of(const char *url, char *host, size_t size, int *tls)
 {
-	char ha[256], hb[256], pa[512], pb[512];
-	uint16_t qa, qb;
-	int ta, tb;
-	if (!a[0] || !b[0] || http_parse_url(a, &ta, ha, sizeof(ha), &qa, pa, sizeof(pa)) < 0 ||
-	    http_parse_url(b, &tb, hb, sizeof(hb), &qb, pb, sizeof(pb)) < 0)
-		return 0;
-	return ta && tb && qa == qb && !g_ascii_strcasecmp(ha, hb);
+	char path[1024];
+	uint16_t port;
+	return url && url[0] && http_parse_url(url, tls, host, size, &port, path, sizeof(path)) == 0;
+}
+
+static int host_listed(const char *list, const char *host)
+{
+	int hit = 0;
+	char **l = g_strsplit(list, ",", -1);
+	for (int i = 0; l[i] && !hit; i++) {
+		const char *e = g_strstrip(l[i]);
+		size_t el = strlen(e), hl = strlen(host);
+		if (!el)
+			continue;
+		if (e[0] == '.')
+			hit = hl > el && !g_ascii_strcasecmp(host + hl - el, e);
+		else
+			hit = !g_ascii_strcasecmp(host, e);
+	}
+	g_strfreev(l);
+	return hit;
 }
 
 int ft_url_trusted(const struct ft_config *c, const char *url)
 {
-	return url && (same_server(url, c->cs_uri) || same_server(url, c->extra_uri));
+	char h[256], hc[256];
+	int tls, t2;
+	if (!host_of(url, h, sizeof(h), &tls) || (!tls && !c->auth_http))
+		return 0;
+	/* The host, not the port: the same name is the same operator's server. */
+	if ((host_of(c->cs_uri, hc, sizeof(hc), &t2) && !g_ascii_strcasecmp(h, hc)) ||
+	    (host_of(c->extra_uri, hc, sizeof(hc), &t2) && !g_ascii_strcasecmp(h, hc)))
+		return 1;
+	return host_listed(c->auth_hosts, h);
 }
 
-/* ---- the file-info document (RCC.07 4.1.x, R9 7.4.1.1.1's example) ------- */
+/* ---- the file-info document (R9 7.4.1.1.1's example, stock FtHttpXmlParser) - */
 
 struct info_ctx {
 	struct ft_info *f;

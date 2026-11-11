@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 /*
- * File transfer over HTTP in the daemon (RCC.07 3.2.5, R9 7.4.1.1): SendFile
+ * File transfer over HTTP in the daemon (GSMA RCC.07, R9 7.4.1.1): SendFile
  * uploads to the content server and sends the file-info it answers with as a
  * chat message; a file-info that comes in a chat is fetched into the
  * download directory and announced with FileReceived. The HTTP work blocks,
@@ -22,6 +22,7 @@
 #include "cpim.h"
 #include "fthttp.h"
 #include "rcsd.h"
+#include "sipmsg.h"
 #include "sipua.h"
 
 /* Neither the configuration nor the file-info says how big: no more than this. */
@@ -105,6 +106,8 @@ static const char *user_for(const struct ft_job *j, const char *url)
 void rcsd_ft_load(struct rcsd *r)
 {
 	ft_config_from_xml(r->xml, &r->ft);
+	g_strlcpy(r->ft.auth_hosts, r->cfg.ft_auth_hosts, sizeof(r->ft.auth_hosts));
+	r->ft.auth_http = r->cfg.ft_auth_http;
 	if (!r->ft.enabled) {
 		fprintf(stderr, "imsroha-rcs: file transfer: not provisioned (ftAuth, ftHTTPCSURI)\n");
 		return;
@@ -394,13 +397,18 @@ struct create_req {
 static int create_fn(void *p)
 {
 	struct create_req *c = p;
+	/* Exclusive: a part name is never another transfer's (it has a random part). */
 	c->fd = openat(c->dirfd, c->name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-	if (c->fd < 0 && errno == EEXIST) {
-		/* A part file left by an earlier run. */
-		unlinkat(c->dirfd, c->name, 0);
-		c->fd = openat(c->dirfd, c->name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-	}
 	return c->fd < 0 ? -errno : 0;
+}
+
+/* ".<id>.<random><suffix>": two file-infos with the same (or the same
+ * filtered) Message-ID never write into each other's part file. */
+static void part_name(char *out, size_t size, const char *sid, const char *suffix)
+{
+	char rnd[13];
+	sip_random(rnd, 12);
+	snprintf(out, size, ".%s.%s%s", sid, rnd, suffix);
 }
 
 /* name, then "stem (2).ext", "stem (3).ext"...: never over an existing file. */
@@ -486,20 +494,20 @@ static void download_thread(GTask *t, gpointer src, gpointer data, GCancellable 
 		g_task_return_boolean(t, TRUE);
 		return;
 	}
-	char sid[48], part[64];
+	char sid[48], part[96], *thumb_name = NULL;
 	safe_id(j->id, sid, sizeof(sid));
 
 	/* The thumbnail first: small, and the app can show it while the file comes. */
 	const struct ft_part *th = &j->info.thumb;
 	if (th->present && th->url && (!th->size || th->size <= FT_THUMB_MAX)) {
-		snprintf(part, sizeof(part), ".%s.thumb.part", sid);
+		part_name(part, sizeof(part), sid, ".thumb.part");
 		char *tname = g_strdup_printf("thumb-%s.%s", sid, thumb_ext(th->ctype));
 		int tr;
 		char *got = fetch(j, m.dirfd, th->url, part, tname, th->size ? th->size : FT_THUMB_MAX, cancel, &tr);
 		g_free(tname);
 		if (got) {
 			j->thumb = g_build_filename(j->dir, got, NULL);
-			g_free(got);
+			thumb_name = got;
 		} else {
 			fprintf(stderr, "imsroha-rcs: file %s: no thumbnail: %s\n", j->id, j->err);
 			j->err[0] = '\0';
@@ -510,17 +518,22 @@ static void download_thread(GTask *t, gpointer src, gpointer data, GCancellable 
 	char *name = ft_safe_name(fp->name);
 	if (!name)
 		name = g_strdup_printf("file-%s", sid);
-	snprintf(part, sizeof(part), ".%s.part", sid);
+	part_name(part, sizeof(part), sid, ".part");
 	char *got = fetch(j, m.dirfd, fp->url, part, name, j->max, cancel, &j->result);
 	g_free(name);
-	close(m.dirfd);
 	if (got) {
 		j->path = g_build_filename(j->dir, got, NULL);
 		g_free(got);
 	} else {
 		j->reason = j->result == -EACCES ? "unauthorized" : j->result == -EFBIG ? "too-large"
 			    : j->result == -ENOENT ? "gone" : "failed";
+		/* Nobody is told about a thumbnail without its file. */
+		if (thumb_name)
+			unlinkat(m.dirfd, thumb_name, 0);
+		g_clear_pointer(&j->thumb, g_free);
 	}
+	g_free(thumb_name);
+	close(m.dirfd);
 	g_task_return_boolean(t, TRUE);
 }
 
@@ -601,7 +614,7 @@ void rcsd_ft_received(struct rcsd *r, const char *number, const char *id, const 
 	g_strlcpy(j->number, number, sizeof(j->number));
 	g_strlcpy(j->id, id, sizeof(j->id));
 	/* The limit counts what arrives, not what the file-info claims. */
-	j->max = r->ft.incoming_max ? r->ft.incoming_max : fi.file.size ? fi.file.size : FT_HARD_MAX;
+	j->max = r->ft.incoming_max ? r->ft.incoming_max : fi.file.size ? MIN(fi.file.size, FT_HARD_MAX) : FT_HARD_MAX;
 	int pe = place(j);
 	if (pe < 0) {
 		fprintf(stderr, "imsroha-rcs: file %s: download directory %s: %s\n", id,

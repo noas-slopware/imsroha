@@ -294,7 +294,11 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
 - Standalone messaging (pager mode) is "X" in R9 table 7-1, so Korea gets none. It is
   implemented for receiving (a MESSAGE with CPIM is a chat message) and for IMDNs.
 
-### File transfer over HTTP (RCC.07 3.2.5, R9 7.4.1.1)
+### File transfer over HTTP (GSMA RCC.07, R9 7.4.1.1)
+
+The wire format below is stock's (`UploadFileTask`, `DownloadFileTask`,
+`HttpAuthGenerator`, `FtHttpIncomingMessage` in imsservice.apk) and R9's examples;
+RCC.07 itself was not at hand.
 
 The file goes to the carrier's content server; the chat carries only the file-info
 XML the server answers with (CPIM content type `application/vnd.gsma.rcs-ft-http+xml`,
@@ -325,11 +329,16 @@ offered in the SDP's `accept-wrapped-types` and published as the
   decoded as stock does, no `/`, no leading dot, existing files never replaced:
   `name (2).ext`). What arrives is capped by the limit whatever the file-info or
   Content-Length says. The thumbnail is `thumb-<message-id>.<ext>`.
-- Credentials go only to the configured content servers: a data URL with the same
-  host and port as `ftHTTPCSURI` or `ftHTTPExtraCSURI`, over https. A peer's
-  file-info pointing anywhere else is fetched without them, so it cannot collect a
-  Digest answer for the user's credentials. R9's own example data URLs are plain
-  `http://...:80`; such a URL is fetched, but a 401 on it is not answered.
+- Credentials go only to our content servers: a data URL on the host of
+  `ftHTTPCSURI` or `ftHTTPExtraCSURI`, or on one of the carrier's
+  `rcs-ft-auth-hosts`, over https (also plain http with `rcs-ft-auth-http=true`). A
+  peer's file-info pointing anywhere else is fetched without them, so it cannot
+  collect a Digest answer for the user's credentials; the log names the host whose
+  401 went unanswered. This is stricter than stock (`DownloadFileTask` answers any
+  401) and than R9's sample, whose data URLs are plain `http://rcs-seoul1...:80` on
+  another host than its `ftHTTPCSURI`. Where LG U+'s data URLs point is not known
+  yet: if receiving fails with "unauthorized", that host goes into
+  `rcs-ft-auth-hosts`.
 - Where files go: `[rcs] download-dir=` (for the messaging app: `<dir>/<IMSI>/`), or
   `<state-dir>/<IMSI>/files`, which is root's alone (the state directory is 0700).
 - imsroha-rcs runs as root and any local user may call it (the bus policy), so it
@@ -376,7 +385,8 @@ package) comes later on the same interface.
 
 `rcs-acs-url`, `rcs-otp-port`, `rcs-otp-type`, `rcs-otp-regex`, `rcs-profile`,
 `rcs-provisioning-version`, `rcs-version`, `rcs-app`, `rcs-user-agent`,
-`rcs-http-user-agent`, `rcs-sip-port`, `rcs-iscomposing-cpim`, `rcs-standalone`. The
+`rcs-http-user-agent`, `rcs-sip-port`, `rcs-iscomposing-cpim`, `rcs-standalone`,
+`rcs-ft-auth-hosts`, `rcs-ft-auth-http`. The
 three Korean carriers get stock's values (globalsettings.json `SKT_KR`, `KT_KR`,
 `LGU+_KR`; imsprofile.json `SKT RCS`, `KT RCS`, `LGU RCS`).
 

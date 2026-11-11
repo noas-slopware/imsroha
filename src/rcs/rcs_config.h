@@ -51,6 +51,8 @@ struct rcs_config {
 	int iscomposing_cpim;         /* rcs-iscomposing-cpim */
 	int standalone;               /* rcs-standalone: pager-mode messages may be sent */
 	unsigned reg_expires;         /* rcs-reg-expires */
+	char ft_auth_hosts[512];      /* rcs-ft-auth-hosts: more file transfer hosts for Digest */
+	int ft_auth_http;             /* rcs-ft-auth-http: Digest over plain http too */
 
 	/* imsroha's own configuration: [device], the VoLTE carrier profile */
 	struct imsroha_config base;

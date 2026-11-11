@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
-"""A fake RCS content server (file transfer over HTTP, RCC.07 3.2.5) for the
+"""A fake RCS content server (file transfer over HTTP, as stock's UploadFileTask and DownloadFileTask talk to it) for the
 tests, HTTPS on localhost. Every request needs HTTP Digest (MD5, qop=auth)
 with --user/--pwd: an empty POST and a GET without it get a 401. A POST with
 multipart/form-data (tid, File) stores the file as <store>/up-<n>.bin,

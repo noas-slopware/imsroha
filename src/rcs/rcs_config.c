@@ -157,6 +157,8 @@ static void rcs_carrier(GKeyFile *kf, const char *g, struct rcs_config *cfg)
 	v = cfg->reg_expires;
 	integer(kf, g, "rcs-reg-expires", 60, 3600 * 24 * 30, &v);
 	cfg->reg_expires = (unsigned)v;
+	str(kf, g, "rcs-ft-auth-hosts", cfg->ft_auth_hosts, sizeof(cfg->ft_auth_hosts));
+	boolean(kf, g, "rcs-ft-auth-http", &cfg->ft_auth_http);
 }
 
 int rcs_config_load_switch(struct rcs_config *cfg)

@@ -220,6 +220,11 @@ n=$(conns)
 [ "$(conns)" = "$n" ] || bad "second off: asked the ACS again"
 echo "off after on: one rcs_state=-4, then nothing"
 
+# Under -Db_sanitize the daemon's own reports end up in its stderr, not in an exit status.
+for f in "$t"/*.err; do
+	! grep -q 'Sanitizer\|runtime error' "$f" || bad "sanitizer report in $(basename "$f"): $(grep -m1 'Sanitizer\|runtime error' "$f")"
+done
+
 if [ $fail != 0 ]; then
 	echo "--- imsroha-rcs"; cat "$t/rcs.err"
 	echo "--- network"; cat "$t/net.log"

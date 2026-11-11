@@ -10,7 +10,7 @@
 #include "rcs_config.h"
 
 /*
- * File transfer over HTTP (GSMA RCC.07 3.2.5, TTAK.KO-06.0410/R9 7.4): the
+ * File transfer over HTTP (GSMA RCC.07, TTAK.KO-06.0410/R9 7.4): the
  * file goes to the carrier's content server, the chat carries only the
  * file-info XML the server answers with, and the receiver fetches the file
  * from the URL in it. This part is blocking and has no daemon state, so the
@@ -30,12 +30,17 @@ struct ft_config {
 	guint64 warn_size;           /* ftWarnSize */
 	guint64 incoming_max;        /* what we accept, 0 = no limit */
 	int aut_accept;              /* ftAutAccept */
+	/* Not from the XML: carrier keys (rcs-ft-auth-hosts, rcs-ft-auth-http). */
+	char auth_hosts[512];        /* more hosts that may get our credentials */
+	int auth_http;               /* also over plain http */
 };
 void ft_config_from_xml(const struct acs_xml *x, struct ft_config *out);
 /* The server for a file of this size: cs_uri, extra_uri, or NULL (too large). */
 const char *ft_upload_uri(const struct ft_config *c, guint64 size);
-/* Is url on one of the configured content servers, over https? Only those
- * get our credentials, whatever a peer's file-info says. */
+/* Is url on one of our content servers: the host of ftHTTPCSURI or
+ * ftHTTPExtraCSURI, or one in auth_hosts (comma separated; ".example.com"
+ * also matches its subdomains), over https unless auth_http? Only those get
+ * our credentials, whatever a peer's file-info says. */
 int ft_url_trusted(const struct ft_config *c, const char *url);
 
 /* One <file-info> of the file-info document. */

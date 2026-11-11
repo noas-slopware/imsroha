@@ -71,10 +71,26 @@ int main(void)
 	/* Credentials only to our servers, only over https. */
 	CHECK(ft_url_trusted(&c, "https://content.example.com/content/abc?x=1"));
 	CHECK(ft_url_trusted(&c, "https://LARGE-content.example.com:443/x"));
+	CHECK(ft_url_trusted(&c, "https://content.example.com:8443/content/abc"));
 	CHECK(!ft_url_trusted(&c, "http://content.example.com/content/abc"));
-	CHECK(!ft_url_trusted(&c, "https://content.example.com:8443/content/abc"));
 	CHECK(!ft_url_trusted(&c, "https://content.example.com.evil.test/x"));
 	CHECK(!ft_url_trusted(&c, "https://u@content.example.com/x"));
+	CHECK(!ft_url_trusted(&c, "https://rcs-seoul1.mip.example.net/content/x"));
+	CHECK(!ft_url_trusted(&c, NULL));
+	/* rcs-ft-auth-hosts, rcs-ft-auth-http */
+	g_strlcpy(c.auth_hosts, "dl.example.org, .mip.example.net", sizeof(c.auth_hosts));
+	CHECK(ft_url_trusted(&c, "https://DL.example.org/x"));
+	CHECK(ft_url_trusted(&c, "https://rcs-seoul1.mip.example.net/content/x"));
+	CHECK(!ft_url_trusted(&c, "https://mip.example.net/x"));
+	CHECK(!ft_url_trusted(&c, "https://evilmip.example.net/x"));
+	CHECK(!ft_url_trusted(&c, "https://xdl.example.org/x"));
+	CHECK(!ft_url_trusted(&c, "http://rcs-seoul1.mip.example.net:80/content/x"));
+	c.auth_http = 1;
+	CHECK(ft_url_trusted(&c, "http://rcs-seoul1.mip.example.net:80/content/x"));
+	CHECK(ft_url_trusted(&c, "http://content.example.com/content/abc"));
+	CHECK(!ft_url_trusted(&c, "http://elsewhere.example.com/"));
+	c.auth_http = 0;
+	c.auth_hosts[0] = '\0';
 
 	/* No ftAuth, no file transfer. */
 	const char *off = "<wap-provisioningdoc><characteristic type=\"FileTransfer\">"
