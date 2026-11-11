@@ -49,6 +49,9 @@ struct aka_ctx {
 	int id_phase;                  /* identity: 0 EF_IMSI, 1 EF_AD, 2 EF_SMSP, then the ISIM */
 	guint8 imsi_raw[9];
 	gsize imsi_len;
+	const guint8 *aid;             /* the application being opened, for a retry */
+	gsize aid_len;
+	int open_tries;
 };
 
 static void close_channel_and_quit(struct aka_ctx *ctx)
@@ -301,6 +304,28 @@ static void apdu_ready(QmiClientUim *client, GAsyncResult *res, gpointer user_da
 	g_main_loop_quit(ctx->loop);
 }
 
+static void open_channel(struct aka_ctx *ctx, const guint8 *aid, gsize aid_len);
+
+static gboolean open_channel_again(gpointer user_data)
+{
+	struct aka_ctx *ctx = user_data;
+	open_channel(ctx, ctx->aid, ctx->aid_len);
+	return G_SOURCE_REMOVE;
+}
+
+/*
+ * All of the card's logical channels are in use for the moment: another QMI
+ * client (imsroha-rcs reading EF_IMPU, ModemManager) holds one, or a process
+ * that just stopped has not given its own back yet. That says nothing about
+ * whether the card has the application.
+ */
+static int channels_busy(const GError *err)
+{
+	return err && err->domain == QMI_PROTOCOL_ERROR &&
+	       (err->code == QMI_PROTOCOL_ERROR_INSUFFICIENT_RESOURCES ||
+		err->code == QMI_PROTOCOL_ERROR_DEVICE_IN_USE);
+}
+
 static void open_channel_ready(QmiClientUim *client, GAsyncResult *res, gpointer user_data)
 {
 	struct aka_ctx *ctx = user_data;
@@ -308,6 +333,21 @@ static void open_channel_ready(QmiClientUim *client, GAsyncResult *res, gpointer
 	QmiMessageUimOpenLogicalChannelOutput *out = qmi_client_uim_open_logical_channel_finish(client, res, &err);
 
 	if (!out || !qmi_message_uim_open_logical_channel_output_get_result(out, &err)) {
+		if (channels_busy(err)) {
+			if (out)
+				qmi_message_uim_open_logical_channel_output_unref(out);
+			/* Within run_ctx()'s 10 s: 12 tries, 500 ms apart. */
+			if (++ctx->open_tries < 12) {
+				g_clear_error(&err);
+				g_timeout_add(500, open_channel_again, ctx);
+				return;
+			}
+			fprintf(stderr, "imsroha: no free logical channel on the card (%s)\n", err->message);
+			g_clear_error(&err);
+			ctx->err_code = -EBUSY;
+			g_main_loop_quit(ctx->loop);
+			return;
+		}
 		if (ctx->id && out) {
 			/* No ISIM on this card: the identity is derived from the IMSI. */
 			fprintf(stderr, "imsroha: no ISIM application (%s), using the USIM\n",
@@ -359,6 +399,8 @@ static void open_channel_ready(QmiClientUim *client, GAsyncResult *res, gpointer
 
 static void open_channel(struct aka_ctx *ctx, const guint8 *aid, gsize aid_len)
 {
+	ctx->aid = aid;
+	ctx->aid_len = aid_len;
 	QmiMessageUimOpenLogicalChannelInput *in = qmi_message_uim_open_logical_channel_input_new();
 	qmi_message_uim_open_logical_channel_input_set_slot(in, 1, NULL);
 	GArray *arr = g_array_sized_new(FALSE, FALSE, sizeof(guint8), aid_len);
@@ -593,6 +635,8 @@ int imsd_isim_read_identity(struct imsd_isim_identity *id)
 		.id = id,
 	};
 	run_ctx(&ctx);
+	if (ctx.err_code == -EBUSY)
+		return -EBUSY; /* the card is busy, not without an ISIM: ask again later */
 	if (ctx.err_code && id->has_isim && id->imsi[0] && id->mcc[0]) {
 		fprintf(stderr, "imsroha: reading the ISIM failed (%s), using the USIM\n", strerror(-ctx.err_code));
 		ctx.err_code = 0;
