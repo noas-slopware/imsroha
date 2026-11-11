@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """A fake botinfo server for the tests (RCC.07 3.6.4.1.1, R9 7.7.3.2):
 HTTPS on localhost, GET /bot?id=...&hl=...&ho=...&v=...
-  sip:bot@botplatform.test   200, ETag "b1", Cache-Control: max-age=3600
-  sip:bot2@botplatform.test  200, ETag "b2", Cache-Control: no-cache; 304 to If-None-Match "b2"
+  sip:bot@botplatform.loopback.example   200, ETag "b1", Cache-Control: max-age=3600
+  sip:bot2@botplatform.loopback.example  200, ETag "b2", Cache-Control: no-cache; 304 to If-None-Match "b2"
   anything else              404
 Logs every request line and If-None-Match to --log. Never run it anywhere
 but in the test's own network namespace."""
@@ -19,8 +19,8 @@ a = ap.parse_args()
 
 log = open(a.log, 'a', buffering=1)
 BOTS = {
-    'sip:bot@botplatform.test': ('botinfo-bot.json', '"b1"', 'max-age=3600'),
-    'sip:bot2@botplatform.test': ('botinfo-bot2.json', '"b2"', 'no-cache'),
+    'sip:bot@botplatform.loopback.example': ('botinfo-bot.json', '"b1"', 'max-age=3600'),
+    'sip:bot2@botplatform.loopback.example': ('botinfo-bot2.json', '"b2"', 'no-cache'),
 }
 
 class H(http.server.BaseHTTPRequestHandler):

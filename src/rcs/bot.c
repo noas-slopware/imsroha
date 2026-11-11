@@ -174,6 +174,8 @@ int bot_multipart_split(const char *ctype_full, const char *body, size_t len, ch
 		const char *start = eol + 1;
 		const char *nd = next_delim(body, start, end, delim, &pre);
 		const char *stop = nd ? pre : end;
+		if (stop < start)
+			stop = start; /* an empty part: the next delimiter right after this one */
 		/* Headers, a blank line, the content; no headers: text/plain (stock). */
 		const char *content = start;
 		char *ct = NULL;
@@ -224,7 +226,7 @@ int bot_uri_key(const char *uri, char *out, size_t size)
 		return -EINVAL;
 	size_t n = strcspn(uri, ";?>");
 	for (size_t i = 0; i < n; i++)
-		if ((unsigned char)uri[i] <= ' ' || strchr("<\"\\", uri[i]) || uri[i] == 0x7f)
+		if ((unsigned char)uri[i] <= ' ' || (unsigned char)uri[i] >= 0x7f || strchr("<\"\\", uri[i]))
 			return -EINVAL;
 	const char *at = memchr(uri, '@', n);
 	if (!at || at + 1 == uri + n || n + 1 > size)

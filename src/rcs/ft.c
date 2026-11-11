@@ -32,7 +32,7 @@
 struct ft_job {
 	struct rcsd *r;
 	GCancellable *cancel;
-	char number[32];
+	char number[256];     /* +E.164, or a chatbot's sip: URI */
 	char id[64];
 	char ua[256];
 	/* A copy: a new registration reloads r->ft while workers run. The

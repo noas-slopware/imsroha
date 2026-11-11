@@ -26,6 +26,7 @@ ap.add_argument('--cs-port', type=int, help='fake-cs.py, for the file-infos we s
 ap.add_argument('--ft-dir', help='where the file-infos we receive are kept')
 ap.add_argument('--rbm', choices=('on', 'off'), help='the chatbot scenario')
 ap.add_argument('--rbm-dir', help='the JSON payloads of the chatbot scenario')
+ap.add_argument('--rbm-big', help='a rich card larger than a SIP read, for pager mode')
 a = ap.parse_args()
 
 USER, REALM, PWD = '+821099999999@rcs.test', 'rcs.test', 'testPassword'
@@ -349,7 +350,7 @@ def msrp_conn(conn):
 
 # ---- the chatbot scenario (--rbm) ------------------------------------------
 
-BOT, BOT2, A2P, A2P_ID = 'sip:bot@botplatform.test', 'sip:bot2@botplatform.test', '+8215880000', 'sip:a2p@botplatform.test'
+BOT, BOT2, A2P, A2P_ID = 'sip:bot@botplatform.loopback.example', 'sip:bot2@botplatform.loopback.example', '+8215880000', 'sip:a2p@botplatform.loopback.example'
 IARI_BOT = 'urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.chatbot'
 CT_BOT = 'application/vnd.gsma.botmessage.v1.0+json'
 CT_SUGG = 'application/vnd.gsma.botsuggestion.v1.0+json'
@@ -369,7 +370,8 @@ def rbm_event(e):
 
 RBM_DONE_ON = {'resp netcheck-1 MESSAGE 200', 'resp a2p-1 MESSAGE 200', 'resp a2p-x13 MESSAGE 606',
                'resp large-1 BYE 200', 'imdn rbm6 delivered tel:' + A2P, 'imdn rbm6 displayed tel:' + A2P,
-               'imdn rbm7 delivered tel:' + A2P, 'suggestion-response', 'resp bot2-1 INVITE 200', 'bot2 sent'}
+               'imdn rbm7 delivered tel:' + A2P, 'suggestion-response', 'resp bot2-1 INVITE 200', 'bot2 sent',
+               'resp a2p-big MESSAGE 200'}
 RBM_DONE_OFF = {'resp off-msg MESSAGE 606', 'resp off-inv INVITE 606', 'resp off-person MESSAGE 200'}
 
 def sip_req(meth, ruri, frm, callid, extra='', ctype=None, body=''):
@@ -416,6 +418,9 @@ def a2p_deliveries():
             f'P-Asserted-Identity: {tel}\r\nP-Asserted-Identity: <{A2P_ID}>\r\n'
             'Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg"\r\n',
             'message/cpim', cpim('rbm6', 'application/vnd.gsma.openrichcard.v1.0+json', payload('openrichcard.json'), D))
+    # Pager mode with more than one read of the SIP connection.
+    sip_req('MESSAGE', state['contact'], tel, 'a2p-big', f'P-Asserted-Identity: {tel}\r\n', 'message/cpim',
+            cpim('rbm8', CT_BOT, open(a.rbm_big, encoding='utf-8', newline='').read(), D))
     # An extended bot message of a version we do not have: 606 (R9 7.7.4.17.2).
     sip_req('MESSAGE', state['contact'], tel, 'a2p-x13', f'P-Asserted-Identity: {tel}\r\n', 'message/cpim',
             cpim('rbm-x13', 'application/vnd.gsma.xbotmessage.v1.3+json', '{}', D))

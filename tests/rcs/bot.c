@@ -82,6 +82,18 @@ static void multipart(void)
 	CHECK(bot_multipart_split("multipart/mixed; boundary=x", m3, strlen(m3), &ct, &part, &n, &sugg) == 0);
 	CHECK(ct && !strcmp(ct, "text/plain") && part && !strcmp(part, "hello") && !sugg);
 	g_free(ct), g_free(part), g_free(sugg);
+	/* An empty part (the next delimiter right after this one), and one at the very end. */
+	const char *m5 = "--x\r\n--x\r\nContent-Type: text/plain\r\n\r\nhi\r\n--x--";
+	CHECK(bot_multipart_split("multipart/mixed; boundary=x", m5, strlen(m5), &ct, &part, &n, &sugg) == 0);
+	CHECK(ct && !strcmp(ct, "text/plain") && part && !strcmp(part, "") && n == 0);
+	g_free(ct), g_free(part), g_free(sugg);
+	const char *m6 = "--x\r\n--x--";
+	CHECK(bot_multipart_split("multipart/mixed; boundary=x", m6, strlen(m6), &ct, &part, &n, &sugg) == 0);
+	CHECK(part && !strcmp(part, ""));
+	g_free(ct), g_free(part), g_free(sugg);
+	const char *m7 = "--x\r\nContent-Type: text/plain\r\n";
+	CHECK(bot_multipart_split("multipart/mixed; boundary=x", m7, strlen(m7), &ct, &part, &n, &sugg) == 0);
+	g_free(ct), g_free(part), g_free(sugg);
 	/* No boundary, or only suggestions: not a message. */
 	CHECK(bot_multipart_split("multipart/mixed", m3, strlen(m3), &ct, &part, &n, &sugg) < 0);
 	const char *m4 = "--x\r\nContent-Type: application/vnd.gsma.botsuggestion.v1.0+json\r\n\r\n[]\r\n--x--";
@@ -107,13 +119,14 @@ static void types(void)
 static void uris(void)
 {
 	char k[256];
-	CHECK(bot_uri_key("sip:bot@botplatform.test;tk=on", k, sizeof(k)) == 0 && !strcmp(k, "sip:bot@botplatform.test"));
-	CHECK(bot_uri_key("sip:bot@botplatform.test?X=y", k, sizeof(k)) == 0 && !strcmp(k, "sip:bot@botplatform.test"));
+	CHECK(bot_uri_key("sip:bot@botplatform.loopback.example;tk=on", k, sizeof(k)) == 0 && !strcmp(k, "sip:bot@botplatform.loopback.example"));
+	CHECK(bot_uri_key("sip:bot@botplatform.loopback.example?X=y", k, sizeof(k)) == 0 && !strcmp(k, "sip:bot@botplatform.loopback.example"));
 	CHECK(bot_uri_key("tel:+821012345678", k, sizeof(k)) < 0);
 	CHECK(bot_uri_key("sip:nohost", k, sizeof(k)) < 0);
 	CHECK(bot_uri_key("sip:bot@", k, sizeof(k)) < 0);
 	CHECK(bot_uri_key("sip:b ot@x", k, sizeof(k)) < 0);
 	CHECK(bot_uri_key("sip:bot@x\r\nEvil: 1", k, sizeof(k)) < 0);
+	CHECK(bot_uri_key("sip:b\xc3\xb6t@x", k, sizeof(k)) < 0);
 }
 
 static void botinfo(void)

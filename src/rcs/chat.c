@@ -326,58 +326,80 @@ static const char *peer_bot_id(const struct chat *c)
 	return v ? v : "";
 }
 
-/* A bot payload: a rich card, an extended bot message, text with suggestions. 0 when it was one. */
-static int on_bot_payload(struct chat *c, const struct cpim *m, const char *id, gint64 ts)
+/*
+ * A chatbot's payload with multipart/mixed opened: 0 and *ct text/plain, a
+ * bot type or a file-info (stock ImProcessor hands that to file transfer
+ * after the split); -1 when there is nothing in it we could show.
+ */
+static int bot_payload(const struct cpim *m, char **ct, char **part, size_t *plen, char **sugg)
 {
-	char *pct = NULL, *part = NULL, *sugg = NULL;
-	size_t plen = 0;
-	int r = -1;
+	*ct = *part = *sugg = NULL;
+	*plen = 0;
 	if (!g_ascii_strcasecmp(m->ctype, "multipart/mixed")) {
-		if (bot_multipart_split(m->ctype_full, m->body, m->blen, &pct, &part, &plen, &sugg) < 0) {
-			fprintf(stderr, "imsroha-rcs: chat %s from %s: unreadable multipart/mixed, dropped\n", id, c->number);
-			return 0;
-		}
+		if (bot_multipart_split(m->ctype_full, m->body, m->blen, ct, part, plen, sugg) < 0)
+			return -1;
 	} else if (bot_kind_of(m->ctype) != BOT_KIND_NONE) {
-		pct = g_strdup(m->ctype);
-		part = g_strndup(m->body, m->blen);
-		plen = m->blen;
+		*ct = g_strdup(m->ctype);
+		*part = g_strndup(m->body, m->blen);
+		*plen = m->blen;
 	} else {
 		return -1;
 	}
+	if (!g_ascii_strcasecmp(*ct, "text/plain") || !g_ascii_strcasecmp(*ct, FT_HTTP_CTYPE) ||
+	    bot_kind_of(*ct) != BOT_KIND_NONE)
+		return 0;
+	g_free(*ct), g_free(*part), g_free(*sugg);
+	*ct = *part = *sugg = NULL;
+	return -1;
+}
+
+static int is_bot_payload(const struct cpim *m)
+{
+	return !g_ascii_strcasecmp(m->ctype, "multipart/mixed") || bot_kind_of(m->ctype) != BOT_KIND_NONE;
+}
+
+/* 0 when it went to the app; -1 when there was nothing to show (no IMDN then). */
+static int on_bot_payload(struct chat *c, const struct cpim *m, const char *id, gint64 ts)
+{
+	char *pct, *part, *sugg;
+	size_t plen;
+	if (bot_payload(m, &pct, &part, &plen, &sugg) < 0) {
+		fprintf(stderr, "imsroha-rcs: chat %s from %s: %s with nothing we can show, dropped\n", id, c->number,
+			m->ctype);
+		return -1;
+	}
 	const char *bot_id = peer_bot_id(c);
-	if (!g_ascii_strcasecmp(pct, "text/plain") && !sugg) {
+	if (!g_ascii_strcasecmp(pct, FT_HTTP_CTYPE)) {
+		fprintf(stderr, "imsroha-rcs: chat file %s from %s%s\n", id, c->number,
+			sugg ? " (its suggestions are not passed on)" : "");
+		rcsd_ft_received(c->r, c->number, id, part, plen, ts);
+	} else if (!g_ascii_strcasecmp(pct, "text/plain") && !sugg) {
 		/* Bot text without suggestions stays a plain message. */
 		rcsd_dbus_message_received(c->r, c->number, id, part, ts);
-		r = 0;
-	} else if (!g_ascii_strcasecmp(pct, "text/plain") || bot_kind_of(pct) != BOT_KIND_NONE) {
+	} else {
 		fprintf(stderr, "imsroha-rcs: chat %s from %s: %s%s (bot %s)\n", id, c->number, pct,
 			sugg ? " with suggestions" : "", bot_id[0] ? bot_id : "unknown");
 		rcsd_dbus_rich_received(c->r, c->number, id, !g_ascii_strcasecmp(pct, "text/plain") ? "text/plain" : pct,
 					part, sugg ? sugg : "", bot_id, ts);
-		r = 0;
-	} else {
-		fprintf(stderr, "imsroha-rcs: chat %s from %s: %s inside multipart/mixed, dropped\n", id, c->number, pct);
-		r = 0;
 	}
-	(void)plen;
 	g_free(pct);
 	g_free(part);
 	g_free(sugg);
-	return r;
+	return 0;
 }
 
 static void on_text(struct chat *c, const struct cpim *m)
 {
 	int text = !g_ascii_strcasecmp(m->ctype, "text/plain");
 	int ft = !g_ascii_strcasecmp(m->ctype, FT_HTTP_CTYPE);
-	int bot = !text && !ft && bot_on(&c->r->bot) &&
-		  (!g_ascii_strcasecmp(m->ctype, "multipart/mixed") || bot_kind_of(m->ctype) != BOT_KIND_NONE);
+	int bot = !text && !ft && bot_on(&c->r->bot) && is_bot_payload(m);
 	if (text || ft || bot) {
 		char id[64];
 		snprintf(id, sizeof(id), "%s", m->msg_id ? m->msg_id : "");
 		gint64 ts = cpim_time_ms(m->datetime);
+		int shown = 1;
 		if (bot) {
-			on_bot_payload(c, m, id, ts);
+			shown = on_bot_payload(c, m, id, ts) == 0;
 		} else {
 			fprintf(stderr, "imsroha-rcs: chat %s from %s (%s)\n", text ? "message" : "file", c->number, id);
 			if (text)
@@ -387,8 +409,9 @@ static void on_text(struct chat *c, const struct cpim *m)
 		}
 		/* A file-info is a chat message like any other: delivered now, as
 		 * stock does (it marks it delivered before the download), and
-		 * displayed when the app says so. So is a bot's message. */
-		if (m->msg_id && m->disposition) {
+		 * displayed when the app says so. So is a bot's message, when there
+		 * was something in it to show. */
+		if (shown && m->msg_id && m->disposition) {
 			if (strstr(m->disposition, "display"))
 			{
 				g_hash_table_replace(want_display, g_strdup(m->msg_id),
@@ -407,7 +430,7 @@ static void on_text(struct chat *c, const struct cpim *m)
 		int a = iscomposing_parse(m->body, m->blen);
 		if (a >= 0)
 			rcsd_dbus_composing(c->r, c->number, a);
-	} else if (bot_kind_of(m->ctype) != BOT_KIND_NONE || !g_ascii_strcasecmp(m->ctype, "multipart/mixed")) {
+	} else if (is_bot_payload(m)) {
 		fprintf(stderr, "imsroha-rcs: chat from %s: %s, but chatbots are off; dropped\n", c->number, m->ctype);
 	}
 }
@@ -738,6 +761,13 @@ static int peer_of(struct sipua *ua, const struct sipmsg *m, struct peer *p)
 	return found ? 0 : -ENOENT;
 }
 
+/* A service id seen next to a tel URI serves that number's later messages and our replies. */
+static void learn_bot_id(struct rcsd *r, const struct peer *p)
+{
+	if (bot_on(&r->bot) && p->bot_id[0] && !sip_key(p->key))
+		g_hash_table_replace(bot_ids, g_strdup(p->key), g_strdup(p->bot_id));
+}
+
 static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 {
 	struct peer p;
@@ -755,6 +785,7 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 	const char *cid = sipmsg_header(m, "Call-ID");
 	if (cid && find_dlg(cid))
 		return; /* a retransmission */
+	learn_bot_id(r, &p);
 	const char *from = sipmsg_header(m, "From");
 	char from_uri[sizeof(((struct sipdlg *)0)->remote_uri) - 2] = "";
 	if (from && !sip_uri_of(from, from_uri, sizeof(from_uri))) {
@@ -781,7 +812,9 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 			close_chat(old, 1);
 		}
 	}
-	c->bot = p.bot;
+	/* Large message mode is how A2P comes (R9 7.7.3.3), and its sender reads
+	 * our accept-wrapped-types as any chatbot does (R9 7.7.4.17.3). */
+	c->bot = p.bot || (bot_on(&r->bot) && (large || g_hash_table_contains(bot_ids, number)));
 	snprintf(c->bot_id, sizeof(c->bot_id), "%s", p.bot_id);
 	c->dlg.uas = 1;
 	snprintf(c->dlg.call_id, sizeof(c->dlg.call_id), "%s", cid ? cid : "");
@@ -819,21 +852,23 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 	start_msrp(c);
 }
 
-/* An extended bot message we may not take: R9 7.7.4.17.2 (stock answers 606). */
-static int xbot_refused(struct rcsd *r, const struct cpim *cp)
+/*
+ * A standalone bot payload we do not take: 415 when there is nothing in it
+ * to show, so the platform does not count it delivered; 606 for an extended
+ * bot message we do not have (R9 7.7.4.17.2, stock libsec-ims.so). 0: taken.
+ */
+static int bot_refusal(struct rcsd *r, const struct cpim *cp)
 {
-	char *pct = NULL, *part = NULL, *sugg = NULL;
+	char *pct, *part, *sugg;
 	size_t plen;
-	const char *ct = cp->ctype;
-	if (!g_ascii_strcasecmp(ct, "multipart/mixed") &&
-	    bot_multipart_split(cp->ctype_full, cp->body, cp->blen, &pct, &part, &plen, &sugg) == 0)
-		ct = pct;
-	enum bot_kind k = bot_kind_of(ct);
-	int refuse = (k == BOT_KIND_XBOT || k == BOT_KIND_OPENRICH) && (!r->bot.xbot || !bot_xbot_version_ok(ct));
+	if (bot_payload(cp, &pct, &part, &plen, &sugg) < 0)
+		return 415;
+	enum bot_kind k = bot_kind_of(pct);
+	int refuse = (k == BOT_KIND_XBOT || k == BOT_KIND_OPENRICH) && (!r->bot.xbot || !bot_xbot_version_ok(pct));
 	g_free(pct);
 	g_free(part);
 	g_free(sugg);
-	return refuse;
+	return refuse ? 606 : 0;
 }
 
 static void on_message(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
@@ -859,20 +894,24 @@ static void on_message(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 		cpim_clear(&cp);
 		return;
 	}
-	int bot_payload = parsed && (bot_kind_of(cp.ctype) != BOT_KIND_NONE || !g_ascii_strcasecmp(cp.ctype, "multipart/mixed"));
-	if ((p.bot || bot_payload) && !bot_on(&r->bot) && !(parsed && !g_ascii_strcasecmp(cp.ctype, "message/imdn+xml"))) {
+	int botp = parsed && is_bot_payload(&cp);
+	if ((p.bot || botp) && !bot_on(&r->bot) && !(parsed && !g_ascii_strcasecmp(cp.ctype, "message/imdn+xml"))) {
 		/* Stock's "chat bot slm not allowed". */
 		fprintf(stderr, "imsroha-rcs: standalone message from %s refused: chatbots are off\n", p.key);
 		sipua_respond(ua, m, 606, "Not Acceptable", "x", NULL, NULL, NULL);
 		cpim_clear(&cp);
 		return;
 	}
-	if (parsed && bot_on(&r->bot) && xbot_refused(r, &cp)) {
-		fprintf(stderr, "imsroha-rcs: standalone %s from %s refused (no such xbotmessage here)\n", cp.ctype, p.key);
-		sipua_respond(ua, m, 606, "Not Acceptable", "x", NULL, NULL, NULL);
+	int refuse = botp ? bot_refusal(r, &cp) : 0;
+	if (refuse) {
+		fprintf(stderr, "imsroha-rcs: standalone %s from %s refused (%s)\n", cp.ctype, p.key,
+			refuse == 606 ? "no such xbotmessage here" : "nothing in it we can show");
+		sipua_respond(ua, m, refuse, refuse == 606 ? "Not Acceptable" : "Unsupported Media Type", "x", NULL, NULL,
+			      NULL);
 		cpim_clear(&cp);
 		return;
 	}
+	learn_bot_id(r, &p);
 	sipua_respond(ua, m, 200, "OK", "m", NULL, NULL, NULL);
 	if (parsed) {
 		struct chat tmp = { .r = r, .bot = p.bot };

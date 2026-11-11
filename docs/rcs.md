@@ -330,7 +330,8 @@ advertised or accepted.
     URI; a SIP URI on another domain next to the tel URI (when its user part is not a
     phone number); or the entity of the capability NOTIFY (R9 7.7.3.2, stock
     `PresenceUpdate`) or the PAI of an OPTIONS answer (stock `OptionsRequestController`)
-    from an earlier `GetCapabilities`. Otherwise it is "".
+    from an earlier `GetCapabilities`. A service id seen next to a tel URI is kept for
+    that number's later messages and our sessions to it. Otherwise it is "".
   - A request is a chatbot's when its Contact has `+g.gsma.rcs.isbot` or it asks for
     the chatbot IARI. With chatbots off, those get 606, as stock's "chat bot sessions /
     slm not allowed".
@@ -344,11 +345,16 @@ advertised or accepted.
     `suggestions`). A text part with suggestions is a `RichMessageReceived` with
     `text/plain`. A text part without them, or a bare text/plain, is a
     `MessageReceived`.
-  - Delivered and displayed IMDNs work as for text.
+  - A file-info with suggestions goes to file transfer, as stock's `ImProcessor` does
+    after the split. The suggestions are not passed on.
+  - Delivered and displayed IMDNs work as for text. A payload with nothing in it we
+    could show gets no delivered IMDN, and 415 in pager mode, so the platform does not
+    count it delivered.
   - In pager mode, an xbotmessage or open rich card above version 1.0, or any of them
     while xbotmessage is not advertised, gets 606 (R9 7.7.4.17.2, stock "doesn't have
     the xbotmessage").
-- **Sessions with a chatbot** (to a sip: URI, or from a chatbot) also offer
+- **Sessions with a chatbot** (to a sip: URI, from a chatbot, with a number whose
+  service id is known, and every large message session) also offer
   `multipart/mixed`, the botmessage and botsuggestion types, and with xbotmessage
   `application/vnd.gsma.xbotmessage.v1.0+json` and
   `application/vnd.gsma.openrichcard.v1.0+json` in `accept-wrapped-types`. R9
@@ -535,8 +541,10 @@ chatbot platform, `tests/rcs/fake-pcscf.py --rbm`, and `tests/rcs/fake-botinfo.p
   rich card (without header and footer), the same card with them as an xbotmessage,
   and a carousel with suggestions, then our suggestion response.
 - A chat from a chatbot: text with suggestions, then plain text.
-- From a tel URI: R9 table 7-8 b's open rich card in pager mode and a rich card in
-  large message mode, both in the number's thread, with their IMDNs to the tel URI.
+- From a tel URI, all in the number's thread with their IMDNs to the tel URI:
+  - R9 table 7-8 b's open rich card in pager mode.
+  - A 60 KB card in pager mode, more than one read of the connection.
+  - A rich card in large message mode, answered recvonly with the bot types.
 - The network check; an xbotmessage v1.3 refused.
 - "chatbot" and "bot-id" for bots, an A2P number and a phone.
 - botinfo fetched, cached, revalidated and unknown.
@@ -593,4 +601,5 @@ Not done yet, or different from R9's own examples:
   - An xbotmessage or open rich card above v1.0 that comes in a session is passed to
     the app; only pager mode can refuse it.
   - The Accept-Contact of an INVITE to a chatbot is from memory of RCC.07, not stock.
+  - `SendFile` takes phone numbers only, so no files are sent to a chatbot.
   - The tests are loopback only.

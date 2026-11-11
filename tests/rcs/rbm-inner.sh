@@ -12,8 +12,16 @@ fail=0
 bad() { echo "FAIL: $*"; fail=1; }
 rbm="$src/tests/rcs/rbm"
 
+# A rich card of about 60 KB: pager mode over more than one SIP read.
+python3 -I - "$t/big.json" <<'PY'
+import json, sys
+d = {"message": {"generalPurposeCard": {"content": {"title": "큰 카드", "description": "가나다라마바사" * 3000}}}}
+open(sys.argv[1], 'w', encoding='utf-8').write(json.dumps(d, ensure_ascii=False))
+PY
+export RBM_BIG="$t/big.json"
+
 # The configuration with R9 B.1.2's Chatbot characteristic (the botinfo root on loopback).
-chatbot='<characteristic type="Chatbot"><parm name="ChatbotDirectory" value="botplatform.test"/><parm name="BotinfoFQDNRoot" value="localhost:18447"/><parm name="PrivacyDisable" value="1"/><parm name="ChatbotMsgTech" value="2"/></characteristic>'
+chatbot='<characteristic type="Chatbot"><parm name="ChatbotDirectory" value="botplatform.loopback.example"/><parm name="BotinfoFQDNRoot" value="localhost:18447"/><parm name="PrivacyDisable" value="1"/><parm name="ChatbotMsgTech" value="2"/></characteristic>'
 sed "s/@SIP_PORT@/15071/; s/@CS_PORT@/18446/; s|<characteristic type=\"MESSAGING\">|&$chatbot|" \
 	"$src/tests/rcs/acs.xml" > "$t/acs.xml"
 grep -q 'BotinfoFQDNRoot' "$t/acs.xml" || { echo "FAIL: no Chatbot characteristic in the test configuration"; exit 1; }
@@ -49,7 +57,7 @@ python3 -I "$src/tests/rcs/fake-acs.py" --http-port 18090 --https-port 18453 --c
 	--key "$t/server.key" --xml "$t/acs.xml" --scenario netauth --log "$t/acs.log" <&3 > "$t/acs.out" &
 pids="$pids $!"
 python3 -I "$src/tests/rcs/fake-pcscf.py" --sip-port 15071 --msrp-port 12865 --cert "$t/server.pem" \
-	--key "$t/server.key" --log "$t/net.log" --rbm on --rbm-dir "$rbm" <&4 > "$t/net.out" &
+	--key "$t/server.key" --log "$t/net.log" --rbm on --rbm-dir "$rbm" --rbm-big "$t/big.json" <&4 > "$t/net.out" &
 pids="$pids $!"
 python3 -I "$src/tests/rcs/fake-botinfo.py" --port 18447 --cert "$t/server.pem" --key "$t/server.key" \
 	--log "$t/bi.log" --dir "$rbm" <&6 > "$t/bi.out" &
@@ -76,21 +84,25 @@ block "$t/net.log" '^sip-in SIP/2.0 200' 'Call-ID: opt-1' | grep -qF -- "$tags" 
 grep -q 'event publish 600 tuples rcs.chatbot< rcs.chatbot.sa< rcs.chatbot.xbotmessage<$' "$t/net.log" ||
 	bad "PUBLISH without the three chatbot tuples"
 # Our chat to the bot: the bot's URI, its IARI and botversion, what it may send us.
-inv=$(block "$t/net.log" '^sip-in INVITE sip:bot@botplatform.test SIP/2.0' 'Content-Type')
+inv=$(block "$t/net.log" '^sip-in INVITE sip:bot@botplatform.loopback.example SIP/2.0' 'Content-Type')
 printf '%s\n' "$inv" | grep -qF 'Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.chatbot";+g.gsma.rcs.botversion="#=1"' ||
 	bad "the INVITE to the bot lacks its Accept-Contact"
-printf '%s\n' "$inv" | grep -qF 'To: <sip:bot@botplatform.test>' || bad "the INVITE is not to the bot's URI"
+printf '%s\n' "$inv" | grep -qF 'To: <sip:bot@botplatform.loopback.example>' || bad "the INVITE is not to the bot's URI"
 printf '%s\n' "$inv" | grep -qF 'a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml application/vnd.gsma.rcs-ft-http+xml multipart/mixed application/vnd.gsma.botmessage.v1.0+json application/vnd.gsma.botsuggestion.v1.0+json application/vnd.gsma.xbotmessage.v1.0+json application/vnd.gsma.openrichcard.v1.0+json|' ||
 	bad "the bot session's SDP lacks the bot content types"
 block "$t/net.log" '^sip-in SIP/2.0 200' 'Call-ID: bot2-1' | grep -qF 'multipart/mixed application/vnd.gsma.botmessage.v1.0+json' ||
 	bad "the answer to the bot's INVITE lacks the bot content types"
 # Large message mode: answered recvonly; the network's BYE taken.
-block "$t/net.log" '^sip-in SIP/2.0 200' 'Call-ID: large-1' | grep -q 'a=recvonly' || bad "the large message session is not recvonly"
+large=$(block "$t/net.log" '^sip-in SIP/2.0 200' 'Call-ID: large-1')
+printf '%s\n' "$large" | grep -q 'a=recvonly' || bad "the large message session is not recvonly"
+printf '%s\n' "$large" | grep -qF 'multipart/mixed application/vnd.gsma.botmessage.v1.0+json application/vnd.gsma.botsuggestion.v1.0+json application/vnd.gsma.xbotmessage.v1.0+json' ||
+	bad "the large message session's SDP lacks the bot content types"
 grep -q 'event resp large-1 BYE 200' "$t/net.log" || bad "the large message session's BYE was not answered"
 # The network check: 200 and nothing else; an xbotmessage v1.3: 606.
 grep -q 'event resp netcheck-1 MESSAGE 200' "$t/net.log" || bad "the network check did not get its 200"
 ! grep -q 'event imdn 30ef1b07' "$t/net.log" || bad "an IMDN went back for the network check"
 grep -q 'event resp a2p-1 MESSAGE 200' "$t/net.log" || bad "the pager-mode A2P message did not get its 200"
+grep -q 'event resp a2p-big MESSAGE 200' "$t/net.log" || bad "the large pager-mode message did not get its 200"
 grep -q 'event resp a2p-x13 MESSAGE 606' "$t/net.log" || bad "the xbotmessage v1.3 did not get 606"
 # A2P IMDNs go to the tel URI (pager mode: SIP MESSAGE).
 grep -q 'event imdn rbm6 delivered tel:+8215880000' "$t/net.log" || bad "no delivered IMDN to tel:+8215880000"
@@ -103,7 +115,7 @@ done
 grep -q 'event suggestion-response application/vnd.gsma.botsuggestion.response.v1.0+json body ok' "$t/net.log" ||
 	bad "the suggestion response is not the app's JSON as application/vnd.gsma.botsuggestion.response.v1.0+json"
 # botinfo: stock's query; cached for max-age; revalidated with the ETag; unknown asked once; no tel: query.
-grep -q '^request /bot?id=sip%3Abot%40botplatform.test&hl=ko&ho=450006&v=3 inm None ua TTA-RCS/2.4 SM-F711N/' "$t/bi.log" ||
+grep -q '^request /bot?id=sip%3Abot%40botplatform.loopback.example&hl=ko&ho=450006&v=3 inm None ua TTA-RCS/2.4 SM-F711N/' "$t/bi.log" ||
 	bad "the botinfo query is not stock's"
 [ "$(grep -c 'id=sip%3Abot%40' "$t/bi.log")" = 1 ] || bad "a fresh botinfo was asked again"
 [ "$(grep -c 'id=sip%3Abot2%40' "$t/bi.log")" = 2 ] || bad "botinfo with no-cache was not asked twice"

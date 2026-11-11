@@ -200,10 +200,10 @@ static void refused(const char *method, GVariant *args, const char *want)
 static int off(void)
 {
 	const char *na = "codes.noa.IMSroha.Rcs.Error.NotAvailable";
-	refused("SendMessage", g_variant_new("(ss)", "sip:bot@botplatform.test", "hi"), na);
-	refused("SendSuggestionResponse", g_variant_new("(sss)", "sip:bot@botplatform.test", "x", "{}"), na);
-	refused("GetBotInfo", g_variant_new("(s)", "sip:bot@botplatform.test"), na);
-	refused("GetCapabilities", g_variant_new("(s)", "sip:bot@botplatform.test"), na);
+	refused("SendMessage", g_variant_new("(ss)", "sip:bot@botplatform.loopback.example", "hi"), na);
+	refused("SendSuggestionResponse", g_variant_new("(sss)", "sip:bot@botplatform.loopback.example", "x", "{}"), na);
+	refused("GetBotInfo", g_variant_new("(s)", "sip:bot@botplatform.loopback.example"), na);
+	refused("GetCapabilities", g_variant_new("(s)", "sip:bot@botplatform.loopback.example"), na);
 	/* A person's message still comes. */
 	GVariant *p = wait_event("text off2");
 	CHECK(p, "no message from the person");
@@ -230,23 +230,28 @@ int main(int argc, char **argv)
 	}
 
 	/* ---- capabilities: "chatbot" is the bot role, not the chatbot tuple a phone has too ---- */
-	caps_are("sip:bot@botplatform.test;tk=on", 1, "sip:bot@botplatform.test");
+	caps_are("sip:bot@botplatform.loopback.example;tk=on", 1, "sip:bot@botplatform.loopback.example");
 	caps_are("+821000000001", 0, "");
 	/* R9 7.7.3.2: the service id behind an A2P number, from the NOTIFY's entity.
 	 * The fake network sends that number's A2P traffic after this. */
-	caps_are("015-8800-00", 1, "sip:a2p@botplatform.test");
+	caps_are("015-8800-00", 1, "sip:a2p@botplatform.loopback.example");
 
 	/* ---- A2P from tel:+8215880000: its number's thread (R9 7.7.3.1) ---- */
 	char *open_card = payload("openrichcard.json"), *card = payload("richcard.json");
 	rich_is("rbm6", "+8215880000", "application/vnd.gsma.openrichcard.v1.0+json", open_card, "",
-		"sip:a2p@botplatform.test");
-	rich_is("rbm7", "+8215880000", "application/vnd.gsma.botmessage.v1.0+json", card, "", "sip:a2p@botplatform.test");
+		"sip:a2p@botplatform.loopback.example");
+	rich_is("rbm7", "+8215880000", "application/vnd.gsma.botmessage.v1.0+json", card, "", "sip:a2p@botplatform.loopback.example");
+	char *big = NULL;
+	if (!g_file_get_contents(getenv("RBM_BIG"), &big, NULL, NULL))
+		big = g_strdup("");
+	rich_is("rbm8", "+8215880000", "application/vnd.gsma.botmessage.v1.0+json", big, "", "sip:a2p@botplatform.loopback.example");
+	g_free(big);
 	GVariant *r = call("MarkDisplayed", g_variant_new("(ss)", "+8215880000", "rbm6"), NULL, NULL);
 	if (r)
 		g_variant_unref(r);
 
 	/* ---- a chat to a chatbot ---- */
-	if (!(r = call("SendMessage", g_variant_new("(ss)", "sip:bot@botplatform.test", "hello bot"), "(s)", NULL)))
+	if (!(r = call("SendMessage", g_variant_new("(ss)", "sip:bot@botplatform.loopback.example", "hello bot"), "(s)", NULL)))
 		return 1;
 	const char *mid;
 	g_variant_get(r, "(&s)", &mid);
@@ -256,14 +261,14 @@ int main(int argc, char **argv)
 	g_free(sent);
 	g_free(dlv);
 	char *xbot = payload("xbotmessage.json"), *carousel = payload("carousel.json"), *sugg = payload("suggestions.json");
-	rich_is("rbm1", "sip:bot@botplatform.test", "application/vnd.gsma.botmessage.v1.0+json", card, "",
-		"sip:bot@botplatform.test");
-	rich_is("rbm2", "sip:bot@botplatform.test", "application/vnd.gsma.xbotmessage.v1.0+json", xbot, "",
-		"sip:bot@botplatform.test");
-	rich_is("rbm3", "sip:bot@botplatform.test", "application/vnd.gsma.botmessage.v1.0+json", carousel, sugg,
-		"sip:bot@botplatform.test");
+	rich_is("rbm1", "sip:bot@botplatform.loopback.example", "application/vnd.gsma.botmessage.v1.0+json", card, "",
+		"sip:bot@botplatform.loopback.example");
+	rich_is("rbm2", "sip:bot@botplatform.loopback.example", "application/vnd.gsma.xbotmessage.v1.0+json", xbot, "",
+		"sip:bot@botplatform.loopback.example");
+	rich_is("rbm3", "sip:bot@botplatform.loopback.example", "application/vnd.gsma.botmessage.v1.0+json", carousel, sugg,
+		"sip:bot@botplatform.loopback.example");
 	char *resp = payload("response.json");
-	if (!(r = call("SendSuggestionResponse", g_variant_new("(sss)", "sip:bot@botplatform.test", "rbm3", resp), "(s)",
+	if (!(r = call("SendSuggestionResponse", g_variant_new("(sss)", "sip:bot@botplatform.loopback.example", "rbm3", resp), "(s)",
 			NULL)))
 		return 1;
 	g_variant_get(r, "(&s)", &mid);
@@ -275,22 +280,22 @@ int main(int argc, char **argv)
 	g_free(dlv);
 
 	/* ---- a chat from a chatbot (the network opens it after our response) ---- */
-	rich_is("rbm4", "sip:bot2@botplatform.test", "text/plain", "무엇을 도와드릴까요?", sugg, "sip:bot2@botplatform.test");
+	rich_is("rbm4", "sip:bot2@botplatform.loopback.example", "text/plain", "무엇을 도와드릴까요?", sugg, "sip:bot2@botplatform.loopback.example");
 	GVariant *t = wait_event("text rbm5");
 	if (t) {
 		const char *n, *id, *txt;
 		gint64 ts;
 		g_variant_get(t, "(&s&s&sx)", &n, &id, &txt, &ts);
-		CHECK(!strcmp(n, "sip:bot2@botplatform.test") && !strcmp(txt, "just text") && ts == TS,
+		CHECK(!strcmp(n, "sip:bot2@botplatform.loopback.example") && !strcmp(txt, "just text") && ts == TS,
 		      "rbm5: %s %s %lld", n, txt, (long long)ts);
 	}
 
 	/* ---- botinfo: fetched, cached (max-age), revalidated (no-cache + ETag), unknown ---- */
-	botinfo_is("sip:bot@botplatform.test", "botinfo-bot.json");
-	botinfo_is("sip:bot@botplatform.test;tk=on", "botinfo-bot.json");
-	botinfo_is("sip:bot2@botplatform.test", "botinfo-bot2.json");
-	botinfo_is("sip:bot2@botplatform.test", "botinfo-bot2.json");
-	refused("GetBotInfo", g_variant_new("(s)", "sip:nobody@botplatform.test"), "codes.noa.IMSroha.Rcs.Error.NotAvailable");
+	botinfo_is("sip:bot@botplatform.loopback.example", "botinfo-bot.json");
+	botinfo_is("sip:bot@botplatform.loopback.example;tk=on", "botinfo-bot.json");
+	botinfo_is("sip:bot2@botplatform.loopback.example", "botinfo-bot2.json");
+	botinfo_is("sip:bot2@botplatform.loopback.example", "botinfo-bot2.json");
+	refused("GetBotInfo", g_variant_new("(s)", "sip:nobody@botplatform.loopback.example"), "codes.noa.IMSroha.Rcs.Error.NotAvailable");
 	refused("GetBotInfo", g_variant_new("(s)", "tel:+8215880000"), "codes.noa.IMSroha.Rcs.Error.NotAvailable");
 
 	/* The network check (R9 7.7.3.3.1) came before all of the A2P traffic: no status for it. */
