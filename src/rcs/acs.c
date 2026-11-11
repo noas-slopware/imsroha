@@ -22,40 +22,6 @@
 
 /* ---- URLs and the request ---------------------------------------------- */
 
-static int parse_url(const char *url, int *tls, char *host, size_t hsize, uint16_t *port,
-		     char *path, size_t psize)
-{
-	const char *p;
-	if (!strncmp(url, "http://", 7)) {
-		*tls = 0;
-		p = url + 7;
-	} else if (!strncmp(url, "https://", 8)) {
-		*tls = 1;
-		p = url + 8;
-	} else {
-		return -EINVAL;
-	}
-	*port = *tls ? 443 : 80;
-	const char *slash = strchr(p, '/');
-	size_t hl = slash ? (size_t)(slash - p) : strlen(p);
-	char hp[256];
-	if (!hl || hl >= sizeof(hp))
-		return -EINVAL;
-	memcpy(hp, p, hl);
-	hp[hl] = '\0';
-	char *colon = strrchr(hp, ':');
-	if (colon && !strchr(hp, ']')) {
-		*colon = '\0';
-		long v = strtol(colon + 1, NULL, 10);
-		if (v <= 0 || v > 65535)
-			return -EINVAL;
-		*port = (uint16_t)v;
-	}
-	snprintf(host, hsize, "%s", hp);
-	snprintf(path, psize, "%s", slash ? slash : "");
-	return 0;
-}
-
 /* RFC 3986 unreserved characters stay, everything else is %XX. */
 static void pct(GString *s, const char *v)
 {
@@ -100,7 +66,7 @@ int acs_build_request(const struct rcs_config *cfg, const struct rcs_identity *i
 	} else {
 		snprintf(url, sizeof(url), "%s", cfg->acs_url);
 	}
-	if (parse_url(url, &tls, out->host, sizeof(out->host), &out->port, path, sizeof(path)) < 0)
+	if (http_parse_url(url, &tls, out->host, sizeof(out->host), &out->port, path, sizeof(path)) < 0)
 		return -EINVAL;
 	out->tls = tls;
 
