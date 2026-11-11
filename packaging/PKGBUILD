@@ -11,7 +11,7 @@
 
 pkgname=imsroha
 pkgver=0.2.0
-pkgrel=10
+pkgrel=11
 pkgdesc="Userspace IMS: VoLTE calls and SMS over IMS on Qualcomm QMI modems, behind ModemManager"
 arch=('aarch64' 'x86_64')
 url="https://github.com/noas-slopware/imsroha"

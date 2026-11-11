@@ -545,6 +545,42 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
  * and responses (to the requests it sends us on port_us) from port_us to its
  * port_pc. The kernel's policies put both into ESP.
  */
+/*
+ * The port in the sent-by of the first Via of a SIP message (its rport
+ * when that has a value), 0 when there is none. For a response that is the
+ * Via of the request it answers: where the request's sender wants it
+ * (RFC 3261 18.2.2, RFC 3581 4).
+ */
+static uint16_t top_via_port(const char *msg, size_t len)
+{
+	char via[512];
+	char tmp[4096];
+	size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+	memcpy(tmp, msg, n);
+	tmp[n] = '\0';
+	if (find_header(tmp, "Via", via, sizeof(via)) < 0 || !via[0])
+		return 0;
+	char *comma = strchr(via, ',');
+	if (comma)
+		*comma = '\0';
+	const char *rp = strcasestr(via, ";rport=");
+	if (rp)
+		return (uint16_t)atoi(rp + 7);
+	/* SIP/2.0/UDP host[:port] or [v6][:port], then ;params */
+	char *host = strchr(via, ' ');
+	if (!host)
+		return 0;
+	while (*host == ' ')
+		host++;
+	char *semi = strchr(host, ';');
+	if (semi)
+		*semi = '\0';
+	char *port = host[0] == '[' ? strstr(host, "]:") : strrchr(host, ':');
+	if (!port)
+		return 0;
+	return (uint16_t)atoi(port + (host[0] == '[' ? 2 : 1));
+}
+
 static int send_sip_msg(struct imsd_sip_ctx *ctx, const void *buf, size_t len)
 {
 	struct sockaddr_in6 to = ctx->pcscf_addr;
@@ -554,6 +590,20 @@ static int send_sip_msg(struct imsd_sip_ctx *ctx, const void *buf, size_t len)
 		int response = len >= 8 && !memcmp(buf, "SIP/2.0 ", 8);
 		fd = response ? ctx->fd_s : ctx->fd_c;
 		to.sin6_port = htons(response ? ctx->sec.port_pc : ctx->sec.port_ps);
+		/*
+		 * A response goes where the request's Via asks (RFC 3261 18.2.2),
+		 * through the SA pair that covers that port. TS 33.203 7.1 puts
+		 * network requests on the P-CSCF's protected client port, but a
+		 * P-CSCF that sends them with its protected server port in the
+		 * Via never sees a response sent to the client port.
+		 */
+		if (response) {
+			uint16_t vp = top_via_port(buf, len);
+			if (vp == ctx->sec.port_ps) {
+				fd = ctx->fd_c;
+				to.sin6_port = htons(ctx->sec.port_ps);
+			}
+		}
 	}
 	ssize_t sent = sendto(fd, buf, len, 0, (struct sockaddr *)&to, sizeof(to));
 	if (sent < 0) {
@@ -2180,8 +2230,9 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		int expected = ctx->sec_state == IMSD_SEC_PROTECTED && fd == ctx->fd_s &&
 			       sport == ctx->sec.port_pc &&
 			       !memcmp(&from_addr.sin6_addr, &ctx->pcscf_addr.sin6_addr, 16);
-		fprintf(stderr, "imsroha: %.*s from [%s]:%u on the %s port%s\n", mlen, buf, src, sport,
-			sock, ctx->sec_state != IMSD_SEC_PROTECTED || expected ? "" :
+		fprintf(stderr, "imsroha: %.*s from [%s]:%u on the %s port, Via port %u%s\n", mlen, buf,
+			src, sport, sock, top_via_port(buf, (size_t)n),
+			ctx->sec_state != IMSD_SEC_PROTECTED || expected ? "" :
 			", not where our responses go");
 	}
 
