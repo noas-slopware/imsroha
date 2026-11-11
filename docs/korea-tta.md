@@ -25,7 +25,7 @@ where data/carriers.conf takes its SKT and KT values from.
 | 5.2.1 | 305 on re-registration: another P-CSCF; 503 without Retry-After = 500; try every P-CSCF from DM/PCO, then a new IMS PDN | P-CSCF list with failover on timeouts |
 | 5.2.2 | IMS-AKA, sec-agree and IPsec (TS 24.229, 33.203); integrity mandatory, confidentiality optional; **if IPsec negotiation fails, go on without sec-agree/IPsec** | `ipsec` per carrier, with that fallback |
 | 5.2.2 | Security-Client default `alg=hmac-sha-2-256-128, prot=esp, ealg=aes-cbc`; without sha-2-256, `alg=hmac-sha-1-96, prot=esp, ealg=aes-cbc` | `ipsec-alg` / `ipsec-ealg`. Stock offers `hmac-sha-1-96` with `aes-cbc` (SKT, LG U+) or `null,aes-cbc` (KT) |
-| 5.2.2 | unprotected REGISTER: `Authorization` with `algorithm=AKAv1-MD5` | the first REGISTER carries an empty Authorization without algorithm (what LG U+ answers to) |
+| 5.2.2 | unprotected REGISTER: `Authorization` with `algorithm=AKAv1-MD5` | with sec-agree on (SKT, KT), yes; LG U+ keeps its recorded REGISTER without it |
 | 5.2.3 | SIP R-URI with `user=phone` and the local number; tel URI with `phone-context`; tel preferred | INVITE: `tel:` with `phone-context`; MESSAGE: `sip:<number>@<domain>;user=phone` (Samsung's `UriGeneratorKr` does the same for all three) |
 | 5.5 | the TTA VoLTE management object over OMA-DM: P-CSCF, SIP timers, ports, payload types, `SMS_PSI`, `IPsec_enabled`, ... | no DM client; these come from carriers.conf |
 | 9.1 | SMS over NAS or over IP, as the DM server says | `sms-over-ip` per carrier |

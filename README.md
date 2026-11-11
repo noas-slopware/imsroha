@@ -18,8 +18,11 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 | SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
 
-SKT and KT also expect IPsec (sec-agree, TS 33.203) on the Gm interface. LG U+
-registers without it.
+SKT and KT get sec-agree with IPsec ESP (TS 33.203), the reg event subscription and
+`+sip.instance`, as TTAK.KO-06.0357 (the Korean VoLTE terminal standard) asks.
+LG U+ registers without any of them, and keeps doing so. When IPsec negotiation
+fails, imsroha registers without it, as the TTA standard says. `docs/korea-tta.md`
+goes through the standard and where imsroha stands.
 
 Hardware it has run on: the Galaxy Z Flip3 (SM8350, IPA, QRTR) in
 [linux-zflip3](https://github.com/noas-slopware/linux-zflip3). Nothing in the code
@@ -32,7 +35,7 @@ profile by its APN.
 | binary | unit | does |
 |---|---|---|
 | `imsroha-bearer` | `imsroha-bearer.service` | starts the IMS PDN (the 3GPP profile whose APN is `ims`) on its own QMAP mux id, creates the rmnet link `imsroha0`, puts the address on it, policy-routes traffic from that address over it, and writes `/run/imsroha/pdn` (interface, address, PCO P-CSCFs, DNS) |
-| `imsroha` | `imsroha.service` | reads the SIM (ISIM, else USIM: IMSI, EF_AD, EF_SMSP), picks the carrier profile, registers, and does SMS (TS 24.341) and VoLTE (INVITE, PRACK, UPDATE, AMR-WB/AMR over RTP, RFC 4733 DTMF). D-Bus `codes.noa.IMSroha` |
+| `imsroha` | `imsroha.service` | reads the SIM (ISIM, else USIM: IMSI, EF_AD, EF_SMSP), picks the carrier profile, registers (IMS AKA, sec-agree with IPsec through `ip xfrm`, reg event), and does SMS (TS 24.341) and VoLTE (INVITE, PRACK, UPDATE, AMR-WB/AMR over RTP, RFC 4733 DTMF). D-Bus `codes.noa.IMSroha` |
 | `imsroha-audio` | `imsroha-audio.service` (user, graphical session) | call PCM between `/run/imsroha/audio.sock` and PipeWire |
 | `imsroha-vss-samsung` | `imsroha-vss-samsung.service` | Samsung modems only: sends the IPC that ungates IMS registration (vendor QMI service 227). Exits at once on any other modem |
 
@@ -73,9 +76,15 @@ and vo-amrwbenc. `packaging/PKGBUILD` builds the Arch package from this checkout
 `systemctl enable --now imsroha-bearer.service`; the bearer starts the rest.
 
 `tests/sip-golden.c` runs the SIP layer against a fake P-CSCF on loopback: REGISTER,
-the AKA 401, MO and MT SMS, a cancelled MO call and an answered MT call. The output,
-with the random fields masked, must match `tests/golden-lguplus.txt`, which is
-byte for byte what the code sent before it left linux-zflip3.
+the AKA 401, MO and MT SMS, a cancelled MO call and an answered MT call. With the
+random fields masked, the output must match:
+
+- `tests/golden-lguplus.txt`: an LG U+ card with an ISIM. Byte for byte what the code
+  sent before it left linux-zflip3.
+- `tests/golden-kt.txt`: a KT card without an ISIM, with sec-agree and the reg event.
+- `esp-loopback`: the KT run again with the real `ip xfrm`, in a user and network
+  namespace. The fake P-CSCF answers through the SAs, and every SA has to carry
+  packets.
 
 ## Related work
 
