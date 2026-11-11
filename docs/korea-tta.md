@@ -3,7 +3,7 @@
 The Korean carriers share one terminal standard, TTAK.KO-06.0357 "사업자 간 UICC
 이동성 제공을 위한 VoLTE 단말 규격" (VoLTE terminal for UICC portability between
 operators). R6 (2026-06-26, 64 pages) is current. TTA only hands out the PDF after
-a login, so what follows is from R5 (2022-06-29), read from the public copy at
+a login, and its sign-up form failed (2026-11-11), so what follows is from R5 (2022-06-29), read from the public copy at
 https://www.scribd.com/document/935960136/TTAK-KO-06-0357R5-2. Check it against R6
 when someone has that file. A January 2026 news piece says the standard was being
 changed because it let terminals without end-to-end encryption onto the core
@@ -27,6 +27,24 @@ where data/carriers.conf takes its SKT and KT values from.
 | 5.2.2 | Security-Client default `alg=hmac-sha-2-256-128, prot=esp, ealg=aes-cbc`; without sha-2-256, `alg=hmac-sha-1-96, prot=esp, ealg=aes-cbc` | `ipsec-alg` / `ipsec-ealg`. Stock offers `hmac-sha-1-96` with `aes-cbc` (SKT, LG U+) or `null,aes-cbc` (KT) |
 | 5.2.2 | unprotected REGISTER: `Authorization` with `algorithm=AKAv1-MD5` | with sec-agree on (SKT, KT), yes; LG U+ keeps its recorded REGISTER without it |
 | 5.2.3 | SIP R-URI with `user=phone` and the local number; tel URI with `phone-context`; tel preferred | INVITE: `tel:` with `phone-context`; MESSAGE: `sip:<number>@<domain>;user=phone` (Samsung's `UriGeneratorKr` does the same for all three) |
+| 6.2.5 | AMR and AMR-WB in both RFC 4867 payload formats, bandwidth-efficient and octet-aligned | both: an offer's per-PT fmtp decides, octet-aligned preferred when both are offered (what LG U+ uses), and the answer mirrors it; our own offers stay octet-aligned |
 | 5.5 | the TTA VoLTE management object over OMA-DM: P-CSCF, SIP timers, ports, payload types, `SMS_PSI`, `IPsec_enabled`, ... | no DM client; these come from carriers.conf |
 | 9.1 | SMS over NAS or over IP, as the DM server says | `sms-over-ip` per carrier |
 | 9.3 | MO-SMS Request-URI = the SMS PSI from DM | `sms-psi` per carrier; without it, the destination as above |
+
+## Other evidence
+
+A Korean write-up of VoLTE on Quectel modems on all three networks
+(https://blog.naver.com/jhnotepad/223505876518, 2024-07-08). That is
+modem-side IMS set through AT commands and NV items, so it is not this
+approach, but it records what the networks accept:
+
+- KT and SKT want a non-carrier device's IMEI registered with them: KT as
+  "PTA-VoLTE" (or it shows up as OPENMODEL4 after a USIM change), SKT as
+  "OMD 기타LTE핸드셋_VOLTE". LG U+ needs nothing.
+- KT's User-Agent there is `TTA-VoLTE/3.0 EC25E/A04 Device_Type/Modem OMD`:
+  TTA 3.0 with the `OMD` operator token.
+- SKT's IMS domain is `sktims.net`, as in the stock profile. The post makes
+  MO-SMS work on SKT by turning on SMS over IMS (`+g.3gpp.smsip`), where
+  Samsung's stock SKT profile leaves SMS on NAS: SKT seems to take both.
+  imsroha keeps stock's choice; `sms-over-ip=true` in [carrier] tries the other.

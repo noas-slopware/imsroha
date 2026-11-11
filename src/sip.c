@@ -7,6 +7,7 @@
 #include "sms.h"
 #include "dns.h"
 #include "imei.h"
+#include "amr_be.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -328,6 +329,20 @@ static int parse_sdp_media(const char *sdp, char *out_ip, size_t max_ip, uint16_
 	return (out_ip[0] && *out_port > 0) ? 0 : -ENOENT;
 }
 
+/* Whether the a=fmtp line of payload type pt has octet-align=1 (RFC 4867 8.1). */
+static int sdp_pt_octet_aligned(const char *sdp, int pt)
+{
+	char key[24];
+	snprintf(key, sizeof(key), "a=fmtp:%d ", pt);
+	const char *f = strstr(sdp, key);
+	if (!f)
+		return 0;
+	size_t l = strcspn(f, "\r\n");
+	char line[256];
+	snprintf(line, sizeof(line), "%.*s", (int)(l < sizeof(line) - 1 ? l : sizeof(line) - 1), f);
+	return strstr(line, "octet-align=1") != NULL;
+}
+
 static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 {
 	ctx->call_pt_amrwb = 0;
@@ -336,6 +351,7 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 	ctx->call_pt_dtmf_wb = 0;
 	ctx->call_pt_dtmf_nb = 0;
 	ctx->call_octet_aligned = 0;
+	ctx->call_wb_octet = ctx->call_nb_octet = 1;
 	ctx->call_has_wb = 0;
 	ctx->call_has_nb = 0;
 	ctx->call_has_dtmf_wb = 0;
@@ -350,10 +366,22 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 		const char *sp = strchr(rtp, ' ');
 		if (sp) {
 			sp++;
+			/*
+			 * RFC 4867: octet-align=1 in this PT's fmtp, else bandwidth-
+			 * efficient. With both on offer, take an octet-aligned one (what
+			 * LG U+ has always had); otherwise the last listed, as before.
+			 */
+			int oa = sdp_pt_octet_aligned(sdp, pt);
 			if (strncasecmp(sp, "AMR-WB", 6) == 0) {
-				ctx->call_pt_amrwb = pt;
+				if (!ctx->call_pt_amrwb || oa || !ctx->call_wb_octet) {
+					ctx->call_pt_amrwb = pt;
+					ctx->call_wb_octet = oa;
+				}
 			} else if (strncasecmp(sp, "AMR", 3) == 0 && strncasecmp(sp, "AMR-WB", 6) != 0) {
-				ctx->call_pt_amr = pt;
+				if (!ctx->call_pt_amr || oa || !ctx->call_nb_octet) {
+					ctx->call_pt_amr = pt;
+					ctx->call_nb_octet = oa;
+				}
 			} else if (strncasecmp(sp, "telephone-event/16000", 21) == 0) {
 				ctx->call_pt_dtmf_wb = pt;
 				ctx->call_has_dtmf_wb = 1;
@@ -371,9 +399,11 @@ static void parse_sdp_codecs(const char *sdp, struct imsd_sip_ctx *ctx)
 		if (p) p++;
 	}
 
-	if (strcasestr(sdp, "octet-align=1")) {
-		ctx->call_octet_aligned = 1;
-	}
+	ctx->call_octet_aligned = ctx->call_pt_amrwb ? ctx->call_wb_octet : ctx->call_nb_octet;
+	if (!ctx->call_pt_amrwb)
+		ctx->call_wb_octet = 1;
+	if (!ctx->call_pt_amr)
+		ctx->call_nb_octet = 1;
 
 	ctx->call_has_wb = ctx->call_pt_amrwb > 0;
 	ctx->call_has_nb = ctx->call_pt_amr > 0;
@@ -456,11 +486,13 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 	if (amrwb && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d AMR-WB/16000/1\r\n"
-			"a=fmtp:%d octet-align=1;mode-set=0,1,2\r\n", amrwb, amrwb);
+			"a=fmtp:%d %smode-set=0,1,2\r\n", amrwb, amrwb,
+			answer && !ctx->call_wb_octet ? "" : "octet-align=1;");
 	if (amr && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d AMR/8000/1\r\n"
-			"a=fmtp:%d octet-align=1;mode-set=0,2,4,7\r\n", amr, amr);
+			"a=fmtp:%d %smode-set=0,2,4,7\r\n", amr, amr,
+			answer && !ctx->call_nb_octet ? "" : "octet-align=1;");
 	if (dtmf_wb && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d telephone-event/16000\r\n"
@@ -1202,6 +1234,16 @@ static int on_rtp_tx_timer(sd_event_source *s, uint64_t usec, void *userdata)
 	} else {
 		pkt[13] = 0x7c; /* NO_DATA: FT=15, Q=1, no speech bits */
 		pkt_len += 1;
+		enc_len = 1;
+	}
+	if (!(codec == IMSD_CODEC_AMRNB ? ctx->call_nb_octet : ctx->call_wb_octet)) {
+		/* Bandwidth-efficient: CMR, ToC and speech bits without padding between. */
+		uint8_t st[64];
+		memcpy(st, pkt + 13, (size_t)enc_len);
+		int be = imsroha_amr_be_pack(codec != IMSD_CODEC_AMRNB, st, (size_t)enc_len, 15,
+					     pkt + 12, sizeof(pkt) - 12);
+		if (be > 0)
+			pkt_len = 12 + (size_t)be;
 	}
 
 	ctx->rtp_tx_seq++;
@@ -1270,7 +1312,16 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		if (ctx->codec_open && n > 13 && (is_wb || is_nb)) {
 			uint32_t ts = (uint32_t)buf[4] << 24 | (uint32_t)buf[5] << 16 |
 				      (uint32_t)buf[6] << 8 | buf[7];
-			playout_put(ctx, ts, is_wb, buf + 13, (size_t)(n - 13));
+			int octet = pt_rx == ctx->call_pt_amrwb ? ctx->call_wb_octet :
+				    pt_rx == ctx->call_pt_amr ? ctx->call_nb_octet : 1;
+			if (octet) {
+				playout_put(ctx, ts, is_wb, buf + 13, (size_t)(n - 13));
+			} else {
+				uint8_t st[64];
+				int sl = imsroha_amr_be_unpack(is_wb, buf + 12, (size_t)(n - 12), st, sizeof(st));
+				if (sl > 0)
+					playout_put(ctx, ts, is_wb, st, (size_t)sl);
+			}
 		}
 	}
 	return 0;

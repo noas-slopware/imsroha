@@ -137,6 +137,8 @@ struct imsd_sip_ctx {
 	int call_has_dtmf_wb;
 	int call_has_dtmf_nb;
 	int call_octet_aligned;
+	/* RFC 4867 payload format per codec: 1 octet-aligned, 0 bandwidth-efficient. */
+	int call_wb_octet, call_nb_octet;
 
 	/* Our SDP origin: one session id per call, version bumped per body (RFC 3264 8). */
 	uint64_t sdp_sess_id;

@@ -284,13 +284,20 @@ int main(void)
 	drain("MT-SMS answers");
 
 	/* 7. MT call: INVITE with AMR-WB 100 / AMR 96 / DTMF, answer, far end BYE */
-	static const char sdp[] =
+	/*
+	 * LG U+ offers octet-aligned AMR (b2q-imsd only ever spoke that format,
+	 * with two-way audio); the KT run offers bandwidth-efficient AMR, which
+	 * the answer has to mirror (RFC 4867 8.3.1, TTAK.KO-06.0357 6.2.5).
+	 */
+	const char *oa = getenv("GOLDEN_CARRIER") && !strcmp(getenv("GOLDEN_CARRIER"), "KT") ? "" : "octet-align=1;";
+	char sdp[1024];
+	snprintf(sdp, sizeof(sdp),
 		"v=0\r\no=- 1 1 IN IP6 ::1\r\ns=-\r\nc=IN IP6 ::1\r\nt=0 0\r\n"
 		"m=audio 41000 RTP/AVP 100 96 101 102\r\n"
-		"a=rtpmap:100 AMR-WB/16000\r\na=fmtp:100 mode-change-capability=2;max-red=0\r\n"
-		"a=rtpmap:96 AMR/8000\r\na=fmtp:96 mode-change-capability=2;max-red=0\r\n"
+		"a=rtpmap:100 AMR-WB/16000\r\na=fmtp:100 %smode-change-capability=2;max-red=0\r\n"
+		"a=rtpmap:96 AMR/8000\r\na=fmtp:96 %smode-change-capability=2;max-red=0\r\n"
 		"a=rtpmap:101 telephone-event/16000\r\na=rtpmap:102 telephone-event/8000\r\n"
-		"a=ptime:20\r\na=sendrecv\r\n";
+		"a=ptime:20\r\na=sendrecv\r\n", oa, oa);
 	snprintf(resp, sizeof(resp),
 		"INVITE sip:01000000000@[::1]:5060 SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmtcall1\r\n"

@@ -204,7 +204,7 @@ CSeq: 1 INVITE
 Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
 Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
 Content-Type: application/sdp
-Content-Length: 381
+Content-Length: 353
 
 v=0
 o=- <sess> <ver> IN IP6 ::1
@@ -214,9 +214,9 @@ t=0 0
 m=audio 40000 RTP/AVP 100 96 101 102
 b=AS:41
 a=rtpmap:100 AMR-WB/16000/1
-a=fmtp:100 octet-align=1;mode-set=0,1,2
+a=fmtp:100 mode-set=0,1,2
 a=rtpmap:96 AMR/8000/1
-a=fmtp:96 octet-align=1;mode-set=0,2,4,7
+a=fmtp:96 mode-set=0,2,4,7
 a=rtpmap:101 telephone-event/16000
 a=fmtp:101 0-15
 a=rtpmap:102 telephone-event/8000
