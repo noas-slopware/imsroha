@@ -25,6 +25,11 @@ static const char introspection[] =
 	"   <arg name='number' type='s' direction='in'/>"
 	"   <arg name='message_id' type='s' direction='in'/>"
 	"  </method>"
+	"  <method name='SendFile'>"
+	"   <arg name='number' type='s' direction='in'/>"
+	"   <arg name='path' type='s' direction='in'/>"
+	"   <arg name='message_id' type='s' direction='out'/>"
+	"  </method>"
 	"  <method name='GetCapabilities'>"
 	"   <arg name='number' type='s' direction='in'/>"
 	"   <arg name='capabilities' type='a{sv}' direction='out'/>"
@@ -38,6 +43,14 @@ static const char introspection[] =
 	"  </signal>"
 	"  <signal name='ComposingChanged'>"
 	"   <arg name='number' type='s'/><arg name='active' type='b'/>"
+	"  </signal>"
+	"  <signal name='FileReceived'>"
+	"   <arg name='number' type='s'/><arg name='message_id' type='s'/>"
+	"   <arg name='path' type='s'/><arg name='content_type' type='s'/><arg name='size' type='t'/>"
+	"   <arg name='thumbnail_path' type='s'/><arg name='timestamp_ms' type='x'/>"
+	"  </signal>"
+	"  <signal name='FileReceiveFailed'>"
+	"   <arg name='number' type='s'/><arg name='message_id' type='s'/><arg name='reason' type='s'/>"
 	"  </signal>"
 	"  <signal name='StateChanged'><arg name='state' type='s'/></signal>"
 	" </interface>"
@@ -54,7 +67,7 @@ static void reply_error(GDBusMethodInvocation *inv, GError *e)
 static void on_call(GDBusConnection *c, const char *sender, const char *path, const char *iface,
 		    const char *method, GVariant *params, GDBusMethodInvocation *inv, gpointer ud)
 {
-	(void)c; (void)sender; (void)path; (void)iface;
+	(void)c; (void)path; (void)iface;
 	struct rcsd *r = ud;
 	GError *e = NULL;
 
@@ -81,6 +94,10 @@ static void on_call(GDBusConnection *c, const char *sender, const char *path, co
 			g_dbus_method_invocation_return_value(inv, NULL);
 		else
 			reply_error(inv, e);
+	} else if (!strcmp(method, "SendFile")) {
+		const char *num, *fpath;
+		g_variant_get(params, "(&s&s)", &num, &fpath);
+		rcsd_ft_send(r, sender, num, fpath, inv);
 	} else if (!strcmp(method, "GetCapabilities")) {
 		const char *num;
 		g_variant_get(params, "(&s)", &num);
@@ -156,4 +173,15 @@ void rcsd_dbus_status(struct rcsd *r, const char *id, const char *status)
 void rcsd_dbus_composing(struct rcsd *r, const char *number, gboolean active)
 {
 	emit(r, "ComposingChanged", g_variant_new("(sb)", number, active));
+}
+
+void rcsd_dbus_file_received(struct rcsd *r, const char *number, const char *id, const char *path,
+			     const char *ctype, guint64 size, const char *thumb, gint64 ts_ms)
+{
+	emit(r, "FileReceived", g_variant_new("(sssstsx)", number, id, path, ctype, size, thumb ? thumb : "", ts_ms));
+}
+
+void rcsd_dbus_file_failed(struct rcsd *r, const char *number, const char *id, const char *reason)
+{
+	emit(r, "FileReceiveFailed", g_variant_new("(sss)", number, id, reason));
 }

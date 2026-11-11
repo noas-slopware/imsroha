@@ -121,6 +121,7 @@ static void rcs_local(GKeyFile *kf, struct rcs_config *cfg)
 	integer(kf, g, "otp-timeout", 10, 3600, &v);
 	cfg->otp_timeout = (unsigned)v;
 	str(kf, g, "state-dir", cfg->state_dir, sizeof(cfg->state_dir));
+	str(kf, g, "download-dir", cfg->download_dir, sizeof(cfg->download_dir));
 }
 
 static void rcs_carrier(GKeyFile *kf, const char *g, struct rcs_config *cfg)

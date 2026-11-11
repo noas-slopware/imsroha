@@ -6,7 +6,10 @@ Digest and checks the answer, answers our chat INVITE and OPTIONS, takes the
 message and sends the delivered IMDN, then (after our isComposing) opens a
 chat to us from a second number and waits for our delivered and displayed
 IMDNs. It prints "done" (or "FAIL ...") on stdout and logs every SIP and MSRP
-message to --log. Never run it anywhere but in the test's own namespace."""
+message to --log. With --cs-port, the chat it opens also carries file-infos
+(file transfer over HTTP) pointing at fake-cs.py there, and the file-infos
+we send are kept in --ft-dir/mo-<n>.xml and answered with a delivered IMDN.
+Never run it anywhere but in the test's own namespace."""
 import argparse, hashlib, re, socket, ssl, sys, threading, time
 
 ap = argparse.ArgumentParser()
@@ -16,13 +19,15 @@ ap.add_argument('--cert', required=True)
 ap.add_argument('--key', required=True)
 ap.add_argument('--log', required=True)
 ap.add_argument('--reg403', action='store_true', help='answer every authenticated REGISTER with 403')
+ap.add_argument('--cs-port', type=int, help='fake-cs.py, for the file-infos we send')
+ap.add_argument('--ft-dir', help='where the file-infos we receive are kept')
 a = ap.parse_args()
 
 USER, REALM, PWD = '+821099999999@rcs.test', 'rcs.test', 'testPassword'
 NONCE = 'b5ba9c08f1a8e1d1'
 log = open(a.log, 'a', buffering=1)
 lock = threading.Lock()
-state = {'sip': None, 'msg_ids': [], 'seen': set()}
+state = {'sip': None, 'msg_ids': [], 'seen': set(), 'mo_files': 0}
 
 def L(*x):
     with lock:
@@ -224,7 +229,9 @@ def msrp_frames(buf):
         out.append((tid.decode(), m.group(2).decode(), hdrs, body.decode(errors='replace')))
 
 def msrp_send(conn, to, frm, ctype, body):
-    tid = f't{int(time.time()*1000)%100000}{threading.get_ident()%1000}'
+    with lock:
+        state['tids'] = state.get('tids', 0) + 1
+        tid = f't{int(time.time()*1000)%100000}x{state["tids"]}'
     b = body.encode()
     msg = (f'MSRP {tid} SEND\r\nTo-Path: {to}\r\nFrom-Path: {frm}\r\nMessage-ID: m{tid}\r\n'
            f'Byte-Range: 1-{len(b)}/{len(b)}\r\nContent-Type: {ctype}\r\n\r\n').encode() + b + f'\r\n-------{tid}$\r\n'.encode()
@@ -237,6 +244,48 @@ def cpim(msg_id, ctype, body, disp=None, extra=''):
     if disp:
         s += f'imdn.Disposition-Notification: {disp}\r\n'
     return s + f'\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {len(body.encode())}\r\n\r\n{body}'
+
+def file_info(file_url, name, size, until='2066-08-23T04:53:50.000Z', thumb_url=None):
+    x = ('<?xml version="1.0" encoding="UTF-8"?>\r\n<file xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp" '
+         'xmlns:e="urn:gsma:params:xml:ns:rcs:rcs:up:fthttpext">\r\n')
+    if thumb_url:
+        x += ('<file-info type="thumbnail">\r\n<file-size>3000</file-size>\r\n<content-type>image/png</content-type>\r\n'
+              f'<data url="{thumb_url}" until="{until}"/>\r\n</file-info>\r\n')
+    x += (f'<file-info type="file">\r\n<file-size>{size}</file-size>\r\n<file-name>{name}</file-name>\r\n'
+          '<content-type>application/octet-stream</content-type>\r\n'
+          f'<data url="{file_url}" until="{until}"/>\r\n</file-info>\r\n</file>\r\n')
+    return x
+
+def mt_files(conn, to, frm):
+    cs = f'https://localhost:{a.cs_port}/content'
+    FT = 'application/vnd.gsma.rcs-ft-http+xml;charset=UTF-8'
+    D = 'positive-delivery, display'
+    # A file with a thumbnail and a name that tries to leave the directory.
+    msrp_send(conn, to, frm, 'message/cpim', cpim('mtft1', FT, file_info(
+        f'{cs}/rx1?t=x&amp;s=40000', '..%2F..%2Fevil+name.bin', 40000, thumb_url=f'{cs}/rx1t'), D))
+    # Expired: never fetched.
+    msrp_send(conn, to, frm, 'message/cpim', cpim('mtft2', FT, file_info(
+        f'{cs}/gone', 'old.bin', 10, until='2020-01-01T00:00:00.000Z'), D))
+    # More than the configuration lets in: never fetched.
+    msrp_send(conn, to, frm, 'message/cpim', cpim('mtft3', FT, file_info(f'{cs}/big', 'big.bin', 999999999), D))
+    # Another host (127.0.0.1, not the configured localhost): its 401 gets no credentials.
+    msrp_send(conn, to, frm, 'message/cpim', cpim('mtft4', FT, file_info(
+        f'https://127.0.0.1:{a.cs_port}/content/rx4', 'x.bin', 100), D))
+    L('event mt-files sent')
+
+def mo_file(conn, to, frm, body):
+    # CPIM headers, MIME headers, then the file-info exactly as it came.
+    mid = re.search(r'imdn.Message-ID: (\S+)', body).group(1)
+    xml = body.split('\r\n\r\n', 2)[2]
+    state['mo_files'] += 1
+    if a.ft_dir:
+        open(f'{a.ft_dir}/mo-{state["mo_files"]}.xml', 'w', newline='').write(xml)
+    L('event mo-file', state['mo_files'], mid)
+    x = ('<?xml version="1.0" encoding="UTF-8"?>\r\n<imdn xmlns="urn:ietf:params:xml:ns:imdn">\r\n'
+         f'<message-id>{mid}</message-id>\r\n<datetime>2026-11-11T12:00:01.000Z</datetime>\r\n'
+         '<delivery-notification><status><delivered/></status></delivery-notification>\r\n</imdn>\r\n')
+    msrp_send(conn, frm, to, 'message/cpim',
+              cpim('imdnf' + str(state['mo_files']), 'message/imdn+xml', x, extra='Content-Disposition: notification\r\n'))
 
 def msrp_conn(conn):
     buf = b''
@@ -261,6 +310,11 @@ def msrp_conn(conn):
                     # Our chat to them: the message, asking for both IMDNs.
                     msrp_send(conn, frm, to, 'message/cpim',
                               cpim('mt1', 'text/plain', 'hi from 2', 'positive-delivery, display'))
+                    if a.cs_port:
+                        mt_files(conn, frm, to)
+                continue
+            if 'rcs-ft-http+xml' in body and 'imdn+xml' not in body:
+                mo_file(conn, to, frm, body)
                 continue
             if 'hello' in body and 'text/plain' in body:
                 mid = re.search(r'imdn.Message-ID: (\S+)', body).group(1)

@@ -159,6 +159,8 @@ glib-networking, GMarkup); the SIM and modem reads reuse `src/aka.c` and `src/im
 | `src/rcs/sipua.c` | a second SIP user agent: TLS, NAPTR/SRV, Digest, REGISTER, PUBLISH (presence), OPTIONS, INVITE/MESSAGE/BYE for chat |
 | `src/rcs/msrp.c` | MSRP (RFC 4975) over TLS, as the active end |
 | `src/rcs/cpim.c` | CPIM (RFC 3862), IMDN (RFC 5438), isComposing (RFC 3994) |
+| `src/rcs/fthttp.c` | file transfer over HTTP: the FileTransfer configuration, the file-info XML, Digest, upload, download |
+| `src/rcs/ft.c` | file transfer in the daemon: `SendFile`, fetching what comes in, the download directory |
 | `src/rcs/rcsd.c` | the daemon: state machine, OTP from SMS, D-Bus service |
 
 ### Opt-in, and what "off" means
@@ -256,8 +258,10 @@ optional port), `Ext/GSMA` `AuthType`/`Realm`/`UserName`/`UserPwd`, `psSignallin
 validation against the system store (`[rcs] ca-file=` for a private CA).
 
 - Contact: the feature tags of what is implemented, nothing else: ICSI
-  `urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session` (chat) and `+sip.instance`.
-  File transfer, geolocation, chatbot and presence tags are added with those features.
+  `urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session` (chat) and `+sip.instance`, and
+  one `+g.3gpp.iari-ref` with `rcse.dp` (presence) and `rcs.fthttp` (file transfer,
+  only when the configuration has `ftAuth=1` and an `ftHTTPCSURI`), comma separated
+  as in R9's examples. Geolocation and chatbot tags are added with those features.
 - Digest (MD5, qop=auth) with the ACS credentials. AKA is not implemented (R9's sample
   configuration says Digest).
 - Capability discovery as the configuration's `CAPDISCOVERY/defaultDisc` says: 1 is
@@ -290,6 +294,51 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
 - Standalone messaging (pager mode) is "X" in R9 table 7-1, so Korea gets none. It is
   implemented for receiving (a MESSAGE with CPIM is a chat message) and for IMDNs.
 
+### File transfer over HTTP (RCC.07 3.2.5, R9 7.4.1.1)
+
+The file goes to the carrier's content server; the chat carries only the file-info
+XML the server answers with (CPIM content type `application/vnd.gsma.rcs-ft-http+xml`,
+offered in the SDP's `accept-wrapped-types` and published as the
+`org.openmobilealliance:File-Transfer-HTTP` tuple, version 1.0, R9 table 6-4).
+
+- Configuration: `ftAuth` (SERVICES), and from FileTransfer `ftHTTPCSURI`,
+  `ftHTTPCSUser`, `ftHTTPCSPwd`, `MaxSizeFileTr`, `ftWarnSize`, `ftAutAccept`, and
+  from Ext (R9 B.1) `ftHTTPExtraCSURI` and `MaxSizeExtraFileTr`. They are read from
+  the stored `config.xml` at registration; the password and user never reach the log.
+  LG U+ provisions ftAuth 1, MaxSizeFileTr 5120 KB, MaxSizeExtraFileTr 307200 KB, a
+  content server and a large-content server.
+- Sending (`SendFile`): the file is opened with the D-Bus caller's rights (see below),
+  must be a regular, non-empty file, and goes to `ftHTTPCSURI` up to `MaxSizeFileTr`,
+  to `ftHTTPExtraCSURI` above that up to `MaxSizeExtraFileTr` (0: no limit, R9 B.1),
+  and is refused above. The upload is what stock's `UploadFileTask` does: an empty
+  POST; a 401 is answered with HTTP Digest (`ftHTTPCSUser`/`ftHTTPCSPwd`, uri =
+  path and query); then `multipart/form-data` with `tid` (a UUID, `text/plain`) and
+  `File` (the name form-encoded as stock sends it), streamed from the file. The
+  server's file-info goes out unchanged as a chat message in the session (one is
+  opened if needed), with delivered and displayed IMDNs as for text.
+- Receiving: a file-info in a chat is a message like any other: delivered at once
+  (stock marks it delivered before the download), displayed on `MarkDisplayed`. It is
+  not fetched when `until` has passed or its `file-size` is over the limit (stock's
+  `MaxSizeFileTrIncoming` when given, else the larger of the two upload limits). The
+  thumbnail (if any) and then the file are fetched over the URL's scheme and stored
+  under a part name, then renamed to the file-name's last component (percent and `+`
+  decoded as stock does, no `/`, no leading dot, existing files never replaced:
+  `name (2).ext`). What arrives is capped by the limit whatever the file-info or
+  Content-Length says. The thumbnail is `thumb-<message-id>.<ext>`.
+- Credentials go only to the configured content servers: a data URL with the same
+  host and port as `ftHTTPCSURI` or `ftHTTPExtraCSURI`, over https. A peer's
+  file-info pointing anywhere else is fetched without them, so it cannot collect a
+  Digest answer for the user's credentials. R9's own example data URLs are plain
+  `http://...:80`; such a URL is fetched, but a 401 on it is not answered.
+- Where files go: `[rcs] download-dir=` (for the messaging app: `<dir>/<IMSI>/`), or
+  `<state-dir>/<IMSI>/files`, which is root's alone (the state directory is 0700).
+- imsroha-rcs runs as root and any local user may call it (the bus policy), so it
+  never opens a file with its own rights: `SendFile` opens the path with the
+  caller's uid, gid and groups from the bus (`GetConnectionCredentials`), and
+  received files are created with the uid and gid of `download-dir`'s owner. Both
+  switch only the worker's filesystem identity (`setfsuid`, `setfsgid` and the raw
+  `setgroups` system call are per thread on Linux) for the `open`, and switch back.
+
 ### D-Bus: `codes.noa.IMSroha.Rcs`
 
 Bus name `codes.noa.IMSroha.Rcs`, object `/codes/noa/IMSroha/Rcs`, interface
@@ -302,19 +351,26 @@ property  s State           "configuring" | "waiting-otp" | "registering" | "reg
 method    SendMessage(s number, s text) -> (s message_id)
 method    SetComposing(s number, b active)
 method    MarkDisplayed(s number, s message_id)
+method    SendFile(s number, s path) -> (s message_id)
+                            path absolute, opened as the caller; status signals as for text
 method    GetCapabilities(s number) -> (a{sv} caps)   "chat": b, "ft-http": b, "known": b
                             (anonymous fetch or OPTIONS, as the configuration says)
 signal    MessageReceived(s number, s message_id, s text, x timestamp_ms)
 signal    MessageStatusChanged(s message_id, s status)   "sent" | "delivered" | "displayed" | "failed"
 signal    ComposingChanged(s number, b active)
+signal    FileReceived(s number, s message_id, s path, s content_type, t size,
+                       s thumbnail_path, x timestamp_ms)   thumbnail_path "" when none
+signal    FileReceiveFailed(s number, s message_id, s reason)
+                            "expired" | "too-large" | "unauthorized" | "gone" | "invalid" | "failed"
 signal    StateChanged(s state)
 ```
 
 `SendMessage` returns when the message is handed to the session; "sent" follows the
 MSRP 200, "failed" an error or a session that could not be set up, so the app can fall
-back to SMS. Group chat (`CreateGroup`, `SendGroupMessage`, the conference event
-package) and file transfer (`SendFile`, HTTP upload to `ftHTTPCSURI`) come later on the
-same interface.
+back to SMS. `SendFile` returns once the file is open and fits; "failed" follows if
+the upload fails, and the app can fall back to MMS (R9 7.4.1.1.1: "파일 업로드 실패시는
+MMS로 fallback"). Group chat (`CreateGroup`, `SendGroupMessage`, the conference event
+package) comes later on the same interface.
 
 ### Carrier data (`carriers.conf`, `rcs-*`)
 
@@ -346,7 +402,13 @@ On loopback (`meson test`: `rcs-acs-request`, `rcs-acs-flow`, `rcs-smsport`,
 clean under ASan/UBSan): every ACS outcome, the first activation with the OTP SMS,
 the ACS floor with an unreachable P-CSCF and with two 403s to REGISTER, chat both ways
 with IMDNs and isComposing, presence (PUBLISH, anonymous fetch), the -4 request, the
-MSRP client certificate. A messaging app's side: Spacebar patches 0004-0006 in
+MSRP client certificate, and file transfer against a fake content server
+(`tests/rcs/fake-cs.py`, Digest on every request): binary files both ways byte for
+byte, the large-file server, the thumbnail over chunked coding, a file name that tries
+to leave the directory, an expired and an oversize file-info never fetched, no
+credentials for another host (`rcs-ft` covers the parsing, the limits and Digest
+against RFC 2617 and RFC 7616's examples). File transfer has not been tried on LG
+U+. A messaging app's side: Spacebar patches 0004-0006 in
 [linux-zflip3](https://github.com/noas-slopware/linux-zflip3) `userspace/spacebar/`.
 
 Not done yet, or different from R9's own examples:
@@ -370,7 +432,15 @@ Not done yet, or different from R9's own examples:
 - OTP for carriers whose SMS stays with the modem (SKT): imsroha-rcs takes the OTP
   from imsroha's `PortPduReceived`, which only carries SMS over IMS. ModemManager drops
   the application port, so that needs ModemManager to keep it, or a QMI WMS path.
-- Group chat (conference factory, conference event package), file transfer over
-  HTTP, revoke, chatbots, presence, the chapter 8 Korean additions.
+- Group chat (conference factory, conference event package), revoke, chatbots,
+  presence, the chapter 8 Korean additions.
+- File transfer: no thumbnail is made or sent (stock sends one), no pause and resume
+  (R9 7.4.3), no group file transfer, nothing for chatbots (`cbftHTTPCSURI`), and no
+  MMS fallback inside imsroha-rcs (the app gets "failed"). `ftAutAccept=0` is not
+  honoured: every file that fits is fetched. `ftWarnSize` is read but nothing warns.
+  The data URL of a peer's file-info is fetched wherever it points (no credentials
+  unless it is our server), as stock does by default. Opening files as the caller or
+  the download directory's owner is not exercised by the tests: the network namespace
+  has only root.
 - The ACS `rcsDisabledState` (UP 2.x) is not read; `-rcscfg` requests only arrive
   through SMS over IMS, like the OTP.

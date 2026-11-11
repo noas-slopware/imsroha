@@ -49,6 +49,11 @@ char *cpim_text(const char *msg_id, const char *text, size_t *len)
 	return wrap(msg_id, "positive-delivery, display", "text/plain; charset=utf-8", NULL, text, len);
 }
 
+char *cpim_message(const char *msg_id, const char *ctype, const char *body, size_t *len)
+{
+	return wrap(msg_id, "positive-delivery, display", ctype, NULL, body, len);
+}
+
 char *cpim_imdn(const char *orig_id, const char *status, size_t *len)
 {
 	char id[32], dt[40];

@@ -8,7 +8,7 @@ pids=""
 trap 'for p in $pids; do kill $p 2>/dev/null || true; done; rm -rf "$t"' EXIT
 . "$src/tests/rcs/certs.sh"
 make_certs "$t"
-sed 's/@SIP_PORT@/15061/' "$src/tests/rcs/acs.xml" > "$t/acs.xml"
+sed 's/@SIP_PORT@/15061/; s/@CS_PORT@/18446/' "$src/tests/rcs/acs.xml" > "$t/acs.xml"
 fail=0
 bad() { echo "FAIL: $*"; fail=1; }
 
@@ -47,12 +47,33 @@ for case in "none" "[rcs]|enable=false" "[rcs]|#enable=true"; do
 	echo "off ($case): no connection, nothing written"
 done
 
+# --- file transfer: binary files (NULs, CRLFs, a boundary-like line, more
+# than one read) and the fake content server ---
+mkdir "$t/cs" "$t/ft" "$t/dl"
+python3 -I - "$t/ft" <<'PY'
+import sys
+def blob(n, k):
+    b = bytes((i * k + i // 253) % 256 for i in range(n))
+    return (b'\r\n--imsroha\r\n\0\0\r\n\r\n' + b)[:n]
+for name, n, k in (('rx1', 40000, 7), ('rx1t', 3000, 11), ('rx4', 100, 13), ('small.bin', 40000, 17),
+                   ('large.bin', 100000, 19), ('huge.bin', 300000, 23)):
+    open(f'{sys.argv[1]}/{name}', 'wb').write(blob(n, k))
+PY
+mkfifo "$t/cs.ready"
+python3 -I "$src/tests/rcs/fake-cs.py" --port 18446 --cert "$t/server.pem" --key "$t/server.key" \
+	--log "$t/cs.log" --store "$t/cs" --user ftuser@rcs.test --pwd ftSecretPw \
+	--serve "rx1=$t/ft/rx1" --serve "rx1t=$t/ft/rx1t" --serve "rx4=$t/ft/rx4" --chunked rx1t \
+	< /dev/null > "$t/cs.ready" &
+pids="$pids $!"
+read -r _ < "$t/cs.ready"
+export RCS_FT_SMALL="$t/ft/small.bin" RCS_FT_LARGE="$t/ft/large.bin" RCS_FT_HUGE="$t/ft/huge.bin"
+
 # --- on, under a private bus ---
-conf '[rcs]' 'enable=true' "ca-file=$t/ca.pem" 'msisdn=+821099999999'
+conf '[rcs]' 'enable=true' "ca-file=$t/ca.pem" 'msisdn=+821099999999' "download-dir=$t/dl"
 mkfifo "$t/net.in" "$t/net.out"
 exec 4<>"$t/net.in"
 python3 -I "$src/tests/rcs/fake-pcscf.py" --sip-port 15061 --msrp-port 12855 --cert "$t/server.pem" \
-	--key "$t/server.key" --log "$t/net.log" <&4 > "$t/net.out" &
+	--key "$t/server.key" --log "$t/net.log" --cs-port 18446 --ft-dir "$t/ft" <&4 > "$t/net.out" &
 pids="$pids $!"
 exec 5<"$t/net.out"
 read -r _ <&5
@@ -67,7 +88,7 @@ cat "$t/client.out"
 cat "$t/net.result"
 grep -q "network: done" "$t/net.result" || bad "the network did not get both IMDNs"
 reg=$(grep -A14 '^sip-in REGISTER' "$t/net.log" | head -30)
-for want in "Contact: <sip:+821099999999@127.0.0.1:" ';transport=tls>;+sip.instance="<urn:gsma:imei:35999999-999999-0>";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcse.dp"' \
+for want in "Contact: <sip:+821099999999@127.0.0.1:" ';transport=tls>;+sip.instance="<urn:gsma:imei:35999999-999999-0>";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcse.dp,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp"' \
 	"User-Agent: TTA-RCS/2.4 SM-F711N/IMSroha-0.2.0 Device_Type/RCS_Android_Phone LGU" \
 	'Authorization: Digest username="+821099999999@rcs.test",realm="rcs.test",uri="sip:rcs.test",nonce="",response=""' \
 	"Expires: 600000" "From: <sip:+821099999999@rcs.test>"; do
@@ -88,9 +109,45 @@ grep -q 'Expires: 0' "$t/net.log" || bad "no de-registration at SIGTERM"
 grep -q '^state registered' "$t/client.out" || grep -q 'registered as' "$t/rcs.err" || bad "never registered"
 [ -s "$t/state/450069999999999/config.xml" ] || bad "no stored configuration"
 
+# File transfer: advertised in PUBLISH and in the chat's SDP.
+grep -q 'org.openmobilealliance:File-Transfer-HTTP' "$t/net.log" || bad "PUBLISH without File-Transfer-HTTP"
+grep -q 'a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml application/vnd.gsma.rcs-ft-http+xml|' \
+	"$t/net.log" || bad "SDP without the file-info type"
+# Receive: the file and its thumbnail (chunked) byte for byte, under the
+# name's last component, Digest to our server, delivered at once.
+dl="$t/dl/450069999999999"
+cmp "$t/ft/rx1" "$dl/evil name.bin" || bad "the received file is not what the server had"
+cmp "$t/ft/rx1t" "$dl/thumb-mtft1.png" || bad "the thumbnail is not what the server had"
+[ "$(ls -A "$dl" | wc -l)" = 2 ] || bad "the download directory holds more than the file and thumbnail: $(ls -A "$dl")"
+[ "$(find "$t" -name 'evil*' | wc -l)" = 1 ] || bad "a file name left the download directory"
+grep -q '^request GET /content/rx1?t=x&s=40000 len 0 noauth' "$t/cs.log" || bad "no first GET of the file"
+grep -q '^request GET /content/rx1?t=x&s=40000 len 0 auth' "$t/cs.log" || bad "the file's 401 was not answered"
+grep -q '^event get rx1t' "$t/cs.log" || bad "no thumbnail download"
+grep -q 'event imdn mtft1 delivered' "$t/net.log" || bad "no delivered IMDN for the file-info"
+# Expired and too large: no request at all. Another host: its 401 gets no credentials.
+! grep -q 'GET /content/gone\|GET /content/big' "$t/cs.log" || bad "fetched an expired or oversize file"
+grep -q '^request GET /content/rx4 len 0 noauth' "$t/cs.log" || bad "no GET of the other host's file"
+! grep -q '^request GET /content/rx4 len 0 auth' "$t/cs.log" || bad "credentials went to a URL that is not our server"
+# Send: an empty POST, its 401 answered, the file in multipart with a tid;
+# above MaxSizeFileTr to ftHTTPExtraCSURI; the server's file-info is what
+# goes out in MSRP, byte for byte; nothing over MaxSizeExtraFileTr goes up.
+[ "$(grep -c '^event empty-post /content/' "$t/cs.log")" = 1 ] || bad "not one empty POST to ftHTTPCSURI"
+[ "$(grep -c '^event empty-post /large/' "$t/cs.log")" = 1 ] || bad "not one empty POST to ftHTTPExtraCSURI"
+grep -Eq '^event upload /content/ 1 tid [0-9a-f-]{36} parts tid,File name small.bin ctype \S+ size 40000$' "$t/cs.log" ||
+	bad "the small file's upload is not tid,File"
+grep -Eq '^event upload /large/ 2 tid [0-9a-f-]{36} parts tid,File name large.bin ctype \S+ size 100000$' "$t/cs.log" ||
+	bad "the large file did not go to the large-file server"
+[ "$(grep -c '^event upload' "$t/cs.log")" = 2 ] || bad "not exactly two uploads"
+! grep -q 'bad-auth\|bad-upload' "$t/cs.log" || bad "the content server refused a request"
+cmp "$t/ft/small.bin" "$t/cs/up-1.bin" || bad "the uploaded small file differs"
+cmp "$t/ft/large.bin" "$t/cs/up-2.bin" || bad "the uploaded large file differs"
+cmp "$t/cs/up-1.xml" "$t/ft/mo-1.xml" || bad "the MSRP file-info is not the server's answer"
+cmp "$t/cs/up-2.xml" "$t/ft/mo-2.xml" || bad "the second MSRP file-info is not the server's answer"
+! grep -q 'ftSecretPw\|ftuser' "$t/rcs.err" || bad "the content server credentials are in the log"
+
 # --- first activation with the OTP SMS, then a P-CSCF that refuses connections:
 # the ACS is asked once and not again within ACS_MIN_INTERVAL ---
-sed 's/@SIP_PORT@/15062/' "$src/tests/rcs/acs.xml" > "$t/acs2.xml"
+sed 's/@SIP_PORT@/15062/; s/@CS_PORT@/18446/' "$src/tests/rcs/acs.xml" > "$t/acs2.xml"
 mkfifo "$t/acs2.in" "$t/acs2.out" "$t/rcs2.pipe" "$t/acs2.ev"
 exec 6<>"$t/acs2.in"
 python3 -I "$src/tests/rcs/fake-acs.py" --http-port 18081 --https-port 18444 --cert "$t/server.pem" \
@@ -124,7 +181,7 @@ echo "OTP flow: SMS -> OTP -> configuration; unreachable P-CSCF: the ACS asked $
 
 # --- 403 to REGISTER: back to the ACS once (which the floor holds back), then
 # the stored configuration, a second 403, and nothing more (R9 A.5 b) ---
-sed 's/@SIP_PORT@/15063/' "$src/tests/rcs/acs.xml" > "$t/acs3.xml"
+sed 's/@SIP_PORT@/15063/; s/@CS_PORT@/18446/' "$src/tests/rcs/acs.xml" > "$t/acs3.xml"
 mkfifo "$t/acs3.in" "$t/acs3.out" "$t/net3.in" "$t/net3.out" "$t/rcs3.pipe"
 exec 8<>"$t/acs3.in"
 python3 -I "$src/tests/rcs/fake-acs.py" --http-port 18082 --https-port 18445 --cert "$t/server.pem" \
@@ -166,6 +223,7 @@ echo "off after on: one rcs_state=-4, then nothing"
 if [ $fail != 0 ]; then
 	echo "--- imsroha-rcs"; cat "$t/rcs.err"
 	echo "--- network"; cat "$t/net.log"
+	echo "--- content server"; cat "$t/cs.log"
 	echo "--- off2"; cat "$t/off2.err"
 	echo "--- otp run"; cat "$t/rcs2.err" 2>/dev/null; cat "$t/acs2.log" 2>/dev/null
 	echo "--- 403 run"; cat "$t/rcs3.err" 2>/dev/null

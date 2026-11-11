@@ -220,8 +220,12 @@ static void contact(struct sipua *ua, GString *m)
 	if (ua->instance[0])
 		g_string_append_printf(m, ";+sip.instance=\"%s\"", ua->instance);
 	g_string_append(m, ";+g.3gpp.icsi-ref=\"" RCS_ICSI_CHAT "\"");
-	if (ua->presence)
-		g_string_append(m, ";+g.3gpp.iari-ref=\"" RCS_IARI_DP "\"");
+	/* One iari-ref with every application, comma separated, as R9's examples. */
+	const char *dp = ua->presence ? RCS_IARI_DP : NULL;
+	const char *ft = ua->r->ft.enabled ? RCS_IARI_FTHTTP : NULL;
+	if (dp || ft)
+		g_string_append_printf(m, ";+g.3gpp.iari-ref=\"%s%s%s\"", dp ? dp : "", dp && ft ? "," : "",
+				       ft ? ft : "");
 	g_string_append(m, "\r\n");
 }
 
@@ -608,21 +612,35 @@ static void on_pub_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 
 static void publish(struct sipua *ua, unsigned expires)
 {
-	char id1[11], id2[11];
+	char id1[11], id2[11], id3[11];
 	sip_random(id1, 10);
 	sip_random(id2, 10);
-	char *body = expires ? g_strdup_printf(
-		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
-		"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" xmlns:op=\"urn:oma:xml:prs:pidf:oma-pres\" entity=\"%s\">\r\n"
-		" <tuple id=\"SessionModeMessaging%s\"><status><basic>open</basic></status>\r\n"
-		"  <op:service-description><op:service-id>org.openmobilealliance:ChatSession</op:service-id>"
-		"<op:version>2.0</op:version><op:description>Session Mode Messaging</op:description></op:service-description>\r\n"
-		"  <contact>%s</contact></tuple>\r\n"
-		" <tuple id=\"DiscoveryPresence%s\"><status><basic>open</basic></status>\r\n"
-		"  <op:service-description><op:service-id>org.3gpp.urn:urn-7:3gpp-application.ims.iari.rcse.dp</op:service-id>"
-		"<op:version>1.0</op:version><op:description>DiscoveryPresence</op:description></op:service-description>\r\n"
-		"  <contact>%s</contact></tuple>\r\n"
-		"</presence>\r\n", ua->impu, id1, ua->impu, id2, ua->impu) : NULL;
+	sip_random(id3, 10);
+	char *body = NULL;
+	if (expires) {
+		GString *b = g_string_new(NULL);
+		g_string_append_printf(b,
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+			"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" xmlns:op=\"urn:oma:xml:prs:pidf:oma-pres\" entity=\"%s\">\r\n"
+			" <tuple id=\"SessionModeMessaging%s\"><status><basic>open</basic></status>\r\n"
+			"  <op:service-description><op:service-id>org.openmobilealliance:ChatSession</op:service-id>"
+			"<op:version>2.0</op:version><op:description>Session Mode Messaging</op:description></op:service-description>\r\n"
+			"  <contact>%s</contact></tuple>\r\n", ua->impu, id1, ua->impu);
+		/* R9 table 6-4: File Transfer via HTTP, service-id File-Transfer-HTTP, version 1.0. */
+		if (ua->r->ft.enabled)
+			g_string_append_printf(b,
+				" <tuple id=\"FileTransferHTTP%s\"><status><basic>open</basic></status>\r\n"
+				"  <op:service-description><op:service-id>org.openmobilealliance:File-Transfer-HTTP</op:service-id>"
+				"<op:version>1.0</op:version><op:description>File Transfer HTTP</op:description></op:service-description>\r\n"
+				"  <contact>%s</contact></tuple>\r\n", id3, ua->impu);
+		g_string_append_printf(b,
+			" <tuple id=\"DiscoveryPresence%s\"><status><basic>open</basic></status>\r\n"
+			"  <op:service-description><op:service-id>org.3gpp.urn:urn-7:3gpp-application.ims.iari.rcse.dp</op:service-id>"
+			"<op:version>1.0</op:version><op:description>DiscoveryPresence</op:description></op:service-description>\r\n"
+			"  <contact>%s</contact></tuple>\r\n"
+			"</presence>\r\n", id2, ua->impu);
+		body = g_string_free(b, FALSE);
+	}
 	char extra[256];
 	snprintf(extra, sizeof(extra), "Event: presence\r\nExpires: %u\r\n%s%s%s", expires,
 		 ua->etag[0] ? "SIP-If-Match: " : "", ua->etag, ua->etag[0] ? "\r\n" : "");
@@ -1037,6 +1055,8 @@ void rcsd_ua_start(struct rcsd *r)
 {
 	if (r->ua)
 		rcsd_ua_stop(r);
+	/* The features we register and publish depend on it. */
+	rcsd_ft_load(r);
 	r->ua = ua_new(r);
 	if (!r->ua) {
 		rcsd_set_state(r, RCSD_UNREGISTERED);

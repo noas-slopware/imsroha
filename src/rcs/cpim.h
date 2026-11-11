@@ -17,6 +17,8 @@ struct cpim {
 
 /* A chat message: anonymous From/To (RCC.07 1-to-1 chat), positive-delivery and display. */
 char *cpim_text(const char *msg_id, const char *text, size_t *len);
+/* The same around another content type (a file-info: application/vnd.gsma.rcs-ft-http+xml). */
+char *cpim_message(const char *msg_id, const char *ctype, const char *body, size_t *len);
 /* A delivered/displayed notification for orig_id. */
 char *cpim_imdn(const char *orig_id, const char *status, size_t *len);
 /* isComposing, wrapped in CPIM or bare. */

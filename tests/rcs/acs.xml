@@ -64,7 +64,17 @@
                 <parm name="MaxSize" value="8192"/>
             </characteristic>
             <characteristic type="FileTransfer">
-                <parm name="ftHTTPCSURI" value="https://localhost/content/"/>
+                <parm name="ftWarnSize" value="64"/>
+                <parm name="MaxSizeFileTr" value="64"/>
+                <parm name="ftAutAccept" value="1"/>
+                <parm name="ftHTTPCSURI" value="https://localhost:@CS_PORT@/content/"/>
+                <parm name="ftHTTPCSUser" value="ftuser@rcs.test"/>
+                <parm name="ftHTTPCSPwd" value="ftSecretPw"/>
+                <parm name="ftHTTPFallback" value="0"/>
+            </characteristic>
+            <characteristic type="Ext">
+                <parm name="MaxSizeExtraFileTr" value="200"/>
+                <parm name="ftHTTPExtraCSURI" value="https://localhost:@CS_PORT@/large/"/>
             </characteristic>
         </characteristic>
         <characteristic type="CAPDISCOVERY">

@@ -155,12 +155,14 @@ static char *sdp(struct chat *c)
 		"m=message 9 %s *\r\n"
 		"a=path:%s\r\n"
 		"a=accept-types:message/cpim application/im-iscomposing+xml\r\n"
-		"a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml\r\n"
+		"a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml%s\r\n"
 		"a=setup:active\r\n"
 		"%s"
 		"a=sendrecv\r\n",
 		g_random_int(), 1u, v6 ? "IP6" : "IP4", ip, v6 ? "IP6" : "IP4", ip,
-		tls ? "TCP/TLS/MSRP" : "TCP/MSRP", c->local_path, fp);
+		tls ? "TCP/TLS/MSRP" : "TCP/MSRP", c->local_path,
+		/* R9's INVITE example: a file-info rides the chat as a wrapped type. */
+		c->r->ft.enabled ? " " FT_HTTP_CTYPE : "", fp);
 	return s;
 }
 
@@ -207,11 +209,18 @@ static void send_imdn(struct rcsd *r, const char *number, const char *orig, cons
 
 static void on_text(struct chat *c, const struct cpim *m)
 {
-	if (!g_ascii_strcasecmp(m->ctype, "text/plain")) {
+	int text = !g_ascii_strcasecmp(m->ctype, "text/plain");
+	if (text || !g_ascii_strcasecmp(m->ctype, FT_HTTP_CTYPE)) {
 		char id[64];
 		snprintf(id, sizeof(id), "%s", m->msg_id ? m->msg_id : "");
-		fprintf(stderr, "imsroha-rcs: chat message from %s (%s)\n", c->number, id);
-		rcsd_dbus_message_received(c->r, c->number, id, m->body, cpim_time_ms(m->datetime));
+		fprintf(stderr, "imsroha-rcs: chat %s from %s (%s)\n", text ? "message" : "file", c->number, id);
+		if (text)
+			rcsd_dbus_message_received(c->r, c->number, id, m->body, cpim_time_ms(m->datetime));
+		else
+			rcsd_ft_received(c->r, c->number, id, m->body, m->blen, cpim_time_ms(m->datetime));
+		/* A file-info is a chat message like any other: delivered now, as
+		 * stock does (it marks it delivered before the download), and
+		 * displayed when the app says so. */
 		if (m->msg_id && m->disposition) {
 			if (strstr(m->disposition, "display"))
 				g_hash_table_replace(want_display, g_strdup(m->msg_id), g_strdup(c->number));
@@ -615,30 +624,47 @@ static gboolean ready(struct rcsd *r, GError **error)
 	return FALSE;
 }
 
-gboolean rcsd_chat_send(struct rcsd *r, const char *number, const char *text, char *id, size_t size,
-			GError **error)
+gboolean rcsd_chat_enqueue(struct rcsd *r, const char *e164, const char *id, char *body, size_t len,
+			   GError **error)
 {
-	char e164[32];
-	if (!ready(r, error))
-		return FALSE;
-	if (sipua_e164(r->ua, number, e164, sizeof(e164)) < 0) {
-		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "not a phone number: %s", number);
+	if (!ready(r, error)) {
+		g_free(body);
 		return FALSE;
 	}
 	chat_on_registered(r);
 	struct chat *c = find(e164);
 	if (!c && !(c = invite(r, e164))) {
 		g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "cannot open a chat with %s", e164);
+		g_free(body);
 		return FALSE;
 	}
 	struct outmsg *o = g_new0(struct outmsg, 1);
-	cpim_msg_id(o->id, sizeof(o->id));
-	o->body = cpim_text(o->id, text, &o->len);
-	snprintf(id, size, "%s", o->id);
+	snprintf(o->id, sizeof(o->id), "%s", id);
+	o->body = body;
+	o->len = len;
 	g_queue_push_tail(&c->queue, o);
 	flush(c);
 	if (c->state == CHAT_UP)
 		touch(c);
+	return TRUE;
+}
+
+gboolean rcsd_chat_send(struct rcsd *r, const char *number, const char *text, char *id, size_t size,
+			GError **error)
+{
+	char e164[32], mid[40];
+	if (!ready(r, error))
+		return FALSE;
+	if (sipua_e164(r->ua, number, e164, sizeof(e164)) < 0) {
+		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "not a phone number: %s", number);
+		return FALSE;
+	}
+	cpim_msg_id(mid, sizeof(mid));
+	size_t len;
+	char *body = cpim_text(mid, text, &len);
+	if (!rcsd_chat_enqueue(r, e164, mid, body, len, error))
+		return FALSE;
+	snprintf(id, size, "%s", mid);
 	return TRUE;
 }
 

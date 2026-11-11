@@ -31,6 +31,8 @@ struct rcs_config {
 	int assume_mobile;            /* start with the HTTP leg (network-based authentication) */
 	unsigned otp_timeout;         /* seconds to wait for the OTP SMS */
 	char state_dir[256];
+	char download_dir[256];       /* received files: <dir>/<IMSI>/, owned by dir's owner;
+	                               * "" = <state_dir>/<IMSI>/files (root only) */
 
 	/* carriers.conf rcs-*, [carrier] */
 	char acs_url[256];            /* rcs-acs-url: http://... (the HTTP leg) */
