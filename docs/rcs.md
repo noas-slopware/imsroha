@@ -319,3 +319,22 @@ the OTP port and its UCS-2 text, `-rcscfg` requests, the TTA User-Agent, isCompo
 without CPIM, no standalone messaging, and the chapter 8 additions (reply, reaction,
 cancel; not implemented yet: CPIM headers in the `Extended-RCS <http://www.tta.or.kr>`
 namespace, ignored when received as RFC 3862 says).
+
+### Status (2026-11-11)
+
+Built and tested on loopback only (`meson test`: `rcs-acs-request`, `rcs-acs-flow`,
+`rcs-smsport`, `rcs-daemon`, each in a network namespace with nothing but `lo`).
+No request has gone to any carrier. Spacebar's side is the patch series in
+linux-zflip3 `userspace/spacebar/` (0004-0006), compile-checked only.
+
+Not done yet:
+
+- AKA for the RCS registration (only Digest, what R9's sample configuration has).
+- OTP for carriers whose SMS stays with the modem (SKT): imsroha-rcs takes the OTP
+  from imsroha's `PduReceived`, which only carries SMS over IMS. ModemManager drops
+  the application port, so that needs ModemManager to keep it, or a QMI WMS path.
+- The OTP SMS also reaches ModemManager, so the messaging app shows it.
+- Group chat (conference factory, conference event package), file transfer over
+  HTTP, revoke, chatbots, presence, the chapter 8 Korean additions.
+- The ACS `rcsDisabledState` (UP 2.x) is not read; `-rcscfg` requests only arrive
+  through SMS over IMS, like the OTP.
