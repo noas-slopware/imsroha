@@ -3,6 +3,7 @@
 
 #include <gio/gio.h>
 #include "acs.h"
+#include "bot.h"
 #include "fthttp.h"
 #include "rcs_config.h"
 
@@ -34,6 +35,7 @@ struct rcsd {
 	int forbidden;            /* 403s to REGISTER this run (R9 A.5 b) */
 	int pcscf_reconfigured;   /* the P-CSCF failed and the ACS was asked once already */
 	struct ft_config ft;      /* from the stored configuration, at registration */
+	struct bot_config bot;    /* the same, for chatbots */
 };
 
 const char *rcsd_state_name(enum rcsd_state s);
@@ -52,6 +54,8 @@ void rcsd_dbus_composing(struct rcsd *r, const char *number, gboolean active);
 void rcsd_dbus_file_received(struct rcsd *r, const char *number, const char *id, const char *path,
 			     const char *ctype, guint64 size, const char *thumb, gint64 ts_ms);
 void rcsd_dbus_file_failed(struct rcsd *r, const char *number, const char *id, const char *reason);
+void rcsd_dbus_rich_received(struct rcsd *r, const char *number, const char *id, const char *ctype,
+			     const char *body, const char *suggestions, const char *bot_id, gint64 ts_ms);
 
 /* The SIP side, from the stored configuration (sipua.c). */
 void rcsd_ua_start(struct rcsd *r);
@@ -66,6 +70,9 @@ gboolean rcsd_chat_displayed(struct rcsd *r, const char *number, const char *id,
  * the status signals for id follow as for text. Takes body. */
 gboolean rcsd_chat_enqueue(struct rcsd *r, const char *e164, const char *id, char *body, size_t len,
 			   GError **error);
+/* SendSuggestionResponse: a botsuggestion.response to the bot of that conversation. */
+gboolean rcsd_chat_suggestion_response(struct rcsd *r, const char *number, const char *in_reply_to,
+				       const char *json, char *id, size_t size, GError **error);
 /* Answers inv with (a{sv}) once the OPTIONS exchange is done. */
 void rcsd_capabilities(struct rcsd *r, const char *number, GDBusMethodInvocation *inv);
 
@@ -79,5 +86,10 @@ void rcsd_ft_received(struct rcsd *r, const char *number, const char *id, const 
 		      gint64 ts_ms);
 void rcsd_ft_shutdown(struct rcsd *r);
 
+/* Chatbot information (botinfo.c): GetBotInfo answers inv with (s) or NotAvailable. */
+void rcsd_botinfo(struct rcsd *r, const char *bot_id, GDBusMethodInvocation *inv);
+void rcsd_botinfo_shutdown(struct rcsd *r);
+
+#define RCSD_ERROR_NOT_AVAILABLE "codes.noa.IMSroha.Rcs.Error.NotAvailable"
 #define RCSD_ERROR_NOT_READY "codes.noa.IMSroha.Rcs.Error.NotReady"
 #define RCSD_ERROR_FAILED "codes.noa.IMSroha.Rcs.Error.Failed"

@@ -86,6 +86,7 @@ struct sipua {
 
 int sipua_registered(const struct sipua *ua) { return ua && ua->registered; }
 const char *sipua_impu(const struct sipua *ua) { return ua->impu; }
+const char *sipua_domain(const struct sipua *ua) { return ua->domain; }
 const char *sipua_local_ip(const struct sipua *ua) { return ua->local_ip; }
 int sipua_local_v6(const struct sipua *ua) { return ua->v6; }
 int sipua_msrp_tls(const struct sipua *ua) { return ua->msrp_tls; }
@@ -220,12 +221,27 @@ static void contact(struct sipua *ua, GString *m)
 	if (ua->instance[0])
 		g_string_append_printf(m, ";+sip.instance=\"%s\"", ua->instance);
 	g_string_append(m, ";+g.3gpp.icsi-ref=\"" RCS_ICSI_CHAT "\"");
-	/* One iari-ref with every application, comma separated, as R9's examples. */
-	const char *dp = ua->presence ? RCS_IARI_DP : NULL;
-	const char *ft = ua->r->ft.enabled ? RCS_IARI_FTHTTP : NULL;
-	if (dp || ft)
-		g_string_append_printf(m, ";+g.3gpp.iari-ref=\"%s%s%s\"", dp ? dp : "", dp && ft ? "," : "",
-				       ft ? ft : "");
+	/* One iari-ref with every application, comma separated, as R9's examples
+	 * (6.4.3, 8.4.4), then botversion with the chatbot ones (R9 table 7-7). */
+	const struct bot_config *bot = &ua->r->bot;
+	const char *iari[] = {
+		ua->presence ? RCS_IARI_DP : NULL,
+		ua->r->ft.enabled ? RCS_IARI_FTHTTP : NULL,
+		bot->session ? BOT_IARI_SESSION : NULL,
+		bot->sa ? BOT_IARI_SA : NULL,
+		bot->xbot ? BOT_IARI_XBOT : NULL,
+	};
+	int n = 0;
+	for (size_t i = 0; i < G_N_ELEMENTS(iari); i++) {
+		if (!iari[i])
+			continue;
+		g_string_append(m, n++ ? "," : ";+g.3gpp.iari-ref=\"");
+		g_string_append(m, iari[i]);
+	}
+	if (n)
+		g_string_append_c(m, '"');
+	if (bot_on(bot))
+		g_string_append(m, ";" BOT_VERSION_TAG);
 	g_string_append(m, "\r\n");
 }
 
@@ -633,6 +649,25 @@ static void publish(struct sipua *ua, unsigned expires)
 				"  <op:service-description><op:service-id>org.openmobilealliance:File-Transfer-HTTP</op:service-id>"
 				"<op:version>1.0</op:version><op:description>File Transfer HTTP</op:description></op:service-description>\r\n"
 				"  <contact>%s</contact></tuple>\r\n", id3, ua->impu);
+		/* R9 table 7-7 (and its PUBLISH example for the first); the
+		 * descriptions of the other two are stock ServiceTuple.java's. */
+		const struct bot_config *bot = &ua->r->bot;
+		const struct { int on; const char *id, *sid, *desc; } bt[] = {
+			{ bot->session, "ChatbotCommunication", BOT_SID_SESSION, "ChatbotCommunication" },
+			{ bot->sa, "ChatbotStandaloneMsg", BOT_SID_SA, "ChatbotStandaloneMsg" },
+			{ bot->xbot, "ExtendedBotMsg", BOT_SID_XBOT, "ExtendedBotMsg" },
+		};
+		for (size_t i = 0; i < G_N_ELEMENTS(bt); i++) {
+			if (!bt[i].on)
+				continue;
+			char tid[11];
+			sip_random(tid, 10);
+			g_string_append_printf(b,
+				" <tuple id=\"%s%s\"><status><basic>open</basic></status>\r\n"
+				"  <op:service-description><op:service-id>%s</op:service-id>"
+				"<op:version>1.0</op:version><op:description>%s</op:description></op:service-description>\r\n"
+				"  <contact>%s</contact></tuple>\r\n", bt[i].id, tid, bt[i].sid, bt[i].desc, ua->impu);
+		}
 		g_string_append_printf(b,
 			" <tuple id=\"DiscoveryPresence%s\"><status><basic>open</basic></status>\r\n"
 			"  <op:service-description><op:service-id>org.3gpp.urn:urn-7:3gpp-application.ims.iari.rcse.dp</op:service-id>"
@@ -1057,6 +1092,15 @@ void rcsd_ua_start(struct rcsd *r)
 		rcsd_ua_stop(r);
 	/* The features we register and publish depend on it. */
 	rcsd_ft_load(r);
+	bot_config_from_xml(r->xml, r->cfg.chatbot, r->cfg.xbotmessage, &r->bot);
+	if (bot_on(&r->bot))
+		fprintf(stderr, "imsroha-rcs: chatbots: %s%s%s, botinfo at %s\n", r->bot.session ? "session" : "",
+			r->bot.sa ? (r->bot.session ? ", standalone" : "standalone") : "",
+			r->bot.xbot ? ", xbotmessage" : "", r->bot.root[0] ? r->bot.root : "the bot's domain");
+	else
+		fprintf(stderr, "imsroha-rcs: chatbots: %s\n", !r->cfg.chatbot ? "off ([rcs] chatbot=false)"
+				: !r->bot.present ? "not provisioned (no Chatbot characteristic)"
+						  : "not provisioned (ChatbotMsgTech, standaloneMsgAuth)");
 	r->ua = ua_new(r);
 	if (!r->ua) {
 		rcsd_set_state(r, RCSD_UNREGISTERED);

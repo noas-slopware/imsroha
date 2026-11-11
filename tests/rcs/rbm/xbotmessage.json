@@ -1,0 +1,31 @@
+{
+    "RCSMessage": {
+     "trafficType": "advertisement",
+     "richcardMessage": {
+          "message": {
+              "generalPurposeCard": {
+                  "messageHeader": "(광고)[Web발신]",
+                  "messageFooter": "수신거부:080-888-8888",
+                  "layout": {
+                  "cardOrientation": "HORIZONTAL",
+                  "imageAlignment": "LEFT"
+                  },
+                  "content": {
+                       "media": {
+                            "mediaUrl": "https://cdn.server/path/media.mp4",
+                            "mediaContentType": "video/mp4",
+                            "mediaFileSize": 2718288,
+                            "thumbnailUrl": "https://cdn.server/path/media.png",
+                            "thumbnailContentType": "image/png",
+                            "thumbnailFileSize": 314159,
+                            "height": "MEDIUM_HEIGHT",
+                            "contentDescription": "Textual description of media content."
+                       },
+                       "title": "This is a single rich card.",
+                       "description": "This is the description of the rich card."
+                  }
+              }
+          }
+     }
+    }
+}

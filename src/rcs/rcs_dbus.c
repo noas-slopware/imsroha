@@ -30,6 +30,16 @@ static const char introspection[] =
 	"   <arg name='path' type='s' direction='in'/>"
 	"   <arg name='message_id' type='s' direction='out'/>"
 	"  </method>"
+	"  <method name='SendSuggestionResponse'>"
+	"   <arg name='number' type='s' direction='in'/>"
+	"   <arg name='in_reply_to_message_id' type='s' direction='in'/>"
+	"   <arg name='response_json' type='s' direction='in'/>"
+	"   <arg name='message_id' type='s' direction='out'/>"
+	"  </method>"
+	"  <method name='GetBotInfo'>"
+	"   <arg name='bot_id' type='s' direction='in'/>"
+	"   <arg name='json' type='s' direction='out'/>"
+	"  </method>"
 	"  <method name='GetCapabilities'>"
 	"   <arg name='number' type='s' direction='in'/>"
 	"   <arg name='capabilities' type='a{sv}' direction='out'/>"
@@ -37,6 +47,12 @@ static const char introspection[] =
 	"  <signal name='MessageReceived'>"
 	"   <arg name='number' type='s'/><arg name='message_id' type='s'/>"
 	"   <arg name='text' type='s'/><arg name='timestamp_ms' type='x'/>"
+	"  </signal>"
+	"  <signal name='RichMessageReceived'>"
+	"   <arg name='number' type='s'/><arg name='message_id' type='s'/>"
+	"   <arg name='content_type' type='s'/><arg name='body' type='s'/>"
+	"   <arg name='suggestions' type='s'/><arg name='bot_id' type='s'/>"
+	"   <arg name='timestamp_ms' type='x'/>"
 	"  </signal>"
 	"  <signal name='MessageStatusChanged'>"
 	"   <arg name='message_id' type='s'/><arg name='status' type='s'/>"
@@ -58,8 +74,10 @@ static const char introspection[] =
 
 static void reply_error(GDBusMethodInvocation *inv, GError *e)
 {
-	const char *name = e->domain == G_IO_ERROR && e->code == G_IO_ERROR_NOT_CONNECTED
-				   ? RCSD_ERROR_NOT_READY : RCSD_ERROR_FAILED;
+	const char *name = e->domain != G_IO_ERROR ? RCSD_ERROR_FAILED
+			   : e->code == G_IO_ERROR_NOT_CONNECTED ? RCSD_ERROR_NOT_READY
+			   : e->code == G_IO_ERROR_NOT_SUPPORTED ? RCSD_ERROR_NOT_AVAILABLE
+								 : RCSD_ERROR_FAILED;
 	g_dbus_method_invocation_return_dbus_error(inv, name, e->message);
 	g_error_free(e);
 }
@@ -98,6 +116,18 @@ static void on_call(GDBusConnection *c, const char *sender, const char *path, co
 		const char *num, *fpath;
 		g_variant_get(params, "(&s&s)", &num, &fpath);
 		rcsd_ft_send(r, sender, num, fpath, inv);
+	} else if (!strcmp(method, "SendSuggestionResponse")) {
+		const char *num, *reply_to, *json;
+		char id[64];
+		g_variant_get(params, "(&s&s&s)", &num, &reply_to, &json);
+		if (rcsd_chat_suggestion_response(r, num, reply_to, json, id, sizeof(id), &e))
+			g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", id));
+		else
+			reply_error(inv, e);
+	} else if (!strcmp(method, "GetBotInfo")) {
+		const char *bot;
+		g_variant_get(params, "(&s)", &bot);
+		rcsd_botinfo(r, bot, inv);
 	} else if (!strcmp(method, "GetCapabilities")) {
 		const char *num;
 		g_variant_get(params, "(&s)", &num);
@@ -159,15 +189,37 @@ void rcsd_dbus_state_changed(struct rcsd *r)
 				      "PropertiesChanged", g_variant_new("(sa{sv}as)", RCS_IFACE, &b, NULL), NULL);
 }
 
+/* Network bytes: a D-Bus string must be UTF-8 (invalid sequences become U+FFFD). */
+static char *utf8(const char *s)
+{
+	return g_utf8_make_valid(s ? s : "", -1);
+}
+
 void rcsd_dbus_message_received(struct rcsd *r, const char *number, const char *id, const char *text,
 				gint64 ts_ms)
 {
-	emit(r, "MessageReceived", g_variant_new("(sssx)", number, id, text, ts_ms));
+	char *n = utf8(number), *i = utf8(id), *t = utf8(text);
+	emit(r, "MessageReceived", g_variant_new("(sssx)", n, i, t, ts_ms));
+	g_free(n);
+	g_free(i);
+	g_free(t);
+}
+
+void rcsd_dbus_rich_received(struct rcsd *r, const char *number, const char *id, const char *ctype,
+			     const char *body, const char *suggestions, const char *bot_id, gint64 ts_ms)
+{
+	char *v[6] = { utf8(number), utf8(id), utf8(ctype), utf8(body), utf8(suggestions), utf8(bot_id) };
+	emit(r, "RichMessageReceived", g_variant_new("(ssssssx)", v[0], v[1], v[2], v[3], v[4], v[5], ts_ms));
+	for (int k = 0; k < 6; k++)
+		g_free(v[k]);
 }
 
 void rcsd_dbus_status(struct rcsd *r, const char *id, const char *status)
 {
-	emit(r, "MessageStatusChanged", g_variant_new("(ss)", id, status));
+	char *i = utf8(id), *st = utf8(status);
+	emit(r, "MessageStatusChanged", g_variant_new("(ss)", i, st));
+	g_free(i);
+	g_free(st);
 }
 
 void rcsd_dbus_composing(struct rcsd *r, const char *number, gboolean active)

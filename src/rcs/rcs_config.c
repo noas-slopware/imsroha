@@ -98,6 +98,7 @@ static void defaults(struct rcs_config *cfg)
 	cfg->iscomposing_cpim = 1;
 	cfg->standalone = 1;
 	cfg->reg_expires = 3600;
+	cfg->chatbot = 1;
 }
 
 /* The local switch: never anything from carriers.conf. */
@@ -122,6 +123,7 @@ static void rcs_local(GKeyFile *kf, struct rcs_config *cfg)
 	cfg->otp_timeout = (unsigned)v;
 	str(kf, g, "state-dir", cfg->state_dir, sizeof(cfg->state_dir));
 	str(kf, g, "download-dir", cfg->download_dir, sizeof(cfg->download_dir));
+	boolean(kf, g, "chatbot", &cfg->chatbot);
 }
 
 static void rcs_carrier(GKeyFile *kf, const char *g, struct rcs_config *cfg)
@@ -159,6 +161,7 @@ static void rcs_carrier(GKeyFile *kf, const char *g, struct rcs_config *cfg)
 	cfg->reg_expires = (unsigned)v;
 	str(kf, g, "rcs-ft-auth-hosts", cfg->ft_auth_hosts, sizeof(cfg->ft_auth_hosts));
 	boolean(kf, g, "rcs-ft-auth-http", &cfg->ft_auth_http);
+	boolean(kf, g, "rcs-xbotmessage", &cfg->xbotmessage);
 }
 
 int rcs_config_load_switch(struct rcs_config *cfg)

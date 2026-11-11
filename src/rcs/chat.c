@@ -5,12 +5,20 @@
  * delivered/displayed, isComposing. Pager-mode MESSAGEs are taken when they
  * come (and used for IMDNs outside a session); they are sent only where the
  * carrier allows standalone messaging.
+ *
+ * Chatbots and RCS A2P (RCC.07 3.6, R9 7.7) ride the same paths: a peer is
+ * a phone number (+E.164; an A2P sender with a tel URI lands in that
+ * number's thread, R9 7.7.3.1) or a chatbot's SIP URI. They come in a
+ * session, in pager mode, or in large message mode (an MSRP session for one
+ * message, R9 7.7.3.3), as rich cards, extended bot messages and
+ * multipart/mixed with suggestions.
  */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "bot.h"
 #include "cpim.h"
 #include "cert.h"
 #include "msrp.h"
@@ -29,7 +37,10 @@ struct outmsg {
 
 struct chat {
 	struct rcsd *r;
-	char number[32];      /* +E.164 */
+	char number[256];     /* the peer: +E.164, or a chatbot's sip: URI */
+	char bot_id[256];     /* the chatbot service id, when the peer is one */
+	int bot;              /* a chatbot session: bot types in the SDP */
+	int large;            /* large message mode: one message in, never ours to send in */
 	struct sipdlg dlg;
 	enum chat_state state;
 	char local_path[256], remote_path[512];
@@ -92,7 +103,30 @@ static void want_display_load(struct rcsd *r)
 	g_free(data);
 }
 static GHashTable *conv_ids; /* number -> Conversation-ID (RCC.07: kept per peer) */
+static GHashTable *bot_ids;  /* +E.164 -> chatbot service id, from capability discovery (R9 7.7.3.2) */
+static GHashTable *sent_ids; /* imdn.Message-IDs we sent this run */
 static GList *chats;
+
+static void tables(void)
+{
+	if (want_display)
+		return;
+	want_display = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	conv_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	bot_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	sent_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+}
+
+/* The request URI of a peer: tel:+82... or the bot's sip: URI. */
+static void key_uri(const char *key, char *out, size_t size)
+{
+	snprintf(out, size, "%s%s", key[0] == '+' ? "tel:" : "", key);
+}
+
+static int sip_key(const char *key)
+{
+	return key[0] != '+';
+}
 
 static void outmsg_free(struct outmsg *o)
 {
@@ -104,7 +138,7 @@ static struct chat *find(const char *number)
 {
 	for (GList *l = chats; l; l = l->next) {
 		struct chat *c = l->data;
-		if (!strcmp(c->number, number) && c->state != CHAT_CLOSED)
+		if (!strcmp(c->number, number) && c->state != CHAT_CLOSED && !c->large)
 			return c;
 	}
 	return NULL;
@@ -194,6 +228,18 @@ static char *sdp(struct chat *c)
 		g_clear_error(&e);
 		g_free(dir);
 	}
+	/*
+	 * With a chatbot, what it may send us (R9 7.7.4.17.3: the platform reads
+	 * accept-wrapped-types before it sends an open rich card): the bot
+	 * content types stock libsec-ims.so knows, the extended ones only when we
+	 * advertise xbotmessage.
+	 */
+	const char *bot = "", *xbot = "";
+	if (c->bot && bot_on(&c->r->bot)) {
+		bot = " multipart/mixed " BOT_CT_MESSAGE " " BOT_CT_SUGGESTION;
+		if (c->r->bot.xbot)
+			xbot = " " BOT_CT_XBOT " " BOT_CT_OPENRICH;
+	}
 	char *s = g_strdup_printf(
 		"v=0\r\n"
 		"o=- %u %u IN %s %s\r\n"
@@ -203,14 +249,16 @@ static char *sdp(struct chat *c)
 		"m=message 9 %s *\r\n"
 		"a=path:%s\r\n"
 		"a=accept-types:message/cpim application/im-iscomposing+xml\r\n"
-		"a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml%s\r\n"
+		"a=accept-wrapped-types:text/plain message/imdn+xml application/im-iscomposing+xml%s%s%s\r\n"
 		"a=setup:active\r\n"
 		"%s"
-		"a=sendrecv\r\n",
+		"a=%s\r\n",
 		g_random_int(), 1u, v6 ? "IP6" : "IP4", ip, v6 ? "IP6" : "IP4", ip,
 		tls ? "TCP/TLS/MSRP" : "TCP/MSRP", c->local_path,
 		/* R9's INVITE example: a file-info rides the chat as a wrapped type. */
-		c->r->ft.enabled ? " " FT_HTTP_CTYPE : "", fp);
+		c->r->ft.enabled ? " " FT_HTTP_CTYPE : "", bot, xbot, fp,
+		/* Large message mode: the sender's offer is sendonly. */
+		c->large ? "recvonly" : "sendrecv");
 	return s;
 }
 
@@ -255,20 +303,91 @@ static void flush(struct chat *c)
 
 static void send_imdn(struct rcsd *r, const char *number, const char *orig, const char *status);
 
+/* An IMDN for one of our messages. R9 7.7.3.3.1: before a standalone
+ * message the platform may probe with a delivered IMDN for an id that never
+ * existed (R9's example ends in "-bodiless"); that one gets its 200 and
+ * nothing else. Other ids we did not send this run may be from before a
+ * restart, and the app knows them. */
+static void imdn_status(struct rcsd *r, const char *id, const char *st)
+{
+	if (!g_hash_table_contains(sent_ids, id) && g_str_has_suffix(id, "-bodiless")) {
+		fprintf(stderr, "imsroha-rcs: network check (IMDN for %s), nothing to report\n", id);
+		return;
+	}
+	fprintf(stderr, "imsroha-rcs: %s: %s\n", id, st);
+	rcsd_dbus_status(r, id, st);
+}
+
+static const char *peer_bot_id(const struct chat *c)
+{
+	if (c->bot_id[0])
+		return c->bot_id;
+	const char *v = !sip_key(c->number) ? g_hash_table_lookup(bot_ids, c->number) : NULL;
+	return v ? v : "";
+}
+
+/* A bot payload: a rich card, an extended bot message, text with suggestions. 0 when it was one. */
+static int on_bot_payload(struct chat *c, const struct cpim *m, const char *id, gint64 ts)
+{
+	char *pct = NULL, *part = NULL, *sugg = NULL;
+	size_t plen = 0;
+	int r = -1;
+	if (!g_ascii_strcasecmp(m->ctype, "multipart/mixed")) {
+		if (bot_multipart_split(m->ctype_full, m->body, m->blen, &pct, &part, &plen, &sugg) < 0) {
+			fprintf(stderr, "imsroha-rcs: chat %s from %s: unreadable multipart/mixed, dropped\n", id, c->number);
+			return 0;
+		}
+	} else if (bot_kind_of(m->ctype) != BOT_KIND_NONE) {
+		pct = g_strdup(m->ctype);
+		part = g_strndup(m->body, m->blen);
+		plen = m->blen;
+	} else {
+		return -1;
+	}
+	const char *bot_id = peer_bot_id(c);
+	if (!g_ascii_strcasecmp(pct, "text/plain") && !sugg) {
+		/* Bot text without suggestions stays a plain message. */
+		rcsd_dbus_message_received(c->r, c->number, id, part, ts);
+		r = 0;
+	} else if (!g_ascii_strcasecmp(pct, "text/plain") || bot_kind_of(pct) != BOT_KIND_NONE) {
+		fprintf(stderr, "imsroha-rcs: chat %s from %s: %s%s (bot %s)\n", id, c->number, pct,
+			sugg ? " with suggestions" : "", bot_id[0] ? bot_id : "unknown");
+		rcsd_dbus_rich_received(c->r, c->number, id, !g_ascii_strcasecmp(pct, "text/plain") ? "text/plain" : pct,
+					part, sugg ? sugg : "", bot_id, ts);
+		r = 0;
+	} else {
+		fprintf(stderr, "imsroha-rcs: chat %s from %s: %s inside multipart/mixed, dropped\n", id, c->number, pct);
+		r = 0;
+	}
+	(void)plen;
+	g_free(pct);
+	g_free(part);
+	g_free(sugg);
+	return r;
+}
+
 static void on_text(struct chat *c, const struct cpim *m)
 {
 	int text = !g_ascii_strcasecmp(m->ctype, "text/plain");
-	if (text || !g_ascii_strcasecmp(m->ctype, FT_HTTP_CTYPE)) {
+	int ft = !g_ascii_strcasecmp(m->ctype, FT_HTTP_CTYPE);
+	int bot = !text && !ft && bot_on(&c->r->bot) &&
+		  (!g_ascii_strcasecmp(m->ctype, "multipart/mixed") || bot_kind_of(m->ctype) != BOT_KIND_NONE);
+	if (text || ft || bot) {
 		char id[64];
 		snprintf(id, sizeof(id), "%s", m->msg_id ? m->msg_id : "");
-		fprintf(stderr, "imsroha-rcs: chat %s from %s (%s)\n", text ? "message" : "file", c->number, id);
-		if (text)
-			rcsd_dbus_message_received(c->r, c->number, id, m->body, cpim_time_ms(m->datetime));
-		else
-			rcsd_ft_received(c->r, c->number, id, m->body, m->blen, cpim_time_ms(m->datetime));
+		gint64 ts = cpim_time_ms(m->datetime);
+		if (bot) {
+			on_bot_payload(c, m, id, ts);
+		} else {
+			fprintf(stderr, "imsroha-rcs: chat %s from %s (%s)\n", text ? "message" : "file", c->number, id);
+			if (text)
+				rcsd_dbus_message_received(c->r, c->number, id, m->body, ts);
+			else
+				rcsd_ft_received(c->r, c->number, id, m->body, m->blen, ts);
+		}
 		/* A file-info is a chat message like any other: delivered now, as
 		 * stock does (it marks it delivered before the download), and
-		 * displayed when the app says so. */
+		 * displayed when the app says so. So is a bot's message. */
 		if (m->msg_id && m->disposition) {
 			if (strstr(m->disposition, "display"))
 			{
@@ -282,14 +401,14 @@ static void on_text(struct chat *c, const struct cpim *m)
 		}
 	} else if (!g_ascii_strcasecmp(m->ctype, "message/imdn+xml")) {
 		char id[64], st[32];
-		if (imdn_parse(m->body, m->blen, id, sizeof(id), st, sizeof(st)) == 0) {
-			fprintf(stderr, "imsroha-rcs: %s: %s\n", id, st);
-			rcsd_dbus_status(c->r, id, st);
-		}
+		if (imdn_parse(m->body, m->blen, id, sizeof(id), st, sizeof(st)) == 0)
+			imdn_status(c->r, id, st);
 	} else if (!g_ascii_strcasecmp(m->ctype, "application/im-iscomposing+xml")) {
 		int a = iscomposing_parse(m->body, m->blen);
 		if (a >= 0)
 			rcsd_dbus_composing(c->r, c->number, a);
+	} else if (bot_kind_of(m->ctype) != BOT_KIND_NONE || !g_ascii_strcasecmp(m->ctype, "multipart/mixed")) {
+		fprintf(stderr, "imsroha-rcs: chat from %s: %s, but chatbots are off; dropped\n", c->number, m->ctype);
 	}
 }
 
@@ -455,18 +574,27 @@ static struct chat *invite(struct rcsd *r, const char *number)
 {
 	struct chat *c = new_chat(r, number);
 	c->state = CHAT_INVITING;
-	snprintf(c->dlg.remote_uri, sizeof(c->dlg.remote_uri), "<tel:%s>", number);
+	char ruri[260];
+	key_uri(number, ruri, sizeof(ruri));
+	snprintf(c->dlg.remote_uri, sizeof(c->dlg.remote_uri), "<%s>", ruri);
+	/* A chatbot: its SIP URI, or a number capability discovery found one behind. */
+	if (bot_on(&r->bot) && (sip_key(number) || g_hash_table_contains(bot_ids, number))) {
+		c->bot = 1;
+		snprintf(c->bot_id, sizeof(c->bot_id), "%s", sip_key(number) ? number : "");
+	}
 	local_path(c);
 	char *body = sdp(c);
-	char extra[768];
+	char extra[1024];
+	/* To a chatbot, the chatbot IARI and botversion too (RCC.07 3.6.8, as
+	 * remembered: stock's Accept-Contact is built in libsec-ims.so, which has
+	 * these tags but not the header as a string). */
 	snprintf(extra, sizeof(extra),
-		 "Accept-Contact: *;+g.3gpp.icsi-ref=\"%s\"\r\n"
+		 "Accept-Contact: *;+g.3gpp.icsi-ref=\"%s\"%s\r\n"
 		 "P-Preferred-Service: %s\r\n"
 		 "Accept: application/sdp\r\n"
 		 "Conversation-ID: %s\r\nContribution-ID: %s\r\n",
-		 RCS_ICSI_CHAT, RCS_ICSI_CHAT_RAW, c->conv_id, c->contrib_id);
-	char ruri[64];
-	snprintf(ruri, sizeof(ruri), "tel:%s", number);
+		 RCS_ICSI_CHAT, c->bot ? ";+g.3gpp.iari-ref=\"" BOT_IARI_SESSION "\";" BOT_VERSION_TAG : "",
+		 RCS_ICSI_CHAT_RAW, c->conv_id, c->contrib_id);
 	fprintf(stderr, "imsroha-rcs: opening a chat with %s\n", number);
 	int e = sipua_send(r->ua, &c->dlg, "INVITE", ruri, extra, "application/sdp", body, strlen(body),
 			   on_invite_resp, c);
@@ -483,8 +611,8 @@ static struct chat *invite(struct rcsd *r, const char *number)
 static void send_message(struct rcsd *r, const char *number, const char *body, size_t len)
 {
 	struct sipdlg d = { 0 };
-	char ruri[64];
-	snprintf(ruri, sizeof(ruri), "tel:%s", number);
+	char ruri[260];
+	key_uri(number, ruri, sizeof(ruri));
 	snprintf(d.remote_uri, sizeof(d.remote_uri), "<%s>", ruri);
 	char extra[512];
 	snprintf(extra, sizeof(extra), "Accept-Contact: *;+g.3gpp.icsi-ref=\"%s\"\r\n"
@@ -514,31 +642,116 @@ static void send_imdn(struct rcsd *r, const char *number, const char *orig, cons
 
 /* ---- the network's requests ---------------------------------------------- */
 
-static int caller(struct sipua *ua, const struct sipmsg *m, char *out, size_t size)
+static int header_has(const struct sipmsg *m, const char *name, const char *what)
 {
-	/* R9 6.4.1: P-Asserted-Identity before From. */
+	char **v = sipmsg_header_all(m, name);
+	int hit = 0;
+	for (int i = 0; v[i] && !hit; i++)
+		hit = strstr(v[i], what) != NULL;
+	g_strfreev(v);
+	return hit;
+}
+
+/* The request is a chatbot's: its Contact has the bot role, or it asks for
+ * the chatbot application (stock libsec-ims.so: IsChatbotRole on Contact). */
+static int botish(const struct sipmsg *m)
+{
+	return header_has(m, "Contact", BOT_ROLE_TAG) || header_has(m, "Accept-Contact", "iari.rcs.chatbot") ||
+	       header_has(m, "P-Asserted-Service", "iari.rcs.chatbot");
+}
+
+struct peer {
+	char key[256];        /* +E.164, or a chatbot's sip: URI */
+	char bot_id[256];     /* "" unless a chatbot */
+	int bot;              /* the request came from a chatbot */
+};
+
+/*
+ * Who sent m. R9 6.4.1: P-Asserted-Identity before From. R9 7.7.3.1: a tel
+ * URI makes it that number's conversation, A2P included; a chatbot known
+ * only by its SIP URI is a conversation of its own. A SIP URI on another
+ * domain than ours next to the tel URI is the chatbot's service id.
+ */
+static int peer_of(struct sipua *ua, const struct sipmsg *m, struct peer *p)
+{
+	memset(p, 0, sizeof(*p));
+	p->bot = botish(m);
+	GPtrArray *uris = g_ptr_array_new_with_free_func(g_free);
 	char **pai = sipmsg_header_all(m, "P-Asserted-Identity");
-	char uri[256] = "";
-	for (int i = 0; pai[i] && !uri[0]; i++)
-		sip_uri_of(pai[i], uri, sizeof(uri));
-	g_strfreev(pai);
-	if (!uri[0]) {
-		const char *f = sipmsg_header(m, "From");
-		if (f)
-			sip_uri_of(f, uri, sizeof(uri));
+	for (int i = 0; pai[i]; i++) {
+		char u[256];
+		if (sip_uri_of(pai[i], u, sizeof(u)))
+			g_ptr_array_add(uris, g_strdup(u));
 	}
-	char user[64];
-	sip_user_of(uri, user, sizeof(user));
-	return sipua_e164(ua, user, out, size);
+	g_strfreev(pai);
+	const char *f = sipmsg_header(m, "From");
+	char fu[256];
+	if (f && sip_uri_of(f, fu, sizeof(fu)))
+		g_ptr_array_add(uris, g_strdup(fu));
+
+	const char *domain = sipua_domain(ua);
+	for (guint i = 0; i < uris->len && !p->bot_id[0]; i++) {
+		const char *u = g_ptr_array_index(uris, i);
+		char k[256];
+		if (bot_uri_key(u, k, sizeof(k)) < 0)
+			continue;
+		/* Not a person on another network: sip:+82...@their.domain is a number. */
+		const char *host = strchr(k, '@') + 1;
+		char user[64], e[32];
+		sip_user_of(k, user, sizeof(user));
+		if (p->bot || (g_ascii_strcasecmp(host, domain) && sipua_e164(ua, user, e, sizeof(e)) < 0))
+			snprintf(p->bot_id, sizeof(p->bot_id), "%s", k);
+	}
+	int found = 0;
+	for (guint i = 0; i < uris->len && !found; i++) {
+		const char *u = g_ptr_array_index(uris, i);
+		char user[64];
+		if (g_ascii_strncasecmp(u, "tel:", 4))
+			continue;
+		sip_user_of(u, user, sizeof(user));
+		found = sipua_e164(ua, user, p->key, sizeof(p->key)) == 0;
+	}
+	for (guint i = 0; i < uris->len && !found; i++) {
+		const char *u = g_ptr_array_index(uris, i);
+		char user[64];
+		if (g_ascii_strncasecmp(u, "sip", 3))
+			continue;
+		/* A person's sip:+82...@domain is their number; never a chatbot's.
+		 * Anything else is a chatbot's own conversation (refused when
+		 * chatbots are off). */
+		char k[256];
+		int is_key = bot_uri_key(u, k, sizeof(k)) == 0;
+		sip_user_of(u, user, sizeof(user));
+		if (!p->bot && !(p->bot_id[0] && is_key && !strcmp(k, p->bot_id)) &&
+		    sipua_e164(ua, user, p->key, sizeof(p->key)) == 0) {
+			found = 1;
+		} else if (is_key) {
+			found = 1;
+			p->bot = 1;
+			snprintf(p->key, sizeof(p->key), "%s", k);
+			snprintf(p->bot_id, sizeof(p->bot_id), "%s", k);
+		}
+	}
+	g_ptr_array_free(uris, TRUE);
+	if (p->bot_id[0])
+		p->bot = 1;
+	return found ? 0 : -ENOENT;
 }
 
 static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 {
-	char number[32];
-	if (!m->body || !strstr(m->body, "m=message") || caller(ua, m, number, sizeof(number)) < 0) {
+	struct peer p;
+	if (!m->body || !strstr(m->body, "m=message") || peer_of(ua, m, &p) < 0) {
 		sipua_respond(ua, m, 488, "Not Acceptable Here", "x", NULL, NULL, NULL);
 		return;
 	}
+	if (p.bot && !bot_on(&r->bot)) {
+		/* Nothing chatbot is advertised: stock's "chat bot sessions not allowed". */
+		fprintf(stderr, "imsroha-rcs: chat INVITE from chatbot %s refused: chatbots are off\n", p.key);
+		sipua_respond(ua, m, 606, "Not Acceptable", "x", NULL, NULL, NULL);
+		return;
+	}
+	const char *number = p.key;
 	const char *cid = sipmsg_header(m, "Call-ID");
 	if (cid && find_dlg(cid))
 		return; /* a retransmission */
@@ -548,17 +761,28 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 		sipua_respond(ua, m, 400, "Bad Request", "x", NULL, NULL, NULL);
 		return;
 	}
+	/* Large message mode (R9 7.7.3.3): a session for one message. */
+	int large = header_has(m, "Accept-Contact", "cpm.largemsg") ||
+		    header_has(m, "P-Asserted-Service", "cpm.largemsg");
 	sipua_respond(ua, m, 100, "Trying", NULL, NULL, NULL, NULL);
-	/* A new session from the same peer replaces the old one. */
-	struct chat *old = find(number);
-	struct chat *c = new_chat(r, number);
-	if (old) {
-		/* Messages still waiting move to the new session. */
-		struct outmsg *o;
-		while ((o = g_queue_pop_head(&old->queue)))
-			g_queue_push_tail(&c->queue, o);
-		close_chat(old, 1);
+	struct chat *c;
+	if (large) {
+		c = new_chat(r, number);
+		c->large = 1;
+	} else {
+		/* A new session from the same peer replaces the old one. */
+		struct chat *old = find(number);
+		c = new_chat(r, number);
+		if (old) {
+			/* Messages still waiting move to the new session. */
+			struct outmsg *o;
+			while ((o = g_queue_pop_head(&old->queue)))
+				g_queue_push_tail(&c->queue, o);
+			close_chat(old, 1);
+		}
 	}
+	c->bot = p.bot;
+	snprintf(c->bot_id, sizeof(c->bot_id), "%s", p.bot_id);
 	c->dlg.uas = 1;
 	snprintf(c->dlg.call_id, sizeof(c->dlg.call_id), "%s", cid ? cid : "");
 	sip_random(c->dlg.local_tag, 12);
@@ -566,14 +790,13 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 		sip_param(from, "tag", c->dlg.remote_tag, sizeof(c->dlg.remote_tag));
 		snprintf(c->dlg.remote_uri, sizeof(c->dlg.remote_uri), "<%s>", from_uri);
 	}
-	const char *cseq = sipmsg_header(m, "CSeq");
 	c->dlg.cseq = 0;
-	(void)cseq;
 	target_from(&c->dlg, m);
 	route_from(&c->dlg, m, 0);
 	const char *conv = sipmsg_header(m, "Conversation-ID");
 	if (conv) {
-		g_hash_table_replace(conv_ids, g_strdup(number), g_strdup(conv));
+		if (!large)
+			g_hash_table_replace(conv_ids, g_strdup(number), g_strdup(conv));
 		snprintf(c->conv_id, sizeof(c->conv_id), "%s", conv);
 	}
 	const char *contrib = sipmsg_header(m, "Contribution-ID");
@@ -591,23 +814,70 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 	/* AutAccept (R9 7.2.1): answered at once. */
 	sipua_respond(ua, m, 200, "OK", c->dlg.local_tag, extra, "application/sdp", body);
 	g_free(body);
-	fprintf(stderr, "imsroha-rcs: chat from %s accepted\n", number);
+	fprintf(stderr, "imsroha-rcs: %s from %s accepted%s\n", large ? "large message" : "chat", number,
+		p.bot ? " (chatbot)" : "");
 	start_msrp(c);
+}
+
+/* An extended bot message we may not take: R9 7.7.4.17.2 (stock answers 606). */
+static int xbot_refused(struct rcsd *r, const struct cpim *cp)
+{
+	char *pct = NULL, *part = NULL, *sugg = NULL;
+	size_t plen;
+	const char *ct = cp->ctype;
+	if (!g_ascii_strcasecmp(ct, "multipart/mixed") &&
+	    bot_multipart_split(cp->ctype_full, cp->body, cp->blen, &pct, &part, &plen, &sugg) == 0)
+		ct = pct;
+	enum bot_kind k = bot_kind_of(ct);
+	int refuse = (k == BOT_KIND_XBOT || k == BOT_KIND_OPENRICH) && (!r->bot.xbot || !bot_xbot_version_ok(ct));
+	g_free(pct);
+	g_free(part);
+	g_free(sugg);
+	return refuse;
 }
 
 static void on_message(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 {
-	char number[32];
 	const char *ct = sipmsg_header(m, "Content-Type");
-	if (caller(ua, m, number, sizeof(number)) < 0 || !ct || g_ascii_strncasecmp(ct, "message/cpim", 12)) {
+	if (!ct || g_ascii_strncasecmp(ct, "message/cpim", 12)) {
 		sipua_respond(ua, m, 415, "Unsupported Media Type", "x", "Accept: message/cpim\r\n", NULL, NULL);
 		return;
 	}
-	sipua_respond(ua, m, 200, "OK", "m", NULL, NULL, NULL);
 	struct cpim cp;
-	if (cpim_parse(m->body, m->blen, &cp) == 0) {
-		struct chat tmp = { .r = r };
-		snprintf(tmp.number, sizeof(tmp.number), "%s", number);
+	int parsed = cpim_parse(m->body ? m->body : "", m->blen, &cp) == 0;
+	struct peer p;
+	if (peer_of(ua, m, &p) < 0) {
+		/* An IMDN needs no peer: R9 7.7.3.3.1's network check gets its 200
+		 * whoever it claims to be from (and however its XML looks). */
+		if (parsed && !g_ascii_strcasecmp(cp.ctype, "message/imdn+xml")) {
+			sipua_respond(ua, m, 200, "OK", "m", NULL, NULL, NULL);
+			struct chat tmp = { .r = r };
+			on_text(&tmp, &cp);
+		} else {
+			sipua_respond(ua, m, 415, "Unsupported Media Type", "x", "Accept: message/cpim\r\n", NULL, NULL);
+		}
+		cpim_clear(&cp);
+		return;
+	}
+	int bot_payload = parsed && (bot_kind_of(cp.ctype) != BOT_KIND_NONE || !g_ascii_strcasecmp(cp.ctype, "multipart/mixed"));
+	if ((p.bot || bot_payload) && !bot_on(&r->bot) && !(parsed && !g_ascii_strcasecmp(cp.ctype, "message/imdn+xml"))) {
+		/* Stock's "chat bot slm not allowed". */
+		fprintf(stderr, "imsroha-rcs: standalone message from %s refused: chatbots are off\n", p.key);
+		sipua_respond(ua, m, 606, "Not Acceptable", "x", NULL, NULL, NULL);
+		cpim_clear(&cp);
+		return;
+	}
+	if (parsed && bot_on(&r->bot) && xbot_refused(r, &cp)) {
+		fprintf(stderr, "imsroha-rcs: standalone %s from %s refused (no such xbotmessage here)\n", cp.ctype, p.key);
+		sipua_respond(ua, m, 606, "Not Acceptable", "x", NULL, NULL, NULL);
+		cpim_clear(&cp);
+		return;
+	}
+	sipua_respond(ua, m, 200, "OK", "m", NULL, NULL, NULL);
+	if (parsed) {
+		struct chat tmp = { .r = r, .bot = p.bot };
+		snprintf(tmp.number, sizeof(tmp.number), "%s", p.key);
+		snprintf(tmp.bot_id, sizeof(tmp.bot_id), "%s", p.bot_id);
 		on_text(&tmp, &cp);
 	}
 	cpim_clear(&cp);
@@ -615,7 +885,7 @@ static void on_message(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 
 void chat_on_request(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 {
-	chat_on_registered(r); /* the tables, loaded once */
+	chat_on_registered(r); /* the tables, want-display loaded once */
 	const char *cid = sipmsg_header(m, "Call-ID");
 	struct chat *c = cid ? find_dlg(cid) : NULL;
 
@@ -648,8 +918,7 @@ void chat_on_request(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 void chat_on_registered(struct rcsd *r)
 {
 	if (!want_display) {
-		want_display = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-		conv_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+		tables();
 		want_display_load(r);
 	}
 }
@@ -674,6 +943,27 @@ static gboolean ready(struct rcsd *r, GError **error)
 	return FALSE;
 }
 
+/* The conversation key of what the app calls a number: +E.164, or a
+ * chatbot's sip: URI (parameters dropped) while chatbots are on. */
+static gboolean key_of(struct rcsd *r, const char *number, char *key, size_t size, GError **error)
+{
+	if (!g_ascii_strncasecmp(number, "sip:", 4) || !g_ascii_strncasecmp(number, "sips:", 5)) {
+		if (!bot_on(&r->bot)) {
+			g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "chatbots are off or not provisioned");
+			return FALSE;
+		}
+		if (bot_uri_key(number, key, size) == 0)
+			return TRUE;
+		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "not a chatbot URI: %s", number);
+		return FALSE;
+	}
+	if (sipua_e164(r->ua, number, key, size) < 0) {
+		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "not a phone number: %s", number);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 gboolean rcsd_chat_enqueue(struct rcsd *r, const char *e164, const char *id, char *body, size_t len,
 			   GError **error)
 {
@@ -688,6 +978,10 @@ gboolean rcsd_chat_enqueue(struct rcsd *r, const char *e164, const char *id, cha
 		g_free(body);
 		return FALSE;
 	}
+	/* What imdn_status() knows as ours; a long run starts over rather than grow. */
+	if (g_hash_table_size(sent_ids) > 8192)
+		g_hash_table_remove_all(sent_ids);
+	g_hash_table_add(sent_ids, g_strdup(id));
 	struct outmsg *o = g_new0(struct outmsg, 1);
 	snprintf(o->id, sizeof(o->id), "%s", id);
 	o->body = body;
@@ -702,17 +996,45 @@ gboolean rcsd_chat_enqueue(struct rcsd *r, const char *e164, const char *id, cha
 gboolean rcsd_chat_send(struct rcsd *r, const char *number, const char *text, char *id, size_t size,
 			GError **error)
 {
-	char e164[32], mid[40];
-	if (!ready(r, error))
+	char key[256], mid[40];
+	if (!ready(r, error) || !key_of(r, number, key, sizeof(key), error))
 		return FALSE;
-	if (sipua_e164(r->ua, number, e164, sizeof(e164)) < 0) {
-		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "not a phone number: %s", number);
-		return FALSE;
-	}
 	cpim_msg_id(mid, sizeof(mid));
 	size_t len;
 	char *body = cpim_text(mid, text, &len);
-	if (!rcsd_chat_enqueue(r, e164, mid, body, len, error))
+	if (!rcsd_chat_enqueue(r, key, mid, body, len, error))
+		return FALSE;
+	snprintf(id, size, "%s", mid);
+	return TRUE;
+}
+
+gboolean rcsd_chat_suggestion_response(struct rcsd *r, const char *number, const char *in_reply_to,
+				       const char *json, char *id, size_t size, GError **error)
+{
+	char key[256], mid[40];
+	if (!ready(r, error))
+		return FALSE;
+	if (!bot_on(&r->bot)) {
+		g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "chatbots are off or not provisioned");
+		return FALSE;
+	}
+	if (!key_of(r, number, key, sizeof(key), error))
+		return FALSE;
+	if (!*json) {
+		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "empty response");
+		return FALSE;
+	}
+	/*
+	 * RCC.07 3.6.10: the response is a chat message of its own content type
+	 * whose JSON carries the postback data. Stock sends it like any message
+	 * (Samsung Messages ActionsFactory: content_type botsuggestion.response,
+	 * no reference to the message it answers), so in_reply_to stays here.
+	 */
+	cpim_msg_id(mid, sizeof(mid));
+	size_t len;
+	char *body = cpim_message(mid, BOT_CT_RESPONSE, json, &len);
+	fprintf(stderr, "imsroha-rcs: suggestion response %s to %s (for %s)\n", mid, key, in_reply_to);
+	if (!rcsd_chat_enqueue(r, key, mid, body, len, error))
 		return FALSE;
 	snprintf(id, size, "%s", mid);
 	return TRUE;
@@ -720,15 +1042,11 @@ gboolean rcsd_chat_send(struct rcsd *r, const char *number, const char *text, ch
 
 gboolean rcsd_chat_composing(struct rcsd *r, const char *number, gboolean active, GError **error)
 {
-	char e164[32];
-	if (!ready(r, error))
+	char key[256];
+	if (!ready(r, error) || !key_of(r, number, key, sizeof(key), error))
 		return FALSE;
-	if (sipua_e164(r->ua, number, e164, sizeof(e164)) < 0) {
-		g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "not a phone number: %s", number);
-		return FALSE;
-	}
 	/* Only inside a session: no session is opened for it, nothing is stored (R9 7.2.3). */
-	struct chat *c = find(e164);
+	struct chat *c = find(key);
 	if (!c || c->state != CHAT_UP)
 		return TRUE;
 	size_t len;
@@ -764,13 +1082,19 @@ struct capq {
 	struct rcsd *r;
 	GDBusMethodInvocation *inv;
 	struct sipdlg dlg;
+	char key[256];
 	guint timer;
 	int replied, tx_done;
 };
 
 static GList *capqs;
 
-static void cap_reply(struct capq *q, int known, int chat, int ft, int code)
+struct caps {
+	int known, chat, ft, chatbot, code;
+	char bot_id[256];
+};
+
+static void cap_reply(struct capq *q, const struct caps *k)
 {
 	if (q->replied)
 		return;
@@ -778,13 +1102,24 @@ static void cap_reply(struct capq *q, int known, int chat, int ft, int code)
 	if (q->timer)
 		g_source_remove(q->timer);
 	q->timer = 0;
+	int bots = bot_on(&q->r->bot);
+	/* R9 7.7.3.2: the service id behind a number, for its A2P messages. */
+	if (bots && k->chatbot && k->bot_id[0] && !sip_key(q->key)) {
+		chat_on_registered(q->r); /* the tables, want-display loaded once */
+		g_hash_table_replace(bot_ids, g_strdup(q->key), g_strdup(k->bot_id));
+	}
 	GVariantBuilder b;
 	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
-	g_variant_builder_add(&b, "{sv}", "known", g_variant_new_boolean(known));
-	g_variant_builder_add(&b, "{sv}", "chat", g_variant_new_boolean(chat));
-	g_variant_builder_add(&b, "{sv}", "ft-http", g_variant_new_boolean(ft));
-	if (code)
-		g_variant_builder_add(&b, "{sv}", "sip-status", g_variant_new_int32(code));
+	g_variant_builder_add(&b, "{sv}", "known", g_variant_new_boolean(k->known));
+	g_variant_builder_add(&b, "{sv}", "chat", g_variant_new_boolean(k->chat));
+	g_variant_builder_add(&b, "{sv}", "ft-http", g_variant_new_boolean(k->ft));
+	/* The peer is a chatbot (it has the bot role, RCC.07's isbot); phones
+	 * that merely talk to chatbots are not. */
+	g_variant_builder_add(&b, "{sv}", "chatbot", g_variant_new_boolean(bots && k->chatbot));
+	if (bots && k->chatbot && k->bot_id[0])
+		g_variant_builder_add(&b, "{sv}", "bot-id", g_variant_new_string(k->bot_id));
+	if (k->code)
+		g_variant_builder_add(&b, "{sv}", "sip-status", g_variant_new_int32(k->code));
 	g_dbus_method_invocation_return_value(q->inv, g_variant_new("(a{sv})", &b));
 }
 
@@ -796,30 +1131,32 @@ static void cap_maybe_free(struct capq *q)
 	g_free(q);
 }
 
-/* A tuple with this service-id whose basic status is open. */
+/* A tuple whose service-id is exactly this and whose basic status is open. */
 static int pidf_has(const char *body, const char *service)
 {
+	char *want = g_strdup_printf(">%s<", service);
+	int hit = 0;
 	const char *p = body;
-	while (p && (p = strstr(p, service))) {
+	while (!hit && p && (p = strstr(p, want))) {
 		const char *t = g_strrstr_len(body, p - body, "<tuple");
 		const char *e = strstr(p, "</tuple>");
 		if (t && e) {
 			char *tuple = g_strndup(t, (gsize)(e - t));
-			int open = strstr(tuple, "<basic>open</basic>") != NULL;
+			hit = strstr(tuple, "<basic>open</basic>") != NULL;
 			g_free(tuple);
-			if (open)
-				return 1;
 		}
-		p += strlen(service);
+		p += strlen(want);
 	}
-	return 0;
+	g_free(want);
+	return hit;
 }
 
 static gboolean on_cap_timeout(gpointer p)
 {
 	struct capq *q = p;
 	q->timer = 0;
-	cap_reply(q, 0, 0, 0, 0);
+	struct caps k = { 0 };
+	cap_reply(q, &k);
 	cap_maybe_free(q);
 	return G_SOURCE_REMOVE;
 }
@@ -831,16 +1168,28 @@ static void on_options(struct sipua *ua, const struct sipmsg *m, void *ud)
 	if (m && m->code < 200)
 		return;
 	q->tx_done = 1;
-	int chat = 0, ft = 0;
+	struct caps k = { .known = m != NULL, .code = m ? m->code : 0 };
 	if (m && m->code >= 200 && m->code < 300) {
 		char **cs = sipmsg_header_all(m, "Contact");
 		for (int i = 0; cs[i]; i++) {
-			chat |= strstr(cs[i], "oma.cpm.session") != NULL;
-			ft |= strstr(cs[i], "rcs.fthttp") != NULL;
+			k.chat |= strstr(cs[i], "oma.cpm.session") != NULL;
+			k.ft |= strstr(cs[i], "rcs.fthttp") != NULL;
+			k.chatbot |= strstr(cs[i], BOT_ROLE_TAG) != NULL;
 		}
 		g_strfreev(cs);
+		/* Stock OptionsRequestController: a bot's service id is the SIP
+		 * URI in the answer's P-Asserted-Identity. */
+		char **pai = sipmsg_header_all(m, "P-Asserted-Identity");
+		for (int i = 0; k.chatbot && pai[i] && !k.bot_id[0]; i++) {
+			char u[256];
+			if (sip_uri_of(pai[i], u, sizeof(u)) && bot_uri_key(u, k.bot_id, sizeof(k.bot_id)) < 0)
+				k.bot_id[0] = '\0';
+		}
+		g_strfreev(pai);
+		if (k.chatbot && !k.bot_id[0] && sip_key(q->key))
+			snprintf(k.bot_id, sizeof(k.bot_id), "%s", q->key);
 	}
-	cap_reply(q, m != NULL, chat, ft, m ? m->code : 0);
+	cap_reply(q, &k);
 	cap_maybe_free(q);
 }
 
@@ -852,7 +1201,8 @@ static void on_subscribe(struct sipua *ua, const struct sipmsg *m, void *ud)
 		return;
 	q->tx_done = 1;
 	if (!m) {
-		cap_reply(q, 0, 0, 0, 0);
+		struct caps k = { 0 };
+		cap_reply(q, &k);
 	} else if (m->code < 300) {
 		/* The answer is the NOTIFY that follows. */
 		if (!q->replied && !q->timer)
@@ -860,7 +1210,8 @@ static void on_subscribe(struct sipua *ua, const struct sipmsg *m, void *ud)
 	} else {
 		/* No such RCS user (404, 410, 480, 603, 604), or we do not know. */
 		int no = m->code == 404 || m->code == 410 || m->code == 480 || m->code == 603 || m->code == 604;
-		cap_reply(q, no, 0, 0, m->code);
+		struct caps k = { .known = no, .code = m->code };
+		cap_reply(q, &k);
 	}
 	cap_maybe_free(q);
 }
@@ -877,9 +1228,22 @@ int chat_on_notify(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 		return -1;
 	sipua_respond(ua, m, 200, "OK", NULL, NULL, NULL, NULL);
 	const char *body = m->body ? m->body : "";
-	int chat = pidf_has(body, "org.openmobilealliance:ChatSession");
-	int ft = pidf_has(body, "org.openmobilealliance:File-Transfer-HTTP");
-	cap_reply(q, 1, chat, ft, 0);
+	struct caps k = { .known = 1 };
+	k.chat = pidf_has(body, "org.openmobilealliance:ChatSession");
+	k.ft = pidf_has(body, "org.openmobilealliance:File-Transfer-HTTP");
+	k.chatbot = pidf_has(body, BOT_SID_ROLE);
+	/* R9 7.7.3.2, stock PresenceUpdate: a chatbot's service id is the PIDF's entity. */
+	const char *ent = strstr(body, "entity=\"");
+	if (k.chatbot && ent) {
+		ent += 8;
+		char u[256];
+		snprintf(u, sizeof(u), "%.*s", (int)strcspn(ent, "\""), ent);
+		if (bot_uri_key(u, k.bot_id, sizeof(k.bot_id)) < 0)
+			k.bot_id[0] = '\0';
+	}
+	if (k.chatbot && !k.bot_id[0] && sip_key(q->key))
+		snprintf(k.bot_id, sizeof(k.bot_id), "%s", q->key);
+	cap_reply(q, &k);
 	cap_maybe_free(q);
 	return 0;
 }
@@ -891,7 +1255,8 @@ static void caps_drop_all(struct rcsd *r)
 		if (r->ua)
 			sipua_forget(r->ua, q);
 		q->tx_done = 1;
-		cap_reply(q, 0, 0, 0, 0);
+		struct caps k = { 0 };
+		cap_reply(q, &k);
 		cap_maybe_free(q);
 	}
 }
@@ -899,21 +1264,25 @@ static void caps_drop_all(struct rcsd *r)
 void rcsd_capabilities(struct rcsd *r, const char *number, GDBusMethodInvocation *inv)
 {
 	GError *e = NULL;
-	char e164[32];
+	char key[256];
 	if (!ready(r, &e)) {
 		g_dbus_method_invocation_return_dbus_error(inv, RCSD_ERROR_NOT_READY, e->message);
 		g_error_free(e);
 		return;
 	}
-	if (sipua_e164(r->ua, number, e164, sizeof(e164)) < 0) {
-		g_dbus_method_invocation_return_dbus_error(inv, RCSD_ERROR_FAILED, "not a phone number");
+	if (!key_of(r, number, key, sizeof(key), &e)) {
+		g_dbus_method_invocation_return_dbus_error(
+			inv, g_error_matches(e, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED) ? RCSD_ERROR_NOT_AVAILABLE : RCSD_ERROR_FAILED,
+			e->message);
+		g_error_free(e);
 		return;
 	}
 	struct capq *q = g_new0(struct capq, 1);
 	q->r = r;
 	q->inv = inv;
-	char ruri[64];
-	snprintf(ruri, sizeof(ruri), "tel:%s", e164);
+	snprintf(q->key, sizeof(q->key), "%s", key);
+	char ruri[260];
+	key_uri(key, ruri, sizeof(ruri));
 	snprintf(q->dlg.remote_uri, sizeof(q->dlg.remote_uri), "<%s>", ruri);
 	int err;
 	if (sipua_presence(r->ua)) {

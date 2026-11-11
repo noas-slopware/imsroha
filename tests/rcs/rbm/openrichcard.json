@@ -1,0 +1,14 @@
+{
+           "RCSMessage": {
+                      "trafficType": "advertisement",
+                      "openrichcardMessage": {
+                              "messageHeader": "[Web 발신] (광고)",
+                              "messageFooter": "수신거부:080-888-8888",
+                              "copyAllowed": true,
+                              "zoomAllowed": false,
+                              "scaleAllowed": true,
+                              "card": "open_rich_card",
+                              "layout": {}
+                      }
+           }
+}

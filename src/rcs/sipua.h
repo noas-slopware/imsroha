@@ -21,8 +21,8 @@ struct sipdlg {
 	char call_id[96];
 	char local_tag[24];
 	char remote_tag[96];
-	char remote_uri[256];    /* To of our requests: <tel:+82...> */
-	char remote_target[256]; /* the peer's Contact URI */
+	char remote_uri[300];    /* To of our requests: <tel:+82...>, <sip:bot@...> */
+	char remote_target[300]; /* the peer's Contact URI */
 	char route[1024];        /* Route set, comma separated <...>, "" = the service route */
 	uint32_t cseq;
 	int uas;                 /* we answered the INVITE */
@@ -34,6 +34,7 @@ typedef void (*sipua_resp_cb)(struct sipua *ua, const struct sipmsg *resp, void 
 
 int sipua_registered(const struct sipua *ua);
 const char *sipua_impu(const struct sipua *ua);
+const char *sipua_domain(const struct sipua *ua);
 const char *sipua_local_ip(const struct sipua *ua);
 int sipua_local_v6(const struct sipua *ua);
 int sipua_msrp_tls(const struct sipua *ua);

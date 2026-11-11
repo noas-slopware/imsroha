@@ -482,6 +482,7 @@ int main(int argc, char **argv)
 	}
 	g_main_loop_run(r->loop);
 	rcsd_ft_shutdown(r);
+	rcsd_botinfo_shutdown(r);
 	rcsd_ua_stop(r);
 	return 0;
 }

@@ -9,6 +9,9 @@ IMDNs. It prints "done" (or "FAIL ...") on stdout and logs every SIP and MSRP
 message to --log. With --cs-port, the chat it opens also carries file-infos
 (file transfer over HTTP) pointing at fake-cs.py there, and the file-infos
 we send are kept in --ft-dir/mo-<n>.xml and answered with a delivered IMDN.
+With --rbm on, it is a chatbot platform instead (rbm_* below): bot sessions
+both ways, A2P in pager and large message mode, the network check; with
+--rbm off it checks that chatbot traffic is refused.
 Never run it anywhere but in the test's own namespace."""
 import argparse, hashlib, re, socket, ssl, sys, threading, time
 
@@ -21,13 +24,15 @@ ap.add_argument('--log', required=True)
 ap.add_argument('--reg403', action='store_true', help='answer every authenticated REGISTER with 403')
 ap.add_argument('--cs-port', type=int, help='fake-cs.py, for the file-infos we send')
 ap.add_argument('--ft-dir', help='where the file-infos we receive are kept')
+ap.add_argument('--rbm', choices=('on', 'off'), help='the chatbot scenario')
+ap.add_argument('--rbm-dir', help='the JSON payloads of the chatbot scenario')
 a = ap.parse_args()
 
 USER, REALM, PWD = '+821099999999@rcs.test', 'rcs.test', 'testPassword'
 NONCE = 'b5ba9c08f1a8e1d1'
 log = open(a.log, 'a', buffering=1)
 lock = threading.Lock()
-state = {'sip': None, 'msg_ids': [], 'seen': set(), 'mo_files': 0}
+state = {'sip': None, 'msg_ids': [], 'seen': set(), 'mo_files': 0, 'rbm': set(), 'tids': 0}
 
 def L(*x):
     with lock:
@@ -139,6 +144,8 @@ def sip_conn(conn):
             if body:
                 L('  body', body.replace('\r\n', '|'))
             meth = first.split(' ')[0]
+            if a.rbm and rbm_sip(conn, meth, first, hdrs, body):
+                continue
             if meth == 'REGISTER':
                 if h(hdrs, 'Expires') == '0':
                     respond(conn, first, hdrs, 200, 'OK')
@@ -196,7 +203,11 @@ def sip_conn(conn):
                 if meth == 'MESSAGE':
                     imdn(body)
             elif first.startswith('SIP/2.0'):
-                pass
+                code = first.split(' ')[1]
+                cseq = (h(hdrs, 'CSeq') or ' ').split(' ')[-1]
+                L('event resp', h(hdrs, 'Call-ID'), cseq, code)
+                if a.rbm:
+                    rbm_event(f'resp {h(hdrs, "Call-ID")} {cseq} {code}')
 
 def imdn(text):
     m = re.search(r'<message-id>([^<]*)</message-id>', text)
@@ -236,6 +247,7 @@ def msrp_send(conn, to, frm, ctype, body):
     msg = (f'MSRP {tid} SEND\r\nTo-Path: {to}\r\nFrom-Path: {frm}\r\nMessage-ID: m{tid}\r\n'
            f'Byte-Range: 1-{len(b)}/{len(b)}\r\nContent-Type: {ctype}\r\n\r\n').encode() + b + f'\r\n-------{tid}$\r\n'.encode()
     conn.sendall(msg)
+    return tid
 
 def cpim(msg_id, ctype, body, disp=None, extra=''):
     s = ('From: <sip:anonymous@anonymous.invalid>\r\nTo: <sip:anonymous@anonymous.invalid>\r\n'
@@ -299,12 +311,16 @@ def msrp_conn(conn):
         frames, buf = msrp_frames(buf)
         for tid, what, hdrs, body in frames:
             L('msrp-in', tid, what, hdrs.get('to-path'), hdrs.get('content-type'), body.replace('\r\n', '|'))
+            if a.rbm and what == '200' and tid == state.get('large_tid'):
+                rbm_large_bye()
             if what != 'SEND':
                 continue
             to, frm = hdrs.get('to-path', ''), hdrs.get('from-path', '')
             mine = to
             if hdrs.get('failure-report', 'yes') != 'no':
                 conn.sendall(f'MSRP {tid} 200 OK\r\nTo-Path: {frm}\r\nFrom-Path: {to}\r\n-------{tid}$\r\n'.encode())
+            if a.rbm and rbm_msrp(conn, to, frm, hdrs, body):
+                continue
             if not body:
                 if 'srv2' in to:
                     # Our chat to them: the message, asking for both IMDNs.
@@ -330,6 +346,214 @@ def msrp_conn(conn):
                 mt_invite()
             elif 'imdn+xml' in body:
                 imdn(body)
+
+# ---- the chatbot scenario (--rbm) ------------------------------------------
+
+BOT, BOT2, A2P, A2P_ID = 'sip:bot@botplatform.test', 'sip:bot2@botplatform.test', '+8215880000', 'sip:a2p@botplatform.test'
+IARI_BOT = 'urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.chatbot'
+CT_BOT = 'application/vnd.gsma.botmessage.v1.0+json'
+CT_SUGG = 'application/vnd.gsma.botsuggestion.v1.0+json'
+D = 'positive-delivery, display'
+
+def payload(name):
+    return open(f'{a.rbm_dir}/{name}', encoding='utf-8', newline='').read()
+
+def rbm_event(e):
+    L('event', e)
+    with lock:
+        state['rbm'].add(e)
+        need = RBM_DONE_ON if a.rbm == 'on' else RBM_DONE_OFF
+        if need <= state['rbm'] and not state.get('rbm_done'):
+            state['rbm_done'] = True
+            finish('done')
+
+RBM_DONE_ON = {'resp netcheck-1 MESSAGE 200', 'resp a2p-1 MESSAGE 200', 'resp a2p-x13 MESSAGE 606',
+               'resp large-1 BYE 200', 'imdn rbm6 delivered tel:' + A2P, 'imdn rbm6 displayed tel:' + A2P,
+               'imdn rbm7 delivered tel:' + A2P, 'suggestion-response', 'resp bot2-1 INVITE 200', 'bot2 sent'}
+RBM_DONE_OFF = {'resp off-msg MESSAGE 606', 'resp off-inv INVITE 606', 'resp off-person MESSAGE 200'}
+
+def sip_req(meth, ruri, frm, callid, extra='', ctype=None, body=''):
+    b = body.encode()
+    m = (f'{meth} {ruri} SIP/2.0\r\n'
+         f'Via: SIP/2.0/TLS 127.0.0.1:{a.sip_port};branch=z9hG4bK{callid}{meth}\r\n'
+         f'Max-Forwards: 69\r\nFrom: {frm};tag=f{callid}\r\nTo: <sip:+821099999999@rcs.test>\r\n'
+         f'Call-ID: {callid}\r\nCSeq: {2 if meth == "BYE" else 1} {meth}\r\n{extra}')
+    if ctype:
+        m += f'Content-Type: {ctype}\r\n'
+    m += f'Content-Length: {len(b)}\r\n\r\n'
+    L('sip-out', meth, callid)
+    state['sip'].sendall(m.encode() + b)
+
+def sdp_large(path):
+    return sdp(path).replace('a=sendrecv', 'a=sendonly')
+
+def rbm_pidf(entity, bot):
+    t = lambda sid, v: (f'<tuple id="t{abs(hash(sid)) % 10000}"><status><basic>open</basic></status><op:service-description>'
+                        f'<op:service-id>{sid}</op:service-id><op:version>{v}</op:version>'
+                        f'</op:service-description><contact>{entity}</contact></tuple>\r\n')
+    x = ('<?xml version="1.0" encoding="UTF-8"?>\r\n<presence xmlns="urn:ietf:params:xml:ns:pidf" '
+         f'xmlns:op="urn:oma:xml:prs:pidf:oma-pres" entity="{entity}">\r\n')
+    x += t('org.openmobilealliance:ChatSession', '2.0')
+    # What a phone publishes too (R9's PUBLISH example): it does not make it a bot.
+    x += t('org.3gpp.urn:urn-7:3gpp-application.ims.iari.rcs.chatbot', '1.0')
+    if bot:
+        x += t('org.gsma.rcs.isbot', '1.0')
+    return x + '</presence>\r\n'
+
+def a2p_deliveries():
+    """A2P from a tel URI (R9 7.7.3): the network check, pager mode, large mode."""
+    tel = f'<tel:{A2P}>'
+    # R9 7.7.3.3.1: a delivered IMDN for an id that never existed.
+    x = ('<?xml version="1.0" encoding="UTF-8"?>\r\n<imdn xmlns="urn:ietf:params:xml:ns:imdn">\r\n'
+         '<message-id>30ef1b07-ed39-47cf-9adc-2e0f027ac806-bodiless</message-id>\r\n'
+         '<datetime>2022-06-30T08:43:22.945Z</datetime>\r\n'
+         '<delivery-notification><status><delivered/></status></delivery-notification>\r\n</imdn>\r\n')
+    sip_req('MESSAGE', state['contact'], tel, 'netcheck-1', f'P-Asserted-Identity: {tel}\r\n', 'message/cpim',
+            cpim('30ef1b07-ed39-47cf-9adc-2e0f027ac806-bodiless', 'message/imdn+xml', x,
+                 extra='Content-Disposition: notification\r\n'))
+    # Pager mode: an open rich card (R9 table 7-8 b), the tel URI and the bot's service id.
+    sip_req('MESSAGE', state['contact'], tel, 'a2p-1',
+            f'P-Asserted-Identity: {tel}\r\nP-Asserted-Identity: <{A2P_ID}>\r\n'
+            'Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg"\r\n',
+            'message/cpim', cpim('rbm6', 'application/vnd.gsma.openrichcard.v1.0+json', payload('openrichcard.json'), D))
+    # An extended bot message of a version we do not have: 606 (R9 7.7.4.17.2).
+    sip_req('MESSAGE', state['contact'], tel, 'a2p-x13', f'P-Asserted-Identity: {tel}\r\n', 'message/cpim',
+            cpim('rbm-x13', 'application/vnd.gsma.xbotmessage.v1.3+json', '{}', D))
+    # Large message mode: a session for one message; the service id only from capability discovery.
+    sip_req('INVITE', state['contact'], tel, 'large-1',
+            f'P-Asserted-Identity: {tel}\r\n'
+            'Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.largemsg"\r\n'
+            'P-Asserted-Service: urn:urn-7:3gpp-service.ims.icsi.oma.cpm.largemsg\r\n'
+            f'Contact: <sip:a2p@localhost:{a.sip_port};transport=tls>\r\n',
+            'application/sdp', sdp_large(f'msrps://localhost:{a.msrp_port}/srv3;tcp'))
+
+def rbm_large_bye():
+    state['large_tid'] = None
+    sip_req('BYE', state['contact'], f'<tel:{A2P}>', 'large-1')
+
+def bot2_invite():
+    sip_req('INVITE', state['contact'], f'<{BOT2}>', 'bot2-1',
+            f'P-Asserted-Identity: <{BOT2}>\r\n'
+            'Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"\r\n'
+            f'Contact: <sip:bot2@localhost:{a.sip_port};transport=tls>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";'
+            f'+g.3gpp.iari-ref="{IARI_BOT}";+g.gsma.rcs.isbot\r\n'
+            'Conversation-ID: conv-bot2\r\nContribution-ID: contrib-bot2\r\n',
+            'application/sdp', sdp(f'msrps://localhost:{a.msrp_port}/srv4;tcp'))
+
+def off_deliveries():
+    sip_req('MESSAGE', state['contact'], f'<{BOT}>', 'off-msg', f'P-Asserted-Identity: <{BOT}>\r\n', 'message/cpim',
+            cpim('off1', CT_BOT, '{"RCSMessage":{}}', D))
+    sip_req('INVITE', state['contact'], f'<{BOT2}>', 'off-inv',
+            f'P-Asserted-Identity: <{BOT2}>\r\n'
+            f'Contact: <sip:bot2@localhost:{a.sip_port};transport=tls>;+g.gsma.rcs.isbot\r\n',
+            'application/sdp', sdp(f'msrps://localhost:{a.msrp_port}/srv5;tcp'))
+    sip_req('MESSAGE', state['contact'], '<tel:+821000000002>', 'off-person',
+            'P-Asserted-Identity: <tel:+821000000002>\r\n', 'message/cpim',
+            cpim('off2', 'text/plain', 'still a person', D))
+
+def multipart(parts):
+    out = ''
+    for ct, b in parts:
+        out += f'--next\r\nContent-Type: {ct}\r\n\r\n{b}\r\n'
+    return out + '--next--\r\n'
+
+def rbm_sip(conn, meth, first, hdrs, body):
+    """The chatbot scenario's requests; False: the generic handling."""
+    ruri = first.split(' ')[1] if ' ' in first else ''
+    if meth == 'PUBLISH' and h(hdrs, 'Expires') != '0':
+        respond(conn, first, hdrs, 200, 'OK', f'SIP-ETag: etag1\r\nExpires: {h(hdrs, "Expires")}\r\n')
+        tuples = [t for t in ('rcs.chatbot<', 'rcs.chatbot.sa<', 'rcs.chatbot.xbotmessage<') if t in body]
+        L('event publish', h(hdrs, 'Expires'), 'tuples', ' '.join(tuples) or 'none')
+        # Our OPTIONS answer is what we register.
+        sip_req('OPTIONS', state['contact'], '<tel:+821000000003>', 'opt-1', 'Accept: application/sdp\r\n')
+        if a.rbm == 'off':
+            off_deliveries()
+        return True
+    if meth == 'SUBSCRIBE':
+        respond(conn, first, hdrs, 200, 'OK', 'Expires: 0\r\n')
+        bot = ruri.startswith('sip:bot') or ruri == f'tel:{A2P}'
+        entity = A2P_ID if ruri == f'tel:{A2P}' else ruri
+        pidf = rbm_pidf(entity, bot)
+        ftag = re.search(r'tag=([^;]+)', h(hdrs, 'From')).group(1)
+        n = (f'NOTIFY {state["contact"]} SIP/2.0\r\n'
+             f'Via: SIP/2.0/TLS 127.0.0.1:{a.sip_port};branch=z9hG4bKnt{ftag}\r\n'
+             f'Max-Forwards: 69\r\nFrom: <{ruri}>;tag=nt1\r\n'
+             f'To: "Anonymous" <sip:anonymous@anonymous.invalid>;tag={ftag}\r\n'
+             f'Call-ID: {h(hdrs, "Call-ID")}\r\nCSeq: 1 NOTIFY\r\nEvent: presence\r\n'
+             'Subscription-State: terminated;reason=timeout\r\nContent-Type: application/pidf+xml\r\n'
+             f'Content-Length: {len(pidf.encode())}\r\n\r\n{pidf}')
+        conn.sendall(n.encode())
+        L('event subscribe', ruri)
+        # The A2P sender's capabilities are known now: its traffic follows.
+        if ruri == f'tel:{A2P}':
+            a2p_deliveries()
+        return True
+    if meth == 'INVITE' and ruri == BOT:
+        respond(conn, first, hdrs, 100, 'Trying')
+        respond(conn, first, hdrs, 200, 'OK',
+                f'Contact: <sip:bot@localhost:{a.sip_port};transport=tls>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";'
+                f'+g.3gpp.iari-ref="{IARI_BOT}";+g.gsma.rcs.isbot\r\n'
+                f'P-Asserted-Identity: <{BOT}>\r\n',
+                sdp(f'msrps://localhost:{a.msrp_port}/srv1;tcp'), 'application/sdp')
+        L('event invite-bot')
+        return True
+    if meth == 'MESSAGE':
+        respond(conn, first, hdrs, 200, 'OK')
+        m = re.search(r'<message-id>([^<]*)</message-id>', body)
+        st = re.search(r'<status><(\w+)/>', body)
+        if m and st:
+            rbm_event(f'imdn {m.group(1)} {st.group(1)} {ruri}')
+        return True
+    return False
+
+def rbm_msrp(conn, to, frm, hdrs, body):
+    """The chatbot scenario over MSRP; False: the generic handling."""
+    if not body:
+        if 'srv1' in to:
+            # Our chat to the bot is up: a rich card, an extended bot message, a carousel with suggestions.
+            msrp_send(conn, frm, to, 'message/cpim', cpim('rbm1', CT_BOT, payload('richcard.json'), D))
+            msrp_send(conn, frm, to, 'message/cpim', cpim('rbm2', 'application/vnd.gsma.xbotmessage.v1.0+json',
+                                                          payload('xbotmessage.json'), D))
+            msrp_send(conn, frm, to, 'message/cpim',
+                      cpim('rbm3', 'multipart/mixed; boundary="next"',
+                           multipart([(CT_BOT, payload('carousel.json')), (CT_SUGG, payload('suggestions.json'))]), D))
+        elif 'srv3' in to:
+            state['large_tid'] = msrp_send(conn, frm, to, 'message/cpim', cpim('rbm7', CT_BOT, payload('richcard.json'), D))
+        elif 'srv4' in to:
+            msrp_send(conn, frm, to, 'message/cpim',
+                      cpim('rbm4', 'multipart/mixed;boundary=next',
+                           multipart([('text/plain;charset=UTF-8', '무엇을 도와드릴까요?'), (CT_SUGG, payload('suggestions.json'))]), D))
+            msrp_send(conn, frm, to, 'message/cpim', cpim('rbm5', 'text/plain', 'just text', D))
+            rbm_event('bot2 sent')
+        return True
+    ct = re.search(r'\r\n\r\nContent-Type: ([^\r\n]+)', body)
+    ct = ct.group(1) if ct else ''
+    mid = re.search(r'imdn.Message-ID: (\S+)', body)
+    if ct.startswith('application/vnd.gsma.botsuggestion.response.v1.0+json'):
+        resp = body.split('\r\n\r\n', 2)[2]
+        L('event suggestion-response', ct, 'body', 'ok' if resp == payload('response.json') else 'differs')
+        rbm_event('suggestion-response')
+        msrp_imdn(conn, to, frm, mid.group(1))
+        bot2_invite()
+        return True
+    if ct.startswith('text/plain') and 'hello bot' in body:
+        L('event mo-bot-message', mid.group(1))
+        msrp_imdn(conn, to, frm, mid.group(1))
+        return True
+    if 'imdn+xml' in ct:
+        m = re.search(r'<message-id>([^<]*)</message-id>', body)
+        st = re.search(r'<status><(\w+)/>', body)
+        if m and st:
+            rbm_event(f'imdn {m.group(1)} {st.group(1)} msrp')
+        return True
+    return False
+
+def msrp_imdn(conn, to, frm, mid):
+    x = ('<?xml version="1.0" encoding="UTF-8"?>\r\n<imdn xmlns="urn:ietf:params:xml:ns:imdn">\r\n'
+         f'<message-id>{mid}</message-id>\r\n<datetime>2026-11-11T12:00:01.000Z</datetime>\r\n'
+         '<delivery-notification><status><delivered/></status></delivery-notification>\r\n</imdn>\r\n')
+    msrp_send(conn, frm, to, 'message/cpim', cpim('imdn-' + mid, 'message/imdn+xml', x,
+                                                  extra='Content-Disposition: notification\r\n'))
 
 def serve(port, handler, ctx):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

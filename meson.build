@@ -35,6 +35,7 @@ executable('imsroha',
 rcs_core = static_library('imsroha-rcs-core',
   'src/rcs/rcs_config.c', 'src/rcs/acs.c', 'src/rcs/http.c', 'src/rcs/net.c',
   'src/rcs/sipmsg.c', 'src/rcs/cpim.c', 'src/rcs/msrp.c', 'src/rcs/cert.c', 'src/rcs/fthttp.c',
+  'src/rcs/bot.c',
   include_directories: include_directories('src'),
   link_with: common,
   dependencies: [glib, gio, gnutls])
@@ -42,7 +43,7 @@ rcs_inc = include_directories('src', 'src/rcs')
 resolv = cc.find_library('resolv', required: false)
 rcs_exe = executable('imsroha-rcs',
   'src/rcs/rcsd.c', 'src/rcs/rcs_dbus.c', 'src/rcs/sipua.c', 'src/rcs/chat.c', 'src/rcs/ft.c',
-  'src/aka.c', 'src/imei.c',
+  'src/rcs/botinfo.c', 'src/aka.c', 'src/imei.c',
   link_with: [rcs_core, common],
   include_directories: rcs_inc,
   dependencies: [glib, gio, qmi, qrtr, resolv],
@@ -120,6 +121,8 @@ test('rcs-cert', executable('rcs-cert', 'tests/rcs/cert.c', link_with: rcs_core,
   include_directories: rcs_inc, dependencies: [glib, gio], build_by_default: false))
 test('rcs-ft', executable('rcs-ft', 'tests/rcs/ft.c', link_with: rcs_core,
   include_directories: rcs_inc, dependencies: [glib, gio], build_by_default: false))
+test('rcs-bot', executable('rcs-bot', 'tests/rcs/bot.c', link_with: rcs_core,
+  include_directories: rcs_inc, dependencies: [glib, gio], build_by_default: false))
 test('rcs-smsport', executable('rcs-smsport', 'tests/rcs/smsport.c', link_with: rcs_core,
   include_directories: rcs_inc, dependencies: [glib], build_by_default: false))
 rcs_acs_request = executable('rcs-acs-request', 'tests/rcs/acs-request.c', link_with: rcs_core,
@@ -139,3 +142,8 @@ rcs_client = executable('rcs-client', 'tests/rcs/rcs-client.c', dependencies: [g
 test('rcs-daemon', find_program('tests/rcs/daemon.sh'),
   args: [meson.project_build_root() / 'imsroha-rcs', rcs_client.full_path(), meson.project_source_root()],
   depends: [rcs_client, rcs_exe], is_parallel: false, timeout: 120)
+rbm_client = executable('rbm-client', 'tests/rcs/rbm-client.c', dependencies: [glib, gio],
+  build_by_default: false)
+test('rcs-rbm', find_program('tests/rcs/rbm.sh'),
+  args: [meson.project_build_root() / 'imsroha-rcs', rbm_client.full_path(), meson.project_source_root()],
+  depends: [rbm_client, rcs_exe], is_parallel: false, timeout: 120)

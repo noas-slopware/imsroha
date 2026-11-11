@@ -8,6 +8,7 @@
 
 struct cpim {
 	char *ctype;        /* the inner Content-Type, parameters stripped */
+	char *ctype_full;   /* as received, with its parameters (a multipart boundary) */
 	char *msg_id;       /* imdn.Message-ID */
 	char *datetime;
 	char *disposition;  /* imdn.Disposition-Notification */

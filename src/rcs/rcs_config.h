@@ -33,6 +33,7 @@ struct rcs_config {
 	char state_dir[256];
 	char download_dir[256];       /* received files: <dir>/<IMSI>/, owned by dir's owner;
 	                               * "" = <state_dir>/<IMSI>/files (root only) */
+	int chatbot;                  /* chatbots and A2P, when provisioned; default 1 */
 
 	/* carriers.conf rcs-*, [carrier] */
 	char acs_url[256];            /* rcs-acs-url: http://... (the HTTP leg) */
@@ -53,6 +54,7 @@ struct rcs_config {
 	unsigned reg_expires;         /* rcs-reg-expires */
 	char ft_auth_hosts[512];      /* rcs-ft-auth-hosts: more file transfer hosts for Digest */
 	int ft_auth_http;             /* rcs-ft-auth-http: Digest over plain http too */
+	int xbotmessage;              /* rcs-xbotmessage: R9 7.7.4's extended bot message */
 
 	/* imsroha's own configuration: [device], the VoLTE carrier profile */
 	struct imsroha_config base;

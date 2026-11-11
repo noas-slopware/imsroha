@@ -120,6 +120,7 @@ static char *hdr(const char *block, size_t len, const char *name)
 void cpim_clear(struct cpim *c)
 {
 	g_free(c->ctype);
+	g_free(c->ctype_full);
 	g_free(c->msg_id);
 	g_free(c->datetime);
 	g_free(c->disposition);
@@ -144,6 +145,7 @@ int cpim_parse(const char *buf, size_t len, struct cpim *out)
 	out->datetime = hdr(buf, (size_t)(h1 - buf), "DateTime");
 	out->disposition = hdr(buf, (size_t)(h1 - buf), "imdn.Disposition-Notification");
 	char *ct = hdr(mime, (size_t)(h2 - mime), "Content-Type");
+	out->ctype_full = g_strdup(ct ? ct : "text/plain");
 	if (ct) {
 		char *semi = strchr(ct, ';');
 		if (semi)
