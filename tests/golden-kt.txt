@@ -15,7 +15,7 @@ Max-Forwards: 70
 Expires: 600000
 Supported: path, sec-agree
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
-User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Android_Phone LGU
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
 Content-Length: 0
 
 
@@ -45,7 +45,7 @@ Max-Forwards: 70
 Expires: 600000
 Supported: path, sec-agree
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
-User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Android_Phone LGU
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
 Content-Length: 0
 
 
@@ -65,7 +65,7 @@ Expires: 600000
 Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
 P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
-User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Android_Phone LGU
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
 Content-Length: 0
 
 
@@ -81,7 +81,7 @@ Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
 P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
 P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel.smsip
-User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Android_Phone LGU
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
 Accept-Contact: *;+g.3gpp.smsip;require;explicit
 Content-Type: application/vnd.3gpp.sms
 Content-Length: 29
@@ -101,7 +101,7 @@ Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
 P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
 P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Android_Phone LGU
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
 P-Early-Media: supported
 Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";require;explicit
 Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
@@ -161,7 +161,7 @@ In-Reply-To: mt-sms-1@ims.mnc008.mcc450.3gppnetwork.org
 Max-Forwards: 70
 P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
 P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
-User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Android_Phone LGU
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
 Content-Type: application/vnd.3gpp.sms
 Content-Length: 2
 

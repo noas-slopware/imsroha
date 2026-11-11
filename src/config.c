@@ -136,6 +136,7 @@ static void device_defaults(struct imsroha_device *dev)
 	snprintf(dev->model, sizeof(dev->model), "imsroha");
 	snprintf(dev->operator_, sizeof(dev->operator_), "OMD");
 	snprintf(dev->build, sizeof(dev->build), "IMSroha-%s", IMSROHA_VERSION);
+	snprintf(dev->device_type, sizeof(dev->device_type), "Android_Phone");
 }
 
 static void device_from(GKeyFile *kf, struct imsroha_device *dev)
@@ -155,6 +156,7 @@ static void device_from(GKeyFile *kf, struct imsroha_device *dev)
 	get_str(kf, g, "model", dev->model, sizeof(dev->model));
 	get_str(kf, g, "operator", dev->operator_, sizeof(dev->operator_));
 	get_str(kf, g, "build", dev->build, sizeof(dev->build));
+	get_str(kf, g, "device-type", dev->device_type, sizeof(dev->device_type));
 }
 
 int imsroha_config_load_device(struct imsroha_device *dev)
@@ -293,6 +295,7 @@ void imsroha_config_user_agent(const struct imsroha_config *cfg, char *out, size
 	replace_all(out, size, "[UICC_VERSION]", cfg->car.uicc_version);
 	replace_all(out, size, "[PRODUCT_MODEL]", cfg->dev.model);
 	replace_all(out, size, "[BUILD_VERSION]", cfg->dev.build);
+	replace_all(out, size, "[DEVICE_TYPE]", cfg->dev.device_type);
 	replace_all(out, size, "[OMCCODE]", cfg->car.operator_code);
 	replace_all(out, size, "[OPERATOR]", cfg->dev.operator_);
 }

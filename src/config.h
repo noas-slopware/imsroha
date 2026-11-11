@@ -42,6 +42,7 @@ struct imsroha_device {
 	char model[64];             /* [PRODUCT_MODEL] */
 	char operator_[16];         /* [OPERATOR]: the carrier that first sold the device (TTA: SKT, KT, LGU, OMD) */
 	char build[64];             /* [BUILD_VERSION] */
+	char device_type[32];       /* [DEVICE_TYPE]: TTA's Device_Type value (Android_Phone, ... or a token) */
 };
 
 struct imsroha_carrier {
