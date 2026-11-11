@@ -217,16 +217,20 @@ int sip_auth_param(const char *hval, const char *name, char *out, size_t size)
 	return -ENOENT;
 }
 
-void sip_uri_of(const char *hval, char *out, size_t size)
+gboolean sip_uri_of(const char *hval, char *out, size_t size)
 {
 	const char *lt = strchr(hval, '<');
+	size_t n;
+
 	if (lt) {
 		const char *gt = strchr(lt, '>');
-		snprintf(out, size, "%.*s", (int)(gt ? gt - lt - 1 : (long)strlen(lt + 1)), lt + 1);
-		return;
+		n = gt ? (size_t)(gt - lt - 1) : strlen(lt + 1);
+		hval = lt + 1;
+	} else {
+		n = strcspn(hval, "; ");
 	}
-	size_t n = strcspn(hval, "; ");
-	snprintf(out, size, "%.*s", (int)n, hval);
+	snprintf(out, size, "%.*s", (int)MIN(n, size - 1), hval);
+	return n < size;
 }
 
 void sip_user_of(const char *uri, char *out, size_t size)

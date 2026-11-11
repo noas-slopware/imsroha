@@ -819,9 +819,10 @@ static int naptr(const char *name, int tls, char *repl, size_t size)
 		const char *svc = tls ? "SIPS+D2T" : "SIP+D2T";
 		if (g_ascii_strcasecmp(fields[1], svc) || (!strchr(fields[0], 's') && !strchr(fields[0], 'S')))
 			continue;
-		if (order * 65536 + pref < best) {
+		/* a replacement that does not fit is skipped, not cut short */
+		if (order * 65536 + pref < best && strlen(r2) < size) {
 			best = order * 65536 + pref;
-			snprintf(repl, size, "%s", r2);
+			g_strlcpy(repl, r2, size);
 		}
 	}
 	return best < 65536 * 2 ? 0 : -ENOENT;

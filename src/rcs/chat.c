@@ -290,6 +290,12 @@ static void start_msrp(struct chat *c)
 {
 	c->state = CHAT_CONNECTING;
 	c->msrp = msrp_new(&c->r->cfg, c->local_path, c->remote_path, &msrp_cbs, c);
+	if (!c->msrp) {
+		g_warning("chat %s: the peer's MSRP path is unusable, ending the session", c->number);
+		c->state = CHAT_UP; /* the SIP dialog is up: end it with a BYE */
+		close_chat(c, 1);
+		return;
+	}
 	msrp_connect(c->msrp);
 	touch(c);
 }
@@ -459,6 +465,12 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 	const char *cid = sipmsg_header(m, "Call-ID");
 	if (cid && find_dlg(cid))
 		return; /* a retransmission */
+	const char *from = sipmsg_header(m, "From");
+	char from_uri[sizeof(((struct sipdlg *)0)->remote_uri) - 2] = "";
+	if (from && !sip_uri_of(from, from_uri, sizeof(from_uri))) {
+		sipua_respond(ua, m, 400, "Bad Request", "x", NULL, NULL, NULL);
+		return;
+	}
 	sipua_respond(ua, m, 100, "Trying", NULL, NULL, NULL, NULL);
 	/* A new session from the same peer replaces the old one. */
 	struct chat *old = find(number);
@@ -473,12 +485,9 @@ static void on_invite(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 	c->dlg.uas = 1;
 	snprintf(c->dlg.call_id, sizeof(c->dlg.call_id), "%s", cid ? cid : "");
 	sip_random(c->dlg.local_tag, 12);
-	const char *from = sipmsg_header(m, "From");
 	if (from) {
 		sip_param(from, "tag", c->dlg.remote_tag, sizeof(c->dlg.remote_tag));
-		char u[256];
-		sip_uri_of(from, u, sizeof(u));
-		snprintf(c->dlg.remote_uri, sizeof(c->dlg.remote_uri), "<%s>", u);
+		snprintf(c->dlg.remote_uri, sizeof(c->dlg.remote_uri), "<%s>", from_uri);
 	}
 	const char *cseq = sipmsg_header(m, "CSeq");
 	c->dlg.cseq = 0;

@@ -63,6 +63,9 @@ gssize msrp_frame_parse(const char *buf, size_t len, struct msrp_frame **out)
 	char tid[40], what[32];
 	if (sscanf(first, "MSRP %39s %31s", tid, what) != 2)
 		return -EBADMSG;
+	/* a method that does not fit is not one we know */
+	if (!g_ascii_isdigit(what[0]) && strlen(what) >= sizeof(((struct msrp_frame *)0)->method))
+		return -EBADMSG;
 	char endl[64];
 	int el = snprintf(endl, sizeof(endl), "-------%s", tid);
 	/* The end-line: CRLF "-------" tid flag CRLF, the first one after the start line. */
@@ -373,6 +376,11 @@ struct msrp *msrp_new(const struct rcs_config *cfg, const char *local_path, cons
 	p = p ? p + 3 : remote_path;
 	char hp[300];
 	size_t n = strcspn(p, "/ ");
+	/* a host:port longer than any DNS name is not a path we can use */
+	if (n >= sizeof(hp)) {
+		msrp_free(m);
+		return NULL;
+	}
 	snprintf(hp, sizeof(hp), "%.*s", (int)n, p);
 	char *colon = hp[0] == '[' ? strstr(hp, "]:") : strrchr(hp, ':');
 	if (hp[0] == '[') {
@@ -380,12 +388,18 @@ struct msrp *msrp_new(const struct rcs_config *cfg, const char *local_path, cons
 		if (rb)
 			*rb = '\0';
 		m->port = colon ? (guint16)atoi(colon + 2) : 2855;
-		snprintf(m->host, sizeof(m->host), "%s", hp + 1);
+		if (g_strlcpy(m->host, hp + 1, sizeof(m->host)) >= sizeof(m->host)) {
+			msrp_free(m);
+			return NULL;
+		}
 	} else {
 		if (colon)
 			*colon = '\0';
 		m->port = colon ? (guint16)atoi(colon + 1) : 2855;
-		snprintf(m->host, sizeof(m->host), "%s", hp);
+		if (g_strlcpy(m->host, hp, sizeof(m->host)) >= sizeof(m->host)) {
+			msrp_free(m);
+			return NULL;
+		}
 	}
 	return m;
 }

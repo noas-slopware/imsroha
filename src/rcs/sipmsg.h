@@ -29,7 +29,8 @@ char **sipmsg_header_all(const struct sipmsg *m, const char *name);
 /* ;name=value of a header value, unquoted. 0 when found. */
 int sip_param(const char *hval, const char *name, char *out, size_t size);
 /* The <uri> or bare URI of a name-addr. */
-void sip_uri_of(const char *hval, char *out, size_t size);
+/* FALSE when the URI does not fit in out (out then holds a truncated copy) */
+gboolean sip_uri_of(const char *hval, char *out, size_t size);
 /* A Digest challenge's param= (quoted or not). */
 int sip_auth_param(const char *hval, const char *name, char *out, size_t size);
 /* The user part of a sip: or tel: URI ("+821012345678"). */

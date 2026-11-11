@@ -402,7 +402,7 @@ static int run_off(struct rcsd *r)
 		return 0;
 	}
 	fprintf(stderr, "imsroha-rcs: RCS was turned off: telling the ACS (rcs_state=-4)\n");
-	snprintf(r->id.msisdn, sizeof(r->id.msisdn), "%s", r->cfg.msisdn);
+	g_strlcpy(r->id.msisdn, r->cfg.msisdn, sizeof(r->id.msisdn));
 	if (!r->id.msisdn[0] && (r->bus = open_bus()))
 		msisdn_from_mm(r);
 	r->loop = g_main_loop_new(NULL, FALSE);
@@ -436,7 +436,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "imsroha-rcs: set [device] vendor= (terminal_vendor; SEC for Samsung)\n");
 		return 1;
 	}
-	snprintf(r->id.msisdn, sizeof(r->id.msisdn), "%s", r->cfg.msisdn);
+	g_strlcpy(r->id.msisdn, r->cfg.msisdn, sizeof(r->id.msisdn));
 	fprintf(stderr, "imsroha-rcs: carrier %s, ACS %s\n", r->cfg.base.car.name, r->cfg.acs_url);
 
 	r->loop = g_main_loop_new(NULL, FALSE);

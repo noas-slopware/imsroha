@@ -21,6 +21,7 @@ struct msrp_cbs {
  * to the first hop of remote_path, TLS for msrps:, and bind the session with
  * an empty SEND.
  */
+/* NULL when remote_path's first hop is unusable (longer than a DNS name) */
 struct msrp *msrp_new(const struct rcs_config *cfg, const char *local_path, const char *remote_path,
 		      const struct msrp_cbs *cbs, void *ud);
 void msrp_connect(struct msrp *m);
