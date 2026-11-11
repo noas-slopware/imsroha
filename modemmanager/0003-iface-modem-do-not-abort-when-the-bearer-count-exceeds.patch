@@ -1,0 +1,38 @@
+From: Noa Himesaka <himesaka@noa.codes>
+Subject: [PATCH] iface-modem: do not abort when the bearer count exceeds the maximum
+
+ModemManager aborts with
+
+  mm-iface-modem.c:6779:mm_iface_modem_count_bearers: assertion failed: (max >= ctx.count)
+
+when a bearer is active and the bearer list maximum has already been reset,
+which happens while ModemManager is being stopped or restarted with an
+active data connection. The assertion fires before the shutdown finishes,
+so the process dumps core and systemd has to restart it.
+
+A stale maximum is not worth a core dump. Clamp the maximum to the counted
+bearers and warn, so the cleanup and the multiplex checks continue with a
+consistent value.
+
+Signed-off-by: Noa Himesaka <himesaka@noa.codes>
+---
+ src/mm-iface-modem.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/mm-iface-modem.c b/src/mm-iface-modem.c
+--- a/src/mm-iface-modem.c
++++ b/src/mm-iface-modem.c
+@@ -6776,7 +6776,12 @@ mm_iface_modem_count_bearers (MMIfaceModem                   *self,
+         max = mm_bearer_list_get_max_active (list);
+ 
+     mm_bearer_list_foreach (list, (MMBearerListForeachFunc)bearer_count, &ctx);
+-    g_assert (max >= ctx.count);
++    if (max < ctx.count) {
++        mm_obj_warn (self,
++                     "bearer list reports %u active bearers but a maximum of %u; clamping",
++                     ctx.count, max);
++        max = ctx.count;
++    }
+ 
+     if (out_max)
+         *out_max = max;

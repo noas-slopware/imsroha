@@ -1,0 +1,1768 @@
+From 113e8fc83bf205f5e068d2b784a0ec8638967be8 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Sun, 8 Nov 2026 23:33:27 +0900
+Subject: [PATCH] broadband-modem-qmi: add b2q-imsd backend for voice and
+ messaging
+
+Connect ModemManager Voice and Messaging interfaces to b2q-imsd
+over D-Bus when the modem port has ID_MM_B2Q_IMS set. This enables
+plasma-dialer and spacebar to work natively without requiring
+QMI VOICE or WMS services.
+
+Mobile-terminated SMS arrive as raw TPDUs (PduReceived, with the id of
+b2q-imsd's durable inbox entry) and are acknowledged with AckPdu once
+the part is handed to the messaging interface. Entries stored while
+ModemManager was not running are fetched with GetPendingPdus when the
+org.b2q.Imsd name appears.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTPdTNcEmdyRhJMbUHU
+---
+ src/meson.build              |   3 +
+ src/mm-broadband-modem-qmi.c | 156 +++++++
+ src/mm-broadband-modem-qmi.h |   4 +
+ src/mm-call-ims.c            | 245 +++++++++++
+ src/mm-call-ims.h            |  47 +++
+ src/mm-ims-backend-b2q.c     | 781 +++++++++++++++++++++++++++++++++++
+ src/mm-ims-backend-b2q.h     |  97 +++++
+ src/mm-sms-ims.c             | 169 ++++++++
+ src/mm-sms-ims.h             |  45 ++
+ 9 files changed, 1547 insertions(+)
+ create mode 100644 src/mm-call-ims.c
+ create mode 100644 src/mm-call-ims.h
+ create mode 100644 src/mm-ims-backend-b2q.c
+ create mode 100644 src/mm-ims-backend-b2q.h
+ create mode 100644 src/mm-sms-ims.c
+ create mode 100644 src/mm-sms-ims.h
+
+diff --git a/src/meson.build b/src/meson.build
+index f2a5362..818c346 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -357,6 +357,9 @@ if enable_qmi
+     'mm-shared-qmi.c',
+     'mm-sim-qmi.c',
+     'mm-sms-qmi.c',
++    'mm-ims-backend-b2q.c',
++    'mm-call-ims.c',
++    'mm-sms-ims.c',
+   )
+ endif
+ 
+diff --git a/src/mm-broadband-modem-qmi.c b/src/mm-broadband-modem-qmi.c
+index 7ce39d5..08d1b23 100644
+--- a/src/mm-broadband-modem-qmi.c
++++ b/src/mm-broadband-modem-qmi.c
+@@ -52,6 +52,9 @@
+ #include "mm-sms-part-cdma.h"
+ #include "mm-call-qmi.h"
+ #include "mm-call-list.h"
++#include "mm-ims-backend-b2q.h"
++#include "mm-call-ims.h"
++#include "mm-sms-ims.h"
+ 
+ static void iface_modem_init                      (MMIfaceModemInterface                   *iface);
+ static void iface_modem_3gpp_init                 (MMIfaceModem3gppInterface               *iface);
+@@ -181,8 +184,53 @@ struct _MMBroadbandModemQmiPrivate {
+     /* Packet service state helpers when using NAS System Info and DSD
+      * (not applicable when using NAS Serving System) */
+     gboolean dsd_supported;
++
++    /* B2Q IMS backend */
++    gboolean b2q_ims_checked;
++    gboolean b2q_ims_enabled;
++    GObject *b2q_ims_backend;
+ };
+ 
++gboolean
++mm_broadband_modem_qmi_is_b2q_ims_enabled (MMBroadbandModemQmi *self)
++{
++    if (!self->priv->b2q_ims_checked) {
++        GList *ports;
++        GList *l;
++
++        self->priv->b2q_ims_checked = TRUE;
++        self->priv->b2q_ims_enabled = FALSE;
++
++        ports = mm_base_modem_find_ports (MM_BASE_MODEM (self), MM_PORT_SUBSYS_UNKNOWN, MM_PORT_TYPE_UNKNOWN);
++        for (l = ports; l; l = g_list_next (l)) {
++            MMKernelDevice *kernel_device = mm_port_peek_kernel_device (MM_PORT (l->data));
++            if (kernel_device) {
++                if (mm_kernel_device_get_global_property_as_boolean (kernel_device, "ID_MM_B2Q_IMS") ||
++                    mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_B2Q_IMS")) {
++                    self->priv->b2q_ims_enabled = TRUE;
++                    break;
++                }
++            }
++        }
++        g_list_free_full (ports, g_object_unref);
++
++        if (self->priv->b2q_ims_enabled) {
++            mm_obj_info (self, "b2q IMS support enabled via udev tag ID_MM_B2Q_IMS");
++            self->priv->b2q_ims_backend = (GObject *) mm_ims_backend_b2q_new (self);
++        }
++    }
++
++    return self->priv->b2q_ims_enabled;
++}
++
++MMImsBackendB2q *
++mm_broadband_modem_qmi_peek_ims_backend (MMBroadbandModemQmi *self)
++{
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self))
++        return MM_IMS_BACKEND_B2Q (self->priv->b2q_ims_backend);
++    return NULL;
++}
++
+ /*****************************************************************************/
+ 
+ static QmiClient *
+@@ -7545,6 +7593,13 @@ messaging_check_support (MMIfaceModemMessaging *self,
+ 
+     task = g_task_new (self, NULL, callback, user_data);
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++        mm_obj_dbg (self, "messaging capabilities supported via b2q IMS");
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     /* If we have support for the WMS client, messaging is supported */
+     if (!mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
+                                     QMI_SERVICE_WMS,
+@@ -7693,6 +7748,14 @@ messaging_init_current_storages (MMIfaceModemMessaging *_self,
+ {
+     MMBroadbandModemQmi *self = MM_BROADBAND_MODEM_QMI (_self);
+     QmiClient *client = NULL;
++    GTask *task;
++
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_return_int (task, (gssize)MM_SMS_STORAGE_ME);
++        g_object_unref (task);
++        return;
++    }
+ 
+     /* Handle AT URC only fallback */
+     if (self->priv->messaging_fallback_at_only) {
+@@ -7804,6 +7867,14 @@ messaging_set_default_storage (MMIfaceModemMessaging *_self,
+     QmiMessageWmsSetRoutesInput *input;
+     GArray *routes_array;
+     QmiMessageWmsSetRoutesInputRouteListElement route;
++    GTask *task;
++
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
+ 
+     /* Handle AT URC only fallback */
+     if (self->priv->messaging_fallback_at_only) {
+@@ -8261,6 +8332,20 @@ load_initial_sms_parts_step (GTask *task)
+     qmi_message_wms_list_messages_input_unref (input);
+ }
+ 
++static void
++b2q_load_initial_sms_ready (MMImsBackendB2q *backend,
++                            GAsyncResult    *res,
++                            GTask           *task)
++{
++    GError *error = NULL;
++
++    if (!mm_ims_backend_b2q_load_initial_sms_finish (backend, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
+ static void
+ load_initial_sms_parts (MMIfaceModemMessaging *_self,
+                         MMSmsStorage storage,
+@@ -8272,6 +8357,15 @@ load_initial_sms_parts (MMIfaceModemMessaging *_self,
+     GTask *task;
+     QmiClient *client = NULL;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        /* b2q-imsd's inbox holds what arrived while ModemManager was not listening. */
++        task = g_task_new (self, NULL, callback, user_data);
++        mm_ims_backend_b2q_load_initial_sms (MM_IMS_BACKEND_B2Q (self->priv->b2q_ims_backend),
++                                             (GAsyncReadyCallback) b2q_load_initial_sms_ready,
++                                             task);
++        return;
++    }
++
+     /* Handle AT URC only fallback */
+     if (self->priv->messaging_fallback_at_only) {
+         return iface_modem_messaging_parent->load_initial_sms_parts (_self, storage, callback, user_data);
+@@ -8483,6 +8577,9 @@ common_setup_cleanup_messaging_unsolicited_events (MMBroadbandModemQmi  *self,
+ {
+     QmiClient *client = NULL;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self))
++        return TRUE;
++
+     client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
+                                         QMI_SERVICE_WMS,
+                                         MM_PORT_QMI_FLAG_DEFAULT,
+@@ -8692,6 +8789,12 @@ common_enable_disable_messaging_unsolicited_events (MMBroadbandModemQmi *self,
+     QmiMessageWmsSetEventReportInput *input;
+     GError *error = NULL;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
+                                         QMI_SERVICE_WMS, MM_PORT_QMI_FLAG_DEFAULT, &error);
+     if (!client) {
+@@ -8844,6 +8947,10 @@ messaging_create_sms (MMIfaceModemMessaging *_self)
+ {
+     MMBroadbandModemQmi *self = MM_BROADBAND_MODEM_QMI (_self);
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        return mm_sms_ims_new (MM_BASE_MODEM (self));
++    }
++
+     /* Handle AT URC only fallback */
+     if (self->priv->messaging_fallback_at_only) {
+         return iface_modem_messaging_parent->create_sms (_self);
+@@ -10548,6 +10655,17 @@ modem_voice_check_support (MMIfaceModemVoice   *self,
+ 
+     task = g_task_new (self, NULL, callback, user_data);
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++        g_object_set (self,
++                      MM_IFACE_MODEM_VOICE_PERIODIC_CALL_LIST_CHECK_DISABLED, TRUE,
++                      MM_IFACE_MODEM_VOICE_INDICATION_CALL_LIST_RELOAD_ENABLED, FALSE,
++                      NULL);
++        mm_obj_dbg (self, "Voice capabilities supported via b2q IMS");
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     /* If we have support for the Voice client, Voice is supported */
+     if (!mm_shared_qmi_peek_client (MM_SHARED_QMI (self),
+                                     QMI_SERVICE_VOICE,
+@@ -10765,6 +10883,13 @@ common_voice_setup_cleanup_unsolicited_events (MMBroadbandModemQmi *self,
+     GTask     *task;
+     QmiClient *client = NULL;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                       QMI_SERVICE_VOICE, &client,
+                                       callback, user_data))
+@@ -10876,6 +11001,13 @@ common_voice_enable_disable_unsolicited_events (MMBroadbandModemQmi *self,
+     GTask     *task;
+     QmiClient *client;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                       QMI_SERVICE_VOICE, &client,
+                                       callback, user_data))
+@@ -10939,6 +11071,13 @@ common_voice_setup_in_call_cleanup_unsolicited_events (MMBroadbandModemQmi *self
+     GTask     *task;
+     QmiClient *client = NULL;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (self)) {
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                       QMI_SERVICE_VOICE, &client,
+                                       callback, user_data))
+@@ -11148,6 +11287,16 @@ modem_voice_load_call_list (MMIfaceModemVoice   *self,
+     QmiClient *client = NULL;
+     GTask *task;
+ 
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++        MMImsBackendB2q *backend = mm_broadband_modem_qmi_peek_ims_backend (MM_BROADBAND_MODEM_QMI (self));
++        GList *call_list = backend ? mm_ims_backend_b2q_get_call_list (backend) : NULL;
++
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_return_pointer (task, call_list, (GDestroyNotify) mm_3gpp_call_info_list_free);
++        g_object_unref (task);
++        return;
++    }
++
+     if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                       QMI_SERVICE_VOICE, &client,
+                                       callback, user_data))
+@@ -11172,6 +11321,12 @@ modem_voice_create_call (MMIfaceModemVoice *self,
+                          MMCallDirection    direction,
+                          const gchar       *number)
+ {
++    if (mm_broadband_modem_qmi_is_b2q_ims_enabled (MM_BROADBAND_MODEM_QMI (self))) {
++        return mm_call_ims_new (MM_BASE_MODEM (self),
++                                direction,
++                                number);
++    }
++
+     return mm_call_qmi_new (MM_BASE_MODEM (self),
+                             direction,
+                             number);
+@@ -13995,6 +14150,7 @@ dispose (GObject *object)
+     self->priv->firmware_list = NULL;
+ 
+     g_clear_object (&self->priv->current_firmware);
++    g_clear_object (&self->priv->b2q_ims_backend);
+ 
+     G_OBJECT_CLASS (mm_broadband_modem_qmi_parent_class)->dispose (object);
+ }
+diff --git a/src/mm-broadband-modem-qmi.h b/src/mm-broadband-modem-qmi.h
+index 97a1a77..1b5b029 100644
+--- a/src/mm-broadband-modem-qmi.h
++++ b/src/mm-broadband-modem-qmi.h
+@@ -64,4 +64,8 @@ MMPortQmi *mm_broadband_modem_qmi_get_port_qmi_for_data  (MMBroadbandModemQmi  *
+                                                           MMQmiDataEndpoint    *out_endpoint,
+                                                           GError              **error);
+ 
++typedef struct _MMImsBackendB2q MMImsBackendB2q;
++gboolean         mm_broadband_modem_qmi_is_b2q_ims_enabled (MMBroadbandModemQmi *self);
++MMImsBackendB2q *mm_broadband_modem_qmi_peek_ims_backend   (MMBroadbandModemQmi *self);
++
+ #endif /* MM_BROADBAND_MODEM_QMI_H */
+diff --git a/src/mm-call-ims.c b/src/mm-call-ims.c
+new file mode 100644
+index 0000000..f42c9b7
+--- /dev/null
++++ b/src/mm-call-ims.c
+@@ -0,0 +1,245 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026 Noa Himesaka <himesaka@noa.codes>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include "mm-call-ims.h"
++#include "mm-ims-backend-b2q.h"
++#include "mm-broadband-modem-qmi.h"
++#include "mm-log-object.h"
++#include "mm-errors-types.h"
++
++G_DEFINE_TYPE (MMCallIms, mm_call_ims, MM_TYPE_BASE_CALL)
++
++/*****************************************************************************/
++/* Start the call */
++
++static gboolean
++call_start_finish (MMBaseCall    *self,
++                   GAsyncResult  *res,
++                   GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++create_call_ready (MMImsBackendB2q *backend,
++                   GAsyncResult    *res,
++                   GTask           *task)
++{
++    MMBaseCall *self;
++    GError     *error = NULL;
++    guint32     call_id = 0;
++
++    self = MM_BASE_CALL (g_task_get_source_object (task));
++
++    if (!mm_ims_backend_b2q_create_call_finish (backend, res, &call_id, &error)) {
++        g_task_return_error (task, error);
++    } else {
++        mm_base_call_set_index (self, call_id);
++        g_task_return_boolean (task, TRUE);
++    }
++    g_object_unref (task);
++}
++
++static void
++call_start (MMBaseCall          *self,
++            GCancellable        *cancellable,
++            GAsyncReadyCallback  callback,
++            gpointer             user_data)
++{
++    MMBroadbandModemQmi *modem = NULL;
++    MMImsBackendB2q     *backend = NULL;
++    GTask               *task;
++    const gchar         *number;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++
++    g_object_get (self, MM_BASE_CALL_MODEM, &modem, NULL);
++    if (!modem) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "No modem associated with this call");
++        g_object_unref (task);
++        return;
++    }
++
++    backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
++    if (!backend || !mm_ims_backend_b2q_is_available (backend)) {
++        g_object_unref (modem);
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                                 "IMS backend is not available");
++        g_object_unref (task);
++        return;
++    }
++
++    number = mm_gdbus_call_get_number (MM_GDBUS_CALL (self));
++    mm_obj_dbg (self, "starting IMS call to %s", number ? number : "");
++
++    mm_ims_backend_b2q_create_call (backend,
++                                    number,
++                                    cancellable,
++                                    (GAsyncReadyCallback) create_call_ready,
++                                    task);
++    g_object_unref (modem);
++}
++
++/*****************************************************************************/
++/* Accept the call */
++
++static gboolean
++call_accept_finish (MMBaseCall    *self,
++                    GAsyncResult  *res,
++                    GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++answer_call_ready (MMImsBackendB2q *backend,
++                   GAsyncResult    *res,
++                   GTask           *task)
++{
++    GError *error = NULL;
++
++    if (!mm_ims_backend_b2q_answer_call_finish (backend, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++call_accept (MMBaseCall          *self,
++             GAsyncReadyCallback  callback,
++             gpointer             user_data)
++{
++    MMBroadbandModemQmi *modem = NULL;
++    MMImsBackendB2q     *backend = NULL;
++    GTask               *task;
++    guint                call_id;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    call_id = mm_base_call_get_index (self);
++
++    g_object_get (self, MM_BASE_CALL_MODEM, &modem, NULL);
++    if (modem) {
++        backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
++        if (backend && mm_ims_backend_b2q_is_available (backend)) {
++            mm_obj_dbg (self, "accepting IMS call %u", call_id);
++            mm_ims_backend_b2q_answer_call (backend,
++                                            call_id,
++                                            NULL,
++                                            (GAsyncReadyCallback) answer_call_ready,
++                                            task);
++            g_object_unref (modem);
++            return;
++        }
++        g_object_unref (modem);
++    }
++
++    g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                             "Cannot accept call: IMS backend unavailable");
++    g_object_unref (task);
++}
++
++/*****************************************************************************/
++
++/* Hangup the call */
++
++static gboolean
++call_hangup_finish (MMBaseCall    *self,
++                    GAsyncResult  *res,
++                    GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++hangup_call_ready (MMImsBackendB2q *backend,
++                   GAsyncResult    *res,
++                   GTask           *task)
++{
++    GError *error = NULL;
++
++    if (!mm_ims_backend_b2q_hangup_call_finish (backend, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++call_hangup (MMBaseCall          *self,
++             GAsyncReadyCallback  callback,
++             gpointer             user_data)
++{
++    MMBroadbandModemQmi *modem = NULL;
++    MMImsBackendB2q     *backend = NULL;
++    GTask               *task;
++    guint                call_id;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    call_id = mm_base_call_get_index (self);
++
++    g_object_get (self, MM_BASE_CALL_MODEM, &modem, NULL);
++    if (modem) {
++        backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
++        if (backend && mm_ims_backend_b2q_is_available (backend)) {
++            mm_obj_dbg (self, "hanging up IMS call %u", call_id);
++            mm_ims_backend_b2q_hangup_call (backend,
++                                            call_id,
++                                            NULL,
++                                            (GAsyncReadyCallback) hangup_call_ready,
++                                            task);
++            g_object_unref (modem);
++            return;
++        }
++        g_object_unref (modem);
++    }
++
++    /* Backend unavailable, complete hangup locally */
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++/*****************************************************************************/
++
++MMBaseCall *
++mm_call_ims_new (MMBaseModem     *modem,
++                 MMCallDirection  direction,
++                 const gchar     *number)
++{
++    return MM_BASE_CALL (g_object_new (MM_TYPE_CALL_IMS,
++                                       MM_BASE_CALL_MODEM,                       modem,
++                                       "direction",                              direction,
++                                       "number",                                 number,
++                                       MM_BASE_CALL_SKIP_INCOMING_TIMEOUT,       TRUE,
++                                       MM_BASE_CALL_SUPPORTS_DIALING_TO_RINGING, TRUE,
++                                       MM_BASE_CALL_SUPPORTS_RINGING_TO_ACTIVE,  TRUE,
++                                       NULL));
++}
++
++static void
++mm_call_ims_init (MMCallIms *self)
++{
++}
++
++static void
++mm_call_ims_class_init (MMCallImsClass *klass)
++{
++    MMBaseCallClass *base_call_class = MM_BASE_CALL_CLASS (klass);
++
++    base_call_class->start = call_start;
++    base_call_class->start_finish = call_start_finish;
++    base_call_class->accept = call_accept;
++    base_call_class->accept_finish = call_accept_finish;
++    base_call_class->hangup = call_hangup;
++    base_call_class->hangup_finish = call_hangup_finish;
++}
+diff --git a/src/mm-call-ims.h b/src/mm-call-ims.h
+new file mode 100644
+index 0000000..2d1952a
+--- /dev/null
++++ b/src/mm-call-ims.h
+@@ -0,0 +1,47 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026 Noa Himesaka <himesaka@noa.codes>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef MM_CALL_IMS_H
++#define MM_CALL_IMS_H
++
++#include <glib.h>
++#include <glib-object.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-base-call.h"
++
++#define MM_TYPE_CALL_IMS            (mm_call_ims_get_type ())
++#define MM_CALL_IMS(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_CALL_IMS, MMCallIms))
++#define MM_CALL_IMS_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_CALL_IMS, MMCallImsClass))
++#define MM_IS_CALL_IMS(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_CALL_IMS))
++#define MM_IS_CALL_IMS_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_CALL_IMS))
++#define MM_CALL_IMS_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_CALL_IMS, MMCallImsClass))
++
++typedef struct _MMCallIms MMCallIms;
++typedef struct _MMCallImsClass MMCallImsClass;
++
++struct _MMCallIms {
++    MMBaseCall parent;
++};
++
++struct _MMCallImsClass {
++    MMBaseCallClass parent;
++};
++
++GType mm_call_ims_get_type (void);
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMCallIms, g_object_unref)
++
++MMBaseCall *mm_call_ims_new (MMBaseModem     *modem,
++                             MMCallDirection  direction,
++                             const gchar     *number);
++
++#endif /* MM_CALL_IMS_H */
+diff --git a/src/mm-ims-backend-b2q.c b/src/mm-ims-backend-b2q.c
+new file mode 100644
+index 0000000..f58dc26
+--- /dev/null
++++ b/src/mm-ims-backend-b2q.c
+@@ -0,0 +1,781 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026 Noa Himesaka <himesaka@noa.codes>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <string.h>
++
++#include "mm-ims-backend-b2q.h"
++#include "mm-log-object.h"
++#include "mm-iface-modem-voice.h"
++#include "mm-iface-modem-messaging.h"
++#include "mm-sms-part.h"
++#include "mm-sms-part-3gpp.h"
++#include "mm-modem-helpers.h"
++
++G_DEFINE_TYPE (MMImsBackendB2q, mm_ims_backend_b2q, G_TYPE_OBJECT)
++
++struct _MMImsBackendB2qPrivate {
++    MMBroadbandModemQmi *modem;
++    GDBusConnection     *connection;
++    guint                name_watch_id;
++    guint                call_added_id;
++    guint                call_state_changed_id;
++    guint                pdu_received_id;
++    guint                reg_state_id;
++    GHashTable          *taken_pdus;   /* inbox ids already handed to messaging */
++    gboolean             messaging_ready; /* the SMS list exists (load_initial_sms_parts ran) */
++    gboolean             is_available;
++    gint                 reg_state;
++    guint32              call_id;
++    gchar               *call_number;
++    MMCallDirection      call_direction;
++    MMCallState          call_state;
++};
++
++static MMCallState
++map_imsd_call_state (gint state)
++{
++    switch (state) {
++    case 1:
++        return MM_CALL_STATE_DIALING;
++    case 2:
++        return MM_CALL_STATE_RINGING_OUT;
++    case 3:
++        return MM_CALL_STATE_RINGING_IN;
++    case 4:
++        return MM_CALL_STATE_ACTIVE;
++    case 5:
++        return MM_CALL_STATE_HELD;
++    case 6:
++    case 7:
++        return MM_CALL_STATE_TERMINATED;
++    default:
++        return MM_CALL_STATE_UNKNOWN;
++    }
++}
++
++static void
++on_call_added (GDBusConnection *connection,
++               const gchar     *sender_name,
++               const gchar     *object_path,
++               const gchar     *interface_name,
++               const gchar     *signal_name,
++               GVariant        *parameters,
++               gpointer         user_data)
++{
++    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    guint32 call_id = 0;
++    const gchar *number = NULL;
++    gint32 direction = 0;
++
++    if (!self->priv->modem)
++        return;
++
++    g_variant_get (parameters, "(u&si)", &call_id, &number, &direction);
++    self->priv->call_id = call_id;
++    g_clear_pointer (&self->priv->call_number, g_free);
++    self->priv->call_number = g_strdup (number);
++    self->priv->call_direction = (direction == 1) ? MM_CALL_DIRECTION_INCOMING : MM_CALL_DIRECTION_OUTGOING;
++    self->priv->call_state = (direction == 1) ? MM_CALL_STATE_RINGING_IN : MM_CALL_STATE_DIALING;
++    mm_obj_dbg (self->priv->modem, "b2q-ims: CallAdded signal (id %u, number %s, dir %d)",
++                call_id, number ? number : "", direction);
++
++    if (direction == 1) {
++        MMCallInfo info;
++
++        memset (&info, 0, sizeof (info));
++        info.index = call_id;
++        info.direction = MM_CALL_DIRECTION_INCOMING;
++        info.state = MM_CALL_STATE_RINGING_IN;
++        info.number = (gchar *)number;
++        mm_iface_modem_voice_report_call (MM_IFACE_MODEM_VOICE (self->priv->modem), &info);
++    }
++}
++
++static void
++on_call_state_changed (GDBusConnection *connection,
++                       const gchar     *sender_name,
++                       const gchar     *object_path,
++                       const gchar     *interface_name,
++                       const gchar     *signal_name,
++                       GVariant        *parameters,
++                       gpointer         user_data)
++{
++    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    guint32 call_id = 0;
++    gint32 state = 0;
++    gint32 reason = 0;
++    MMCallInfo info;
++
++    if (!self->priv->modem)
++        return;
++
++    g_variant_get (parameters, "(uii)", &call_id, &state, &reason);
++    if (call_id == self->priv->call_id)
++        self->priv->call_state = map_imsd_call_state (state);
++    mm_obj_dbg (self->priv->modem, "b2q-ims: CallStateChanged signal (id %u, state %d, reason %d)",
++                call_id, state, reason);
++
++    memset (&info, 0, sizeof (info));
++    info.index = call_id;
++    info.direction = MM_CALL_DIRECTION_UNKNOWN;
++    info.state = map_imsd_call_state (state);
++    info.number = NULL;
++
++    mm_iface_modem_voice_report_call (MM_IFACE_MODEM_VOICE (self->priv->modem), &info);
++}
++
++static void
++ack_pdu_ready (GDBusConnection *connection,
++               GAsyncResult    *res,
++               MMImsBackendB2q *self)
++{
++    g_autoptr(GVariant) ret = NULL;
++    g_autoptr(GError)   error = NULL;
++
++    ret = g_dbus_connection_call_finish (connection, res, &error);
++    if (!ret && self->priv->modem)
++        mm_obj_warn (self->priv->modem, "b2q-ims: AckPdu failed: %s", error->message);
++    g_object_unref (self);
++}
++
++/*
++ * Hand one inbox entry to the messaging interface, then tell b2q-imsd it can
++ * drop it. Live PduReceived signals and the GetPendingPdus backlog both land
++ * here; an id already taken in this ModemManager run is only acked again.
++ *
++ * An entry is acked only once ModemManager holds it: take_part() refuses
++ * (and frees) parts while the SMS list does not exist yet, early in modem
++ * initialization. Such an entry stays in the inbox and is fetched again from
++ * load_initial_sms_parts. One that can never be parsed is acked so it is not
++ * handed over forever.
++ */
++static void
++take_pdu (MMImsBackendB2q *self,
++          const gchar     *id,
++          const gchar     *hexpdu)
++{
++    g_autoptr(GError) error = NULL;
++    MMSmsPart        *part;
++
++    if (!self->priv->modem || !self->priv->connection)
++        return;
++
++    if (!g_hash_table_contains (self->priv->taken_pdus, id)) {
++        mm_obj_info (self->priv->modem, "b2q-ims: MT-SMS %s (%" G_GSIZE_FORMAT " PDU bytes)",
++                     id, strlen (hexpdu) / 2);
++        part = mm_sms_part_3gpp_new_from_pdu (SMS_PART_INVALID_INDEX, hexpdu,
++                                              self->priv->modem, &error);
++        if (!part) {
++            mm_obj_warn (self->priv->modem, "b2q-ims: couldn't parse 3GPP PDU %s (%s): %s",
++                         id, hexpdu, error->message);
++        } else if (!mm_iface_modem_messaging_take_part (MM_IFACE_MODEM_MESSAGING (self->priv->modem),
++                                                       part,
++                                                       MM_SMS_STATE_RECEIVED,
++                                                       MM_SMS_STORAGE_UNKNOWN)) {
++            mm_obj_info (self->priv->modem,
++                         "b2q-ims: messaging not ready, MT-SMS %s stays in the b2q-imsd inbox", id);
++            return;
++        }
++        g_hash_table_add (self->priv->taken_pdus, g_strdup (id));
++    }
++
++    g_dbus_connection_call (self->priv->connection,
++                            "org.b2q.Imsd",
++                            "/org/b2q/Imsd",
++                            "org.b2q.Imsd",
++                            "AckPdu",
++                            g_variant_new ("(s)", id),
++                            NULL,
++                            G_DBUS_CALL_FLAGS_NONE,
++                            -1,
++                            NULL,
++                            (GAsyncReadyCallback) ack_pdu_ready,
++                            g_object_ref (self));
++}
++
++static void
++on_pdu_received (GDBusConnection *connection,
++                 const gchar     *sender_name,
++                 const gchar     *object_path,
++                 const gchar     *interface_name,
++                 const gchar     *signal_name,
++                 GVariant        *parameters,
++                 gpointer         user_data)
++{
++    const gchar *id = NULL;
++    const gchar *hexpdu = NULL;
++
++    g_variant_get (parameters, "(&s&s)", &id, &hexpdu);
++    take_pdu (MM_IMS_BACKEND_B2Q (user_data), id, hexpdu);
++}
++
++static void
++get_pending_pdus_ready (GDBusConnection *connection,
++                        GAsyncResult    *res,
++                        GTask           *task)
++{
++    MMImsBackendB2q        *self = g_task_get_source_object (task);
++    g_autoptr(GVariant)     ret = NULL;
++    g_autoptr(GVariantIter) iter = NULL;
++    g_autoptr(GError)       error = NULL;
++    const gchar            *id;
++    const gchar            *hexpdu;
++
++    ret = g_dbus_connection_call_finish (connection, res, &error);
++    if (!ret) {
++        /* Not fatal for messaging: the entries stay in the inbox. */
++        if (self->priv->modem)
++            mm_obj_warn (self->priv->modem, "b2q-ims: GetPendingPdus failed: %s", error->message);
++    } else {
++        g_variant_get (ret, "(a(ss))", &iter);
++        if (self->priv->modem && g_variant_iter_n_children (iter) > 0)
++            mm_obj_info (self->priv->modem, "b2q-ims: %" G_GSIZE_FORMAT " pending MT-SMS in the inbox",
++                         g_variant_iter_n_children (iter));
++        while (g_variant_iter_loop (iter, "(&s&s)", &id, &hexpdu))
++            take_pdu (self, id, hexpdu);
++    }
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++fetch_pending_pdus (MMImsBackendB2q     *self,
++                    GAsyncReadyCallback  callback,
++                    gpointer             user_data)
++{
++    GTask *task = g_task_new (self, NULL, callback, user_data);
++
++    g_dbus_connection_call (self->priv->connection,
++                            "org.b2q.Imsd",
++                            "/org/b2q/Imsd",
++                            "org.b2q.Imsd",
++                            "GetPendingPdus",
++                            NULL,
++                            G_VARIANT_TYPE ("(a(ss))"),
++                            G_DBUS_CALL_FLAGS_NONE,
++                            -1,
++                            NULL,
++                            (GAsyncReadyCallback) get_pending_pdus_ready,
++                            task);
++}
++
++/*
++ * Called from load_initial_sms_parts, the step where ModemManager loads stored
++ * messages, once the SMS list exists: b2q-imsd's inbox is this modem's storage.
++ */
++void
++mm_ims_backend_b2q_load_initial_sms (MMImsBackendB2q     *self,
++                                     GAsyncReadyCallback  callback,
++                                     gpointer             user_data)
++{
++    self->priv->messaging_ready = TRUE;
++    if (self->priv->is_available && self->priv->connection) {
++        fetch_pending_pdus (self, callback, user_data);
++        return;
++    }
++    /* b2q-imsd not on the bus yet: on_name_appeared fetches the inbox. */
++    GTask *task = g_task_new (self, NULL, callback, user_data);
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++gboolean
++mm_ims_backend_b2q_load_initial_sms_finish (MMImsBackendB2q  *self,
++                                            GAsyncResult     *res,
++                                            GError          **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++on_reg_state_changed (GDBusConnection *connection,
++                      const gchar     *sender_name,
++                      const gchar     *object_path,
++                      const gchar     *interface_name,
++                      const gchar     *signal_name,
++                      GVariant        *parameters,
++                      gpointer         user_data)
++{
++    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++    gint32 state = 0;
++
++    g_variant_get (parameters, "(i)", &state);
++    self->priv->reg_state = state;
++    if (self->priv->modem) {
++        mm_obj_info (self->priv->modem, "b2q-ims: registration state changed to %d (%s)",
++                     state, state == 2 ? "registered" : (state == 1 ? "registering" : "down"));
++    }
++}
++
++static void
++subscribe_signals (MMImsBackendB2q *self)
++{
++    if (!self->priv->connection)
++        return;
++
++    if (self->priv->call_added_id == 0) {
++        self->priv->call_added_id = g_dbus_connection_signal_subscribe (
++            self->priv->connection,
++            "org.b2q.Imsd",
++            "org.b2q.Imsd",
++            "CallAdded",
++            "/org/b2q/Imsd",
++            NULL,
++            G_DBUS_SIGNAL_FLAGS_NONE,
++            on_call_added,
++            self,
++            NULL);
++    }
++
++    if (self->priv->call_state_changed_id == 0) {
++        self->priv->call_state_changed_id = g_dbus_connection_signal_subscribe (
++            self->priv->connection,
++            "org.b2q.Imsd",
++            "org.b2q.Imsd",
++            "CallStateChanged",
++            "/org/b2q/Imsd",
++            NULL,
++            G_DBUS_SIGNAL_FLAGS_NONE,
++            on_call_state_changed,
++            self,
++            NULL);
++    }
++
++    if (self->priv->pdu_received_id == 0) {
++        self->priv->pdu_received_id = g_dbus_connection_signal_subscribe (
++            self->priv->connection,
++            "org.b2q.Imsd",
++            "org.b2q.Imsd",
++            "PduReceived",
++            "/org/b2q/Imsd",
++            NULL,
++            G_DBUS_SIGNAL_FLAGS_NONE,
++            on_pdu_received,
++            self,
++            NULL);
++    }
++    if (self->priv->reg_state_id == 0) {
++        self->priv->reg_state_id = g_dbus_connection_signal_subscribe (
++            self->priv->connection,
++            "org.b2q.Imsd",
++            "org.b2q.Imsd",
++            "RegistrationStateChanged",
++            "/org/b2q/Imsd",
++            NULL,
++            G_DBUS_SIGNAL_FLAGS_NONE,
++            on_reg_state_changed,
++            self,
++            NULL);
++    }
++}
++
++static void
++unsubscribe_signals (MMImsBackendB2q *self)
++{
++    if (!self->priv->connection)
++        return;
++
++    if (self->priv->call_added_id != 0) {
++        g_dbus_connection_signal_unsubscribe (self->priv->connection, self->priv->call_added_id);
++        self->priv->call_added_id = 0;
++    }
++    if (self->priv->call_state_changed_id != 0) {
++        g_dbus_connection_signal_unsubscribe (self->priv->connection, self->priv->call_state_changed_id);
++        self->priv->call_state_changed_id = 0;
++    }
++    if (self->priv->pdu_received_id != 0) {
++        g_dbus_connection_signal_unsubscribe (self->priv->connection, self->priv->pdu_received_id);
++        self->priv->pdu_received_id = 0;
++    }
++    if (self->priv->reg_state_id != 0) {
++        g_dbus_connection_signal_unsubscribe (self->priv->connection, self->priv->reg_state_id);
++        self->priv->reg_state_id = 0;
++    }
++}
++
++static void
++on_name_appeared (GDBusConnection *connection,
++                  const gchar     *name,
++                  const gchar     *name_owner,
++                  gpointer         user_data)
++{
++    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++
++    if (self->priv->modem)
++        mm_obj_info (self->priv->modem, "b2q-ims: %s appeared on system bus (owner %s)", name, name_owner);
++    self->priv->is_available = TRUE;
++    subscribe_signals (self);
++
++    /*
++     * Messages b2q-imsd stored while nobody was listening. Before messaging
++     * is enabled there is no SMS list to put them in; load_initial_sms_parts
++     * fetches them then.
++     */
++    if (self->priv->messaging_ready)
++        fetch_pending_pdus (self, NULL, NULL);
++}
++
++static void
++on_name_vanished (GDBusConnection *connection,
++                  const gchar     *name,
++                  gpointer         user_data)
++{
++    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (user_data);
++
++    if (self->priv->modem)
++        mm_obj_warn (self->priv->modem, "b2q-ims: %s vanished from system bus", name);
++    self->priv->is_available = FALSE;
++    unsubscribe_signals (self);
++}
++
++gboolean
++mm_ims_backend_b2q_is_available (MMImsBackendB2q *self)
++{
++    g_return_val_if_fail (MM_IS_IMS_BACKEND_B2Q (self), FALSE);
++    return self->priv->is_available;
++}
++
++/*****************************************************************************/
++/* Call methods */
++
++static void
++dbus_create_call_ready (GDBusConnection *connection,
++                        GAsyncResult    *res,
++                        GTask           *task)
++{
++    GError *error = NULL;
++    g_autoptr(GVariant) reply = NULL;
++
++    reply = g_dbus_connection_call_finish (connection, res, &error);
++    if (!reply) {
++        g_task_return_error (task, error);
++    } else {
++        guint32 call_id = 0;
++        g_variant_get (reply, "(u)", &call_id);
++        g_task_return_int (task, (gssize)call_id);
++    }
++    g_object_unref (task);
++}
++
++void
++mm_ims_backend_b2q_create_call (MMImsBackendB2q    *self,
++                                const gchar        *number,
++                                GCancellable       *cancellable,
++                                GAsyncReadyCallback callback,
++                                gpointer            user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++    if (!self->priv->is_available || !self->priv->connection) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "b2q-imsd is not available");
++        g_object_unref (task);
++        return;
++    }
++
++    g_dbus_connection_call (self->priv->connection,
++                            "org.b2q.Imsd",
++                            "/org/b2q/Imsd",
++                            "org.b2q.Imsd",
++                            "CreateCall",
++                            g_variant_new ("(s)", number ? number : ""),
++                            G_VARIANT_TYPE ("(u)"),
++                            G_DBUS_CALL_FLAGS_NONE,
++                            15000,
++                            cancellable,
++                            (GAsyncReadyCallback) dbus_create_call_ready,
++                            task);
++}
++
++gboolean
++mm_ims_backend_b2q_create_call_finish (MMImsBackendB2q  *self,
++                                       GAsyncResult     *res,
++                                       guint32          *out_call_id,
++                                       GError          **error)
++{
++    gssize val;
++
++    val = g_task_propagate_int (G_TASK (res), error);
++    if (val < 0)
++        return FALSE;
++    if (out_call_id)
++        *out_call_id = (guint32)val;
++    return TRUE;
++}
++
++static void
++dbus_answer_call_ready (GDBusConnection *connection,
++                        GAsyncResult    *res,
++                        GTask           *task)
++{
++    GError *error = NULL;
++    g_autoptr(GVariant) reply = NULL;
++
++    reply = g_dbus_connection_call_finish (connection, res, &error);
++    if (!reply)
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++void
++mm_ims_backend_b2q_answer_call (MMImsBackendB2q    *self,
++                                guint32             call_id,
++                                GCancellable       *cancellable,
++                                GAsyncReadyCallback callback,
++                                gpointer            user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++    if (!self->priv->is_available || !self->priv->connection) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "b2q-imsd is not available");
++        g_object_unref (task);
++        return;
++    }
++
++    g_dbus_connection_call (self->priv->connection,
++                            "org.b2q.Imsd",
++                            "/org/b2q/Imsd",
++                            "org.b2q.Imsd",
++                            "AnswerCall",
++                            g_variant_new ("(u)", call_id),
++                            G_VARIANT_TYPE ("()"),
++                            G_DBUS_CALL_FLAGS_NONE,
++                            10000,
++                            cancellable,
++                            (GAsyncReadyCallback) dbus_answer_call_ready,
++                            task);
++}
++
++gboolean
++mm_ims_backend_b2q_answer_call_finish (MMImsBackendB2q  *self,
++                                       GAsyncResult     *res,
++                                       GError          **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++dbus_hangup_call_ready (GDBusConnection *connection,
++                        GAsyncResult    *res,
++                        GTask           *task)
++{
++    GError *error = NULL;
++    g_autoptr(GVariant) reply = NULL;
++
++    reply = g_dbus_connection_call_finish (connection, res, &error);
++    if (!reply)
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++void
++mm_ims_backend_b2q_hangup_call (MMImsBackendB2q    *self,
++                                guint32             call_id,
++                                GCancellable       *cancellable,
++                                GAsyncReadyCallback callback,
++                                gpointer            user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++    if (!self->priv->is_available || !self->priv->connection) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    g_dbus_connection_call (self->priv->connection,
++                            "org.b2q.Imsd",
++                            "/org/b2q/Imsd",
++                            "org.b2q.Imsd",
++                            "HangupCall",
++                            g_variant_new ("(u)", call_id),
++                            G_VARIANT_TYPE ("()"),
++                            G_DBUS_CALL_FLAGS_NONE,
++                            10000,
++                            cancellable,
++                            (GAsyncReadyCallback) dbus_hangup_call_ready,
++                            task);
++}
++
++gboolean
++mm_ims_backend_b2q_hangup_call_finish (MMImsBackendB2q  *self,
++                                       GAsyncResult     *res,
++                                       GError          **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++/*****************************************************************************/
++/* SMS methods */
++
++static void
++dbus_send_sms_ready (GDBusConnection *connection,
++                     GAsyncResult    *res,
++                     GTask           *task)
++{
++    GError *error = NULL;
++    g_autoptr(GVariant) reply = NULL;
++
++    reply = g_dbus_connection_call_finish (connection, res, &error);
++    if (!reply) {
++        g_task_return_error (task, error);
++    } else {
++        const gchar *ref = NULL;
++        g_variant_get (reply, "(&s)", &ref);
++        g_task_return_pointer (task, g_strdup (ref), g_free);
++    }
++    g_object_unref (task);
++}
++
++void
++mm_ims_backend_b2q_send_sms (MMImsBackendB2q    *self,
++                             const gchar        *number,
++                             const gchar        *text,
++                             GCancellable       *cancellable,
++                             GAsyncReadyCallback callback,
++                             gpointer            user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++    if (!self->priv->is_available || !self->priv->connection) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "b2q-imsd is not available");
++        g_object_unref (task);
++        return;
++    }
++
++    g_dbus_connection_call (self->priv->connection,
++                            "org.b2q.Imsd",
++                            "/org/b2q/Imsd",
++                            "org.b2q.Imsd",
++                            "SendSms",
++                            g_variant_new ("(ss)", number ? number : "", text ? text : ""),
++                            G_VARIANT_TYPE ("(s)"),
++                            G_DBUS_CALL_FLAGS_NONE,
++                            30000,
++                            cancellable,
++                            (GAsyncReadyCallback) dbus_send_sms_ready,
++                            task);
++}
++
++gboolean
++mm_ims_backend_b2q_send_sms_finish (MMImsBackendB2q  *self,
++                                    GAsyncResult     *res,
++                                    gchar           **out_ref,
++                                    GError          **error)
++{
++    gchar *ref;
++
++    ref = g_task_propagate_pointer (G_TASK (res), error);
++    if (!ref)
++        return FALSE;
++    if (out_ref)
++        *out_ref = ref;
++    else
++        g_free (ref);
++    return TRUE;
++}
++
++/*****************************************************************************/
++
++GList *
++mm_ims_backend_b2q_get_call_list (MMImsBackendB2q *self)
++{
++    MMCallInfo *info;
++
++    if (!self->priv->call_id || self->priv->call_state == MM_CALL_STATE_UNKNOWN)
++        return NULL;
++
++    info = g_new0 (MMCallInfo, 1);
++    info->index = self->priv->call_id;
++    info->direction = self->priv->call_direction;
++    info->state = self->priv->call_state;
++    info->number = g_strdup (self->priv->call_number);
++    return g_list_append (NULL, info);
++}
++
++/*****************************************************************************/
++
++MMImsBackendB2q *
++mm_ims_backend_b2q_new (MMBroadbandModemQmi *modem)
++{
++    MMImsBackendB2q *self;
++    GDBusConnection *conn = NULL;
++
++    self = g_object_new (MM_TYPE_IMS_BACKEND_B2Q, NULL);
++    self->priv->modem = modem;
++
++    g_object_get (modem, MM_BASE_MODEM_CONNECTION, &conn, NULL);
++    if (!conn)
++        conn = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
++
++    self->priv->connection = conn;
++    if (self->priv->connection) {
++        self->priv->name_watch_id = g_bus_watch_name_on_connection (
++            self->priv->connection,
++            "org.b2q.Imsd",
++            G_BUS_NAME_WATCHER_FLAGS_NONE,
++            on_name_appeared,
++            on_name_vanished,
++            self,
++            NULL);
++    }
++
++    return self;
++}
++
++static void
++mm_ims_backend_b2q_init (MMImsBackendB2q *self)
++{
++    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self, MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2qPrivate);
++    self->priv->is_available = FALSE;
++    self->priv->reg_state = 0;
++    self->priv->taken_pdus = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++}
++
++static void
++dispose (GObject *object)
++{
++    MMImsBackendB2q *self = MM_IMS_BACKEND_B2Q (object);
++
++    if (self->priv->name_watch_id != 0) {
++        g_bus_unwatch_name (self->priv->name_watch_id);
++        self->priv->name_watch_id = 0;
++    }
++
++    unsubscribe_signals (self);
++
++    g_clear_object (&self->priv->connection);
++    g_clear_pointer (&self->priv->taken_pdus, g_hash_table_unref);
++    g_clear_pointer (&self->priv->call_number, g_free);
++    self->priv->modem = NULL;
++
++    G_OBJECT_CLASS (mm_ims_backend_b2q_parent_class)->dispose (object);
++}
++
++static void
++mm_ims_backend_b2q_class_init (MMImsBackendB2qClass *klass)
++{
++    GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++    g_type_class_add_private (object_class, sizeof (MMImsBackendB2qPrivate));
++    object_class->dispose = dispose;
++}
+diff --git a/src/mm-ims-backend-b2q.h b/src/mm-ims-backend-b2q.h
+new file mode 100644
+index 0000000..66d046e
+--- /dev/null
++++ b/src/mm-ims-backend-b2q.h
+@@ -0,0 +1,97 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026 Noa Himesaka <himesaka@noa.codes>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef MM_IMS_BACKEND_B2Q_H
++#define MM_IMS_BACKEND_B2Q_H
++
++#include <glib.h>
++#include <glib-object.h>
++#include <gio/gio.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-broadband-modem-qmi.h"
++
++#define MM_TYPE_IMS_BACKEND_B2Q            (mm_ims_backend_b2q_get_type ())
++#define MM_IMS_BACKEND_B2Q(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2q))
++#define MM_IMS_BACKEND_B2Q_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2qClass))
++#define MM_IS_IMS_BACKEND_B2Q(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_IMS_BACKEND_B2Q))
++#define MM_IS_IMS_BACKEND_B2Q_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_IMS_BACKEND_B2Q))
++#define MM_IMS_BACKEND_B2Q_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_IMS_BACKEND_B2Q, MMImsBackendB2qClass))
++
++typedef struct _MMImsBackendB2q MMImsBackendB2q;
++typedef struct _MMImsBackendB2qClass MMImsBackendB2qClass;
++typedef struct _MMImsBackendB2qPrivate MMImsBackendB2qPrivate;
++
++struct _MMImsBackendB2q {
++    GObject parent;
++    MMImsBackendB2qPrivate *priv;
++};
++
++struct _MMImsBackendB2qClass {
++    GObjectClass parent;
++};
++
++GType mm_ims_backend_b2q_get_type (void);
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMImsBackendB2q, g_object_unref)
++
++MMImsBackendB2q *mm_ims_backend_b2q_new (MMBroadbandModemQmi *modem);
++
++gboolean mm_ims_backend_b2q_is_available (MMImsBackendB2q *self);
++void     mm_ims_backend_b2q_load_initial_sms        (MMImsBackendB2q     *self,
++                                                     GAsyncReadyCallback  callback,
++                                                     gpointer             user_data);
++gboolean mm_ims_backend_b2q_load_initial_sms_finish (MMImsBackendB2q     *self,
++                                                     GAsyncResult        *res,
++                                                     GError             **error);
++
++GList *mm_ims_backend_b2q_get_call_list (MMImsBackendB2q *self);
++
++void mm_ims_backend_b2q_create_call (MMImsBackendB2q    *self,
++                                     const gchar        *number,
++                                     GCancellable       *cancellable,
++                                     GAsyncReadyCallback callback,
++                                     gpointer            user_data);
++gboolean mm_ims_backend_b2q_create_call_finish (MMImsBackendB2q  *self,
++                                                GAsyncResult     *res,
++                                                guint32          *out_call_id,
++                                                GError          **error);
++
++void mm_ims_backend_b2q_answer_call (MMImsBackendB2q    *self,
++                                     guint32             call_id,
++                                     GCancellable       *cancellable,
++                                     GAsyncReadyCallback callback,
++                                     gpointer            user_data);
++gboolean mm_ims_backend_b2q_answer_call_finish (MMImsBackendB2q  *self,
++                                                GAsyncResult     *res,
++                                                GError          **error);
++
++void mm_ims_backend_b2q_hangup_call (MMImsBackendB2q    *self,
++                                     guint32             call_id,
++                                     GCancellable       *cancellable,
++                                     GAsyncReadyCallback callback,
++                                     gpointer            user_data);
++gboolean mm_ims_backend_b2q_hangup_call_finish (MMImsBackendB2q  *self,
++                                                GAsyncResult     *res,
++                                                GError          **error);
++
++void mm_ims_backend_b2q_send_sms (MMImsBackendB2q    *self,
++                                  const gchar        *number,
++                                  const gchar        *text,
++                                  GCancellable       *cancellable,
++                                  GAsyncReadyCallback callback,
++                                  gpointer            user_data);
++gboolean mm_ims_backend_b2q_send_sms_finish (MMImsBackendB2q  *self,
++                                             GAsyncResult     *res,
++                                             gchar           **out_ref,
++                                             GError          **error);
++
++#endif /* MM_IMS_BACKEND_B2Q_H */
+diff --git a/src/mm-sms-ims.c b/src/mm-sms-ims.c
+new file mode 100644
+index 0000000..d250c26
+--- /dev/null
++++ b/src/mm-sms-ims.c
+@@ -0,0 +1,169 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026 Noa Himesaka <himesaka@noa.codes>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include "mm-sms-ims.h"
++#include "mm-ims-backend-b2q.h"
++#include "mm-broadband-modem-qmi.h"
++#include "mm-log-object.h"
++#include "mm-errors-types.h"
++
++G_DEFINE_TYPE (MMSmsIms, mm_sms_ims, MM_TYPE_BASE_SMS)
++
++/*****************************************************************************/
++/* Send SMS */
++
++static gboolean
++sms_send_finish (MMBaseSms     *self,
++                 GAsyncResult  *res,
++                 GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++send_sms_ready (MMImsBackendB2q *backend,
++                GAsyncResult    *res,
++                GTask           *task)
++{
++    MMBaseSms *self;
++    GError    *error = NULL;
++    gchar     *ref = NULL;
++
++    self = MM_BASE_SMS (g_task_get_source_object (task));
++
++    if (!mm_ims_backend_b2q_send_sms_finish (backend, res, &ref, &error)) {
++        g_task_return_error (task, error);
++    } else {
++        GList *parts;
++
++        /* Set message reference on first part if available */
++        parts = mm_base_sms_get_parts (self);
++        if (parts && parts->data) {
++            guint msg_ref = (guint) g_ascii_strtoull (ref ? ref : "0", NULL, 10);
++            mm_sms_part_set_message_reference ((MMSmsPart *)parts->data, msg_ref);
++        }
++        g_free (ref);
++        g_task_return_boolean (task, TRUE);
++    }
++    g_object_unref (task);
++}
++
++static void
++sms_send (MMBaseSms           *self,
++          GAsyncReadyCallback  callback,
++          gpointer             user_data)
++{
++    MMBroadbandModemQmi *modem = NULL;
++    MMImsBackendB2q     *backend = NULL;
++    GTask               *task;
++    const gchar         *number;
++    const gchar         *text;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    g_object_get (self, MM_BASE_SMS_MODEM, &modem, NULL);
++    if (!modem) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "No modem associated with this SMS");
++        g_object_unref (task);
++        return;
++    }
++
++    backend = mm_broadband_modem_qmi_peek_ims_backend (modem);
++    if (!backend || !mm_ims_backend_b2q_is_available (backend)) {
++        g_object_unref (modem);
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                                 "IMS backend is not available");
++        g_object_unref (task);
++        return;
++    }
++
++    number = mm_gdbus_sms_get_number (MM_GDBUS_SMS (self));
++    text = mm_gdbus_sms_get_text (MM_GDBUS_SMS (self));
++
++    if (!number || !text) {
++        GList *parts = mm_base_sms_get_parts (self);
++        if (parts && parts->data) {
++            if (!number)
++                number = mm_sms_part_get_number ((MMSmsPart *)parts->data);
++            if (!text)
++                text = mm_sms_part_get_text ((MMSmsPart *)parts->data);
++        }
++    }
++
++    if (!number || !text) {
++        g_object_unref (modem);
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
++                                 "Cannot send SMS: number or text is missing");
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "sending IMS SMS to %s", number);
++
++    mm_ims_backend_b2q_send_sms (backend,
++                                 number,
++                                 text,
++                                 NULL,
++                                 (GAsyncReadyCallback) send_sms_ready,
++                                 task);
++    g_object_unref (modem);
++}
++
++/*****************************************************************************/
++/* Delete SMS */
++
++static gboolean
++sms_delete_finish (MMBaseSms     *self,
++                   GAsyncResult  *res,
++                   GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++sms_delete (MMBaseSms           *self,
++            GAsyncReadyCallback  callback,
++            gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++/*****************************************************************************/
++
++MMBaseSms *
++mm_sms_ims_new (MMBaseModem *modem)
++{
++    return MM_BASE_SMS (g_object_new (MM_TYPE_SMS_IMS,
++                                      MM_BASE_SMS_MODEM, modem,
++                                      NULL));
++}
++
++static void
++mm_sms_ims_init (MMSmsIms *self)
++{
++}
++
++static void
++mm_sms_ims_class_init (MMSmsImsClass *klass)
++{
++    MMBaseSmsClass *base_sms_class = MM_BASE_SMS_CLASS (klass);
++
++    base_sms_class->send = sms_send;
++    base_sms_class->send_finish = sms_send_finish;
++    base_sms_class->delete = sms_delete;
++    base_sms_class->delete_finish = sms_delete_finish;
++}
+diff --git a/src/mm-sms-ims.h b/src/mm-sms-ims.h
+new file mode 100644
+index 0000000..d213bbf
+--- /dev/null
++++ b/src/mm-sms-ims.h
+@@ -0,0 +1,45 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026 Noa Himesaka <himesaka@noa.codes>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef MM_SMS_IMS_H
++#define MM_SMS_IMS_H
++
++#include <glib.h>
++#include <glib-object.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-base-sms.h"
++
++#define MM_TYPE_SMS_IMS            (mm_sms_ims_get_type ())
++#define MM_SMS_IMS(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_SMS_IMS, MMSmsIms))
++#define MM_SMS_IMS_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_SMS_IMS, MMSmsImsClass))
++#define MM_IS_SMS_IMS(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_SMS_IMS))
++#define MM_IS_SMS_IMS_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_SMS_IMS))
++#define MM_SMS_IMS_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_SMS_IMS, MMSmsImsClass))
++
++typedef struct _MMSmsIms MMSmsIms;
++typedef struct _MMSmsImsClass MMSmsImsClass;
++
++struct _MMSmsIms {
++    MMBaseSms parent;
++};
++
++struct _MMSmsImsClass {
++    MMBaseSmsClass parent;
++};
++
++GType mm_sms_ims_get_type (void);
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMSmsIms, g_object_unref)
++
++MMBaseSms *mm_sms_ims_new (MMBaseModem *modem);
++
++#endif /* MM_SMS_IMS_H */
+-- 
+2.56.0
+
