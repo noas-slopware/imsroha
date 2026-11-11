@@ -6,5 +6,7 @@ exec sed -E \
 	-e 's/tag=(b2q|ir)?[0-9a-f]{8}\b/tag=<rand>/g' \
 	-e 's/^(Call-ID: )[0-9a-f]{16,}@/\1<rand>@/' \
 	-e 's/^(o=[^ ]+ )[0-9]+ [0-9]+/\1<sess> <ver>/' \
-	-e 's/^----- [0-9]+ bytes$/----- <len>/' \
+	-e 's/^----- [0-9]+ bytes/----- <len>/' \
+	-e '/^Security-Client:/s/spi-([cs])=[0-9]+/spi-\1=<rand>/g' \
+	-e 's/ spi 0x[0-9a-f]{8}/ spi <spi>/' \
 	"$@"

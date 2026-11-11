@@ -477,11 +477,22 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 	return (int)len;
 }
 
+/*
+ * Once the SAs are up, requests leave from port_uc to the P-CSCF's port_ps,
+ * and responses (to the requests it sends us on port_us) from port_us to its
+ * port_pc. The kernel's policies put both into ESP.
+ */
 static int send_sip_msg(struct imsd_sip_ctx *ctx, const void *buf, size_t len)
 {
-	ssize_t sent = sendto(ctx->fd, buf, len, 0,
-			      (struct sockaddr *)&ctx->pcscf_addr,
-			      sizeof(ctx->pcscf_addr));
+	struct sockaddr_in6 to = ctx->pcscf_addr;
+	int fd = ctx->fd;
+
+	if (ctx->sec_state == IMSD_SEC_PROTECTED) {
+		int response = len >= 8 && !memcmp(buf, "SIP/2.0 ", 8);
+		fd = response ? ctx->fd_s : ctx->fd_c;
+		to.sin6_port = htons(response ? ctx->sec.port_pc : ctx->sec.port_ps);
+	}
+	ssize_t sent = sendto(fd, buf, len, 0, (struct sockaddr *)&to, sizeof(to));
 	if (sent < 0) {
 		fprintf(stderr, "imsroha: sendto failed: %s\n", strerror(errno));
 		return -errno;
@@ -550,12 +561,59 @@ static uint32_t reg_req_expires(const struct imsd_sip_ctx *ctx)
 	return ctx->reg_min_expires > IMSD_REG_EXPIRES ? ctx->reg_min_expires : IMSD_REG_EXPIRES;
 }
 
+/* sec-agree failed: drop the SAs and register the plain way from now on. */
+static void sec_give_up(struct imsd_sip_ctx *ctx)
+{
+	imsroha_ipsec_remove(&ctx->sec);
+	ctx->sec_state = IMSD_SEC_FALLBACK;
+	ctx->ua_port = ctx->sip_port;
+}
+
+/*
+ * The sec-agree lines of a REGISTER (TS 24.229 5.1.1.2.1, RFC 3329): our
+ * Security-Client, and once the SAs are up the P-CSCF's Security-Server back
+ * as Security-Verify. Empty when sec-agree is off or was given up.
+ */
+static void sec_lines(struct imsd_sip_ctx *ctx, char *out, size_t size)
+{
+	char client[512];
+
+	out[0] = '\0';
+	if (ctx->sec_state != IMSD_SEC_OFFERED && ctx->sec_state != IMSD_SEC_PROTECTED)
+		return;
+	if (imsroha_ipsec_client_header(&ctx->sec, client, sizeof(client)) < 0)
+		return;
+	int n = snprintf(out, size, "Security-Client: %s\r\n", client);
+	if (ctx->sec_state == IMSD_SEC_PROTECTED && n > 0 && (size_t)n < size)
+		n += snprintf(out + n, size - n, "Security-Verify: %s\r\n", ctx->sec.server_line);
+	if (n > 0 && (size_t)n < size)
+		snprintf(out + n, size - n, "Require: sec-agree\r\nProxy-Require: sec-agree\r\n");
+}
+
+static const char *sec_supported(const struct imsd_sip_ctx *ctx)
+{
+	return ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED ?
+	       "path, sec-agree" : "path";
+}
+
 int imsd_sip_register(struct imsd_sip_ctx *ctx)
 {
 	char branch[32];
 	snprintf(branch, sizeof(branch), "z9hG4bK%08x", (unsigned)rand());
 
-	char req[2048];
+	/*
+	 * A REGISTER that will be challenged offers fresh SPIs: the SAs the 401
+	 * leads to are new ones (TS 33.203 7.4). Over SAs that are up, the
+	 * Security-Client keeps announcing the ones in use until then.
+	 */
+	char sec[1200];
+	if (ctx->sec_state == IMSD_SEC_OFFERED)
+		imsroha_ipsec_new_spis(&ctx->sec);
+	sec_lines(ctx, sec, sizeof(sec));
+	/* TTAK.KO-06.0357 5.2.2: the unprotected REGISTER names AKAv1-MD5. */
+	const char *alg = ctx->sec_state == IMSD_SEC_OFFERED ? ", algorithm=AKAv1-MD5" : "";
+
+	char req[3072];
 	int len = snprintf(req, sizeof(req),
 		"REGISTER sip:%s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=%s;rport\r\n"
@@ -564,16 +622,17 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 		"Call-ID: %s\r\n"
 		"CSeq: %u REGISTER\r\n"
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"%s\r\n"
-		"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"\", uri=\"sip:%s\", response=\"\"\r\n"
+		"Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"\", uri=\"sip:%s\", response=\"\"%s\r\n"
+		"%s"
 		"Max-Forwards: 70\r\n"
 		"Expires: %u\r\n"
-		"Supported: path\r\n"
+		"Supported: %s\r\n"
 		"P-Access-Network-Info: %s\r\n"
 		"User-Agent: %s\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->domain, ctx->local_ip, ctx->sip_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
-		ctx->impu_user, ctx->local_ip, ctx->sip_port, contact_sms(ctx), ctx->impi, ctx->domain, ctx->domain,
-		reg_req_expires(ctx), ctx->pani, ctx->user_agent);
+		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
+		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_sms(ctx), ctx->impi, ctx->domain, ctx->domain, alg,
+		sec, reg_req_expires(ctx), sec_supported(ctx), ctx->pani, ctx->user_agent);
 
 	/* A refresh keeps the account usable; only the first REGISTER is "registering". */
 	if (ctx->reg_state != IMSD_UP)
@@ -621,6 +680,31 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 	if (r < 0 || !res.success) {
 		fprintf(stderr, "imsroha: imsd_aka_run_isim failed: %d\n", r);
 		return -EIO;
+	}
+
+	/*
+	 * sec-agree: take the P-CSCF's Security-Server and bring the SAs up with
+	 * this challenge's IK and CK; the answer goes out over them. Without a
+	 * usable Security-Server, or when the SAs cannot be installed, register
+	 * without sec-agree (TTAK.KO-06.0357 5.2.2).
+	 */
+	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED) {
+		char ss[1024] = "";
+		char pcscf[INET6_ADDRSTRLEN];
+		inet_ntop(AF_INET6, &ctx->pcscf_addr.sin6_addr, pcscf, sizeof(pcscf));
+		if (res.is_sync_failure) {
+			/* No keys from a sync failure: answer with AUTS over what is there. */
+		} else if (find_header(msg, "Security-Server", ss, sizeof(ss)) < 0 ||
+			   imsroha_ipsec_parse_server(&ctx->sec, ss) < 0) {
+			fprintf(stderr, "imsroha: the 401 has no usable Security-Server, registering without sec-agree\n");
+			sec_give_up(ctx);
+		} else if (imsroha_ipsec_install(&ctx->sec, ctx->local_ip, pcscf, res.ik, res.ck) < 0) {
+			fprintf(stderr, "imsroha: cannot install the IPsec SAs, registering without sec-agree\n");
+			sec_give_up(ctx);
+		} else {
+			ctx->sec_state = IMSD_SEC_PROTECTED;
+			ctx->ua_port = ctx->sec.port_us;
+		}
 	}
 
 	char branch[32];
@@ -679,7 +763,10 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		fprintf(stderr, "imsroha: sending authenticated REGISTER (RES len %zu)...\n", res.res_len);
 	}
 
-	char req[2560];
+	char sec[1200];
+	sec_lines(ctx, sec, sizeof(sec));
+
+	char req[3072];
 	int len = snprintf(req, sizeof(req),
 		"REGISTER sip:%s SIP/2.0\r\n"
 		"Via: SIP/2.0/UDP [%s]:%u;branch=%s;rport\r\n"
@@ -689,15 +776,16 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 		"CSeq: %u REGISTER\r\n"
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"%s\r\n"
 		"%s"
+		"%s"
 		"Max-Forwards: 70\r\n"
 		"Expires: %u\r\n"
-		"Supported: path\r\n"
+		"Supported: %s\r\n"
 		"P-Access-Network-Info: %s\r\n"
 		"User-Agent: %s\r\n"
 		"Content-Length: 0\r\n\r\n",
-		ctx->domain, ctx->local_ip, ctx->sip_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
-		ctx->impu_user, ctx->local_ip, ctx->sip_port, contact_sms(ctx), auth_line,
-		reg_req_expires(ctx), ctx->pani, ctx->user_agent);
+		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->impu, ctx->reg_from_tag, ctx->impu, ctx->reg_call_id, ctx->reg_cseq++,
+		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_sms(ctx), auth_line, sec,
+		reg_req_expires(ctx), sec_supported(ctx), ctx->pani, ctx->user_agent);
 
 	schedule_reg_retry(ctx);
 	return send_sip_msg(ctx, req, len);
@@ -708,6 +796,15 @@ static int on_reg_retry_timer(sd_event_source *s, uint64_t usec, void *userdata)
 	(void)s; (void)usec;
 	struct imsd_sip_ctx *ctx = userdata;
 	ctx->reg_retry_count++;
+	/*
+	 * No answer over the SAs: the authenticated REGISTER that should have
+	 * completed sec-agree, or two refreshes in a row. TTAK.KO-06.0357 5.2.2:
+	 * when IPsec negotiation fails, register without it.
+	 */
+	if (ctx->sec_state == IMSD_SEC_PROTECTED && (ctx->reg_state != IMSD_UP || ctx->reg_retry_count >= 2)) {
+		fprintf(stderr, "imsroha: no answer over IPsec, registering without sec-agree\n");
+		sec_give_up(ctx);
+	}
 	/* TS 24.229 5.1.1.2.1: a P-CSCF that stays silent is replaced by the next one. */
 	if (ctx->pcscf_n > 1 && ctx->reg_retry_count % 2 == 0) {
 		char a[INET6_ADDRSTRLEN];
@@ -753,6 +850,15 @@ static void schedule_reg_retry(struct imsd_sip_ctx *ctx)
  */
 static void handle_register_rejected(struct imsd_sip_ctx *ctx, const char *msg, int status_code)
 {
+	if (status_code == 494 && ctx->cfg.car.ipsec && ctx->sec_state != IMSD_SEC_OFFERED) {
+		/* RFC 3329 2.3.1: Security Agreement Required. Offer it again. */
+		fprintf(stderr, "imsroha: REGISTER 494, offering sec-agree again\n");
+		imsroha_ipsec_remove(&ctx->sec);
+		ctx->sec_state = IMSD_SEC_OFFERED;
+		ctx->ua_port = ctx->sip_port;
+		imsd_sip_register(ctx);
+		return;
+	}
 	if (status_code == 423) {
 		/* Too short an Expires: ask again at once with the registrar's minimum. */
 		char min_exp[32] = "";
@@ -1317,7 +1423,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 				"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
 				"Allow: " IMSD_ALLOW "\r\n"
 				"Content-Length: 0\r\n\r\n",
-				via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port);
+				via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port);
 			send_sip_msg(ctx, ringing, rlen);
 		}
 		return 0;
@@ -1375,7 +1481,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 			"Content-Length: %d\r\n\r\n"
 			"%s",
 			via, from, to_with_tag, call_id, cseq,
-			ctx->impu_user, ctx->local_ip, ctx->sip_port, se_hdr, sdp_len, sdp);
+			ctx->impu_user, ctx->local_ip, ctx->ua_port, se_hdr, sdp_len, sdp);
 		send_sip_msg(ctx, resp, len);
 		return 0;
 	}
@@ -1459,7 +1565,7 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
 		"Allow: " IMSD_ALLOW "\r\n"
 		"Content-Length: 0\r\n\r\n",
-		via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port);
+		via, from, to, ctx->call_to_tag, call_id, cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port);
 	send_sip_msg(ctx, ringing, rlen);
 
 	ctx->call_state = IMSD_CALL_RINGING;
@@ -1661,7 +1767,7 @@ static void send_rp_reply(struct imsd_sip_ctx *ctx, const char *via, const char 
 		"User-Agent: %s\r\n"
 		"Content-Type: application/vnd.3gpp.sms\r\n"
 		"Content-Length: %zu\r\n\r\n",
-		sc, ctx->local_ip, ctx->sip_port, branch, route, ctx->impu, ftag, sc,
+		sc, ctx->local_ip, ctx->ua_port, branch, route, ctx->impu, ftag, sc,
 		cid, ctx->domain, call_id, ctx->pani, ctx->impu, ctx->user_agent, rp_len);
 	if (len < 0 || (size_t)len + rp_len > sizeof(full))
 		return;
@@ -1892,7 +1998,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"CSeq: %u ACK\r\n"
 					"Max-Forwards: 70\r\n"
 					"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, ctx->sip_port, branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->ua_port, branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ctx->call_invite_cseq);
 				send_sip_msg(ctx, ack, ack_len);
 				fprintf(stderr, "imsroha: sent ACK:\n%.*s\n", ack_len, ack);
 				ctx->call_state = IMSD_CALL_ACTIVE;
@@ -1944,7 +2050,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"RAck: %s %u INVITE\r\n"
 					"Max-Forwards: 70\r\n"
 					"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, ctx->sip_port, prack_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_cseq, rseq_hdr, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->ua_port, prack_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_cseq, rseq_hdr, ctx->call_invite_cseq);
 				send_sip_msg(ctx, prack, prack_len);
 			}
 			ctx->call_state = (status_code == 180) ? IMSD_CALL_RINGING : IMSD_CALL_EARLY_MEDIA;
@@ -1986,7 +2092,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"CSeq: %u ACK\r\n"
 					"Max-Forwards: 70\r\n"
 					"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, ctx->sip_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->ua_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_invite_cseq);
 				send_sip_msg(ctx, ack, ack_len);
 				ctx->call_state = IMSD_CALL_TERMINATED;
 				imsd_rtp_stop(ctx);
@@ -2143,7 +2249,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				"Content-Length: %d\r\n\r\n"
 				"%s",
 				via, from, to_with_tag, call_id, cseq,
-				ctx->impu_user, ctx->local_ip, ctx->sip_port, se_hdr, sdp_len, sdp);
+				ctx->impu_user, ctx->local_ip, ctx->ua_port, se_hdr, sdp_len, sdp);
 			send_sip_msg(ctx, ok_resp, ok_len);
 			fprintf(stderr, "imsroha: answered UPDATE with SDP (CSeq %s)\n", cseq);
 		} else {
@@ -2160,7 +2266,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				"%s"
 				"Content-Length: 0\r\n\r\n",
 				via, from, to_with_tag, call_id, cseq,
-				ctx->impu_user, ctx->local_ip, ctx->sip_port, se_hdr);
+				ctx->impu_user, ctx->local_ip, ctx->ua_port, se_hdr);
 			send_sip_msg(ctx, ok_resp, ok_len);
 			fprintf(stderr, "imsroha: answered in-dialog/request with 200 OK (CSeq %s)\n", cseq);
 		}
@@ -2248,7 +2354,7 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 		"Accept-Contact: *;+g.3gpp.smsip;require;explicit\r\n"
 		"Content-Type: application/vnd.3gpp.sms\r\n"
 		"Content-Length: %d\r\n\r\n",
-		sip_dest, ctx->domain, ctx->local_ip, ctx->sip_port, branch, ctx->impu, tag, sip_dest, ctx->domain,
+		sip_dest, ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->impu, tag, sip_dest, ctx->domain,
 		cid, ctx->domain, ctx->pani, ctx->impu, ctx->user_agent, rp_len);
 
 	unsigned char full_msg[2560];
@@ -2389,7 +2495,7 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: %d\r\n\r\n"
 		"%s",
-		target_ruri, ctx->local_ip, ctx->sip_port, branch, route_hdr, ctx->impu, ctx->call_from_tag, target_to, ctx->call_id, ctx->call_cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port, ctx->pani, ctx->impu, ctx->user_agent,
+		target_ruri, ctx->local_ip, ctx->ua_port, branch, route_hdr, ctx->impu, ctx->call_from_tag, target_to, ctx->call_id, ctx->call_cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port, ctx->pani, ctx->impu, ctx->user_agent,
 		ctx->cfg.car.session_expires, sdp_len, sdp);
 
 	fprintf(stderr, "imsroha: placing VoLTE call to %s with INVITE:\n%s\n", dest_number, req);
@@ -2424,7 +2530,7 @@ int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: %d\r\n\r\n"
 		"%s",
-		ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag, ctx->inc_call_id, ctx->inc_cseq, ctx->impu_user, ctx->local_ip, ctx->sip_port, sdp_len, sdp);
+		ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag, ctx->inc_call_id, ctx->inc_cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port, sdp_len, sdp);
 
 	imsd_rtp_start(ctx);
 	send_sip_msg(ctx, resp, len);
@@ -2471,7 +2577,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				"CSeq: %u BYE\r\n"
 				"Max-Forwards: 70\r\n"
 				"Content-Length: 0\r\n\r\n",
-				ruri, ctx->local_ip, ctx->sip_port, bye_branch,
+				ruri, ctx->local_ip, ctx->ua_port, bye_branch,
 				ctx->inc_to, ctx->call_to_tag, ctx->inc_from,
 				ctx->inc_call_id, ++ctx->call_cseq);
 			send_sip_msg(ctx, req, len);
@@ -2491,7 +2597,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				"CSeq: %u CANCEL\r\n"
 				"Max-Forwards: 70\r\n"
 				"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, ctx->sip_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_id, ctx->call_invite_cseq);
+		ruri, ctx->local_ip, ctx->ua_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_id, ctx->call_invite_cseq);
 			send_sip_msg(ctx, req, len);
 		} else if (ctx->call_state == IMSD_CALL_ACTIVE) {
 			/* Send BYE */
@@ -2508,7 +2614,7 @@ int imsd_sip_hangup(struct imsd_sip_ctx *ctx)
 				"CSeq: %u BYE\r\n"
 				"Max-Forwards: 70\r\n"
 				"Content-Length: 0\r\n\r\n",
-		ruri, ctx->local_ip, ctx->sip_port, bye_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ++ctx->call_cseq);
+		ruri, ctx->local_ip, ctx->ua_port, bye_branch, ctx->impu, ctx->call_from_tag, ctx->call_remote, ctx->call_to_tag, ctx->call_id, ++ctx->call_cseq);
 			send_sip_msg(ctx, req, len);
 		}
 	}
@@ -2607,6 +2713,15 @@ int imsd_sip_setup(struct imsd_sip_ctx *ctx, const struct imsd_isim_identity *id
 	snprintf(ctx->iface, sizeof(ctx->iface), "%s", pdn->iface);
 	snprintf(ctx->local_ip, sizeof(ctx->local_ip), "%s", pdn->addr);
 	ctx->sip_port = cfg->car.sip_port;
+	ctx->ua_port = ctx->sip_port;
+	ctx->fd_c = ctx->fd_s = -1;
+	ctx->sec_state = cfg->car.ipsec ? IMSD_SEC_OFFERED : IMSD_SEC_OFF;
+	memset(&ctx->sec, 0, sizeof(ctx->sec));
+	/* Our protected ports: next to the plain one, clear of it. */
+	ctx->sec.port_uc = (uint16_t)(ctx->sip_port + 2);
+	ctx->sec.port_us = (uint16_t)(ctx->sip_port + 4);
+	snprintf(ctx->sec.offer_alg, sizeof(ctx->sec.offer_alg), "%s", cfg->car.alg);
+	snprintf(ctx->sec.offer_ealg, sizeof(ctx->sec.offer_ealg), "%s", cfg->car.ealg);
 	imsroha_config_user_agent(cfg, ctx->user_agent, sizeof(ctx->user_agent));
 	/*
 	 * No cell identity is read from the modem: the PLMN with an all-zero
@@ -2645,6 +2760,29 @@ int imsd_sip_setup(struct imsd_sip_ctx *ctx, const struct imsd_isim_identity *id
 	rand_hex(cid_rnd, 16);
 	snprintf(ctx->reg_call_id, sizeof(ctx->reg_call_id), "%s@%s", cid_rnd, ctx->domain);
 	ctx->reg_cseq = 1;
+	return 0;
+}
+
+/* A UDP socket on the IMS address and link, fed to on_sip_packet. */
+static int sip_socket(struct imsd_sip_ctx *ctx, uint16_t port, int *out)
+{
+	int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return -errno;
+	struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_port = htons(port) };
+	inet_pton(AF_INET6, ctx->local_ip, &a.sin6_addr);
+	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ctx->iface, strlen(ctx->iface) + 1) < 0 ||
+	    bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		int r = -errno;
+		close(fd);
+		return r;
+	}
+	int r = sd_event_add_io(ctx->event, NULL, fd, EPOLLIN, on_sip_packet, ctx);
+	if (r < 0) {
+		close(fd);
+		return r;
+	}
+	*out = fd;
 	return 0;
 }
 
@@ -2739,11 +2877,26 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	}
 
 	fprintf(stderr, "imsroha: SIP UDP socket bound to [%s]:%u\n", ctx->local_ip, ctx->sip_port);
+
+	if (ctx->sec_state == IMSD_SEC_OFFERED) {
+		if ((r = sip_socket(ctx, ctx->sec.port_uc, &ctx->fd_c)) < 0 ||
+		    (r = sip_socket(ctx, ctx->sec.port_us, &ctx->fd_s)) < 0) {
+			fprintf(stderr, "imsroha: no sockets for the protected ports (%s), registering without sec-agree\n",
+				strerror(-r));
+			ctx->sec_state = IMSD_SEC_FALLBACK;
+		}
+	}
 	return imsd_sip_register(ctx);
 }
 
 void imsd_sip_destroy(struct imsd_sip_ctx *ctx)
 {
+	imsroha_ipsec_remove(&ctx->sec);
+	if (ctx->fd_c >= 0)
+		close(ctx->fd_c);
+	if (ctx->fd_s >= 0)
+		close(ctx->fd_s);
+	ctx->fd_c = ctx->fd_s = -1;
 	imsd_rtp_stop(ctx);
 	if (ctx->sms_timeout_timer) {
 		sd_event_source_unref(ctx->sms_timeout_timer);

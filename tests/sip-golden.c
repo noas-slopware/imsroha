@@ -55,9 +55,26 @@ void imsd_emit_call_state_changed(sd_bus *b, uint32_t c, int s, int r) { (void)b
 
 /* --- the fake P-CSCF ---------------------------------------------------- */
 
-static int pcscf_fd;
+static int pcscf_fd;              /* the P-CSCF's plain port */
+static int pcscf_ps = -1, pcscf_pc = -1; /* its protected ports, for sec-agree */
 static struct sockaddr_in6 ue_addr;
 static int step;
+#define FAKE_PORT_PS 6100
+#define FAKE_PORT_PC 6101
+
+/* The P-CSCF socket that has something from the UE, or -1. */
+static int ready_fd(int timeout_ms)
+{
+	struct pollfd p[3] = { { .fd = pcscf_fd, .events = POLLIN },
+			       { .fd = pcscf_ps, .events = POLLIN },
+			       { .fd = pcscf_pc, .events = POLLIN } };
+	if (poll(p, 3, timeout_ms) <= 0)
+		return -1;
+	for (int i = 0; i < 3; i++)
+		if (p[i].revents & POLLIN)
+			return p[i].fd;
+	return -1;
+}
 
 /* Everything the UE sent since the last call, each message framed. */
 static void drain(const char *label)
@@ -65,13 +82,13 @@ static void drain(const char *label)
 	char buf[8192];
 	printf("===== step %d: %s\n", ++step, label);
 	for (;;) {
-		struct pollfd p = { .fd = pcscf_fd, .events = POLLIN };
-		if (poll(&p, 1, 50) <= 0)
+		int fd = ready_fd(50);
+		if (fd < 0)
 			break;
-		ssize_t n = recv(pcscf_fd, buf, sizeof(buf), 0);
+		ssize_t n = recv(fd, buf, sizeof(buf), 0);
 		if (n <= 0)
 			break;
-		printf("----- %zd bytes\n", n);
+		printf("----- %zd bytes%s\n", n, fd == pcscf_ps ? " (to port-s)" : fd == pcscf_pc ? " (to port-c)" : "");
 		for (ssize_t i = 0; i < n; i++) {
 			unsigned char c = (unsigned char)buf[i];
 			if (c == '\n' || c == '\r' || (c >= 0x20 && c < 0x7f))
@@ -84,10 +101,37 @@ static void drain(const char *label)
 	fflush(stdout);
 }
 
+/*
+ * Hands the UE what just went to fd, once it is there: through real ESP the
+ * kernel's crypto delivers it a moment after sendto() returns.
+ */
+static void deliver(struct imsd_sip_ctx *ctx, int fd)
+{
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	if (poll(&p, 1, 2000) > 0)
+		on_sip_packet(NULL, fd, EPOLLIN, ctx);
+	else
+		fprintf(stderr, "golden: nothing arrived on fd %d\n", fd);
+}
+
+/*
+ * Over sec-agree, the P-CSCF answers from port_ps to the UE's port_uc and
+ * sends its own requests from port_pc to the UE's port_us; before, from its
+ * plain port to the UE's.
+ */
 static void to_ue(struct imsd_sip_ctx *ctx, const void *msg, size_t len)
 {
+	fflush(stdout);
+	if (ctx->sec_state == IMSD_SEC_PROTECTED) {
+		int response = !memcmp(msg, "SIP/2.0 ", 8);
+		struct sockaddr_in6 to = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT,
+			.sin6_port = htons(response ? ctx->sec.port_uc : ctx->sec.port_us) };
+		sendto(response ? pcscf_ps : pcscf_pc, msg, len, 0, (struct sockaddr *)&to, sizeof(to));
+		deliver(ctx, response ? ctx->fd_c : ctx->fd_s);
+		return;
+	}
 	sendto(pcscf_fd, msg, len, 0, (struct sockaddr *)&ue_addr, sizeof(ue_addr));
-	on_sip_packet(NULL, ctx->fd, EPOLLIN, ctx);
+	deliver(ctx, ctx->fd);
 }
 
 static void to_ue_str(struct imsd_sip_ctx *ctx, const char *msg)
@@ -99,10 +143,10 @@ static void to_ue_str(struct imsd_sip_ctx *ctx, const char *msg)
 static char last[8192];
 static void capture_last(void)
 {
-	struct pollfd p = { .fd = pcscf_fd, .events = POLLIN };
 	last[0] = 0;
-	if (poll(&p, 1, 50) > 0) {
-		ssize_t n = recv(pcscf_fd, last, sizeof(last) - 1, MSG_PEEK);
+	int fd = ready_fd(50);
+	if (fd >= 0) {
+		ssize_t n = recv(fd, last, sizeof(last) - 1, MSG_PEEK);
 		if (n > 0)
 			last[n] = 0;
 	}
@@ -138,6 +182,22 @@ int main(void)
 	getsockname(ue_fd, (struct sockaddr *)&ue_addr, &pl);
 
 	golden_setup(&ctx, event, ue_fd, &pa);
+	if (ctx.sec_state == IMSD_SEC_OFFERED) {
+		/* The UE's protected sockets, as imsd_sip_init() opens them, and the P-CSCF's. */
+		struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+		ctx.fd_c = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+		a.sin6_port = htons(ctx.sec.port_uc);
+		bind(ctx.fd_c, (struct sockaddr *)&a, sizeof(a));
+		ctx.fd_s = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+		a.sin6_port = htons(ctx.sec.port_us);
+		bind(ctx.fd_s, (struct sockaddr *)&a, sizeof(a));
+		pcscf_ps = socket(AF_INET6, SOCK_DGRAM, 0);
+		a.sin6_port = htons(FAKE_PORT_PS);
+		bind(pcscf_ps, (struct sockaddr *)&a, sizeof(a));
+		pcscf_pc = socket(AF_INET6, SOCK_DGRAM, 0);
+		a.sin6_port = htons(FAKE_PORT_PC);
+		bind(pcscf_pc, (struct sockaddr *)&a, sizeof(a));
+	}
 
 	/* 1. initial REGISTER */
 	imsd_sip_register(&ctx);
@@ -150,8 +210,28 @@ int main(void)
 	snprintf(resp, sizeof(resp),
 		"SIP/2.0 401 Unauthorized\r\nVia: %s\r\nFrom: %s\r\nTo: %s;tag=pcscf1\r\nCall-ID: %s\r\nCSeq: %s\r\n"
 		"WWW-Authenticate: Digest realm=\"%s\", nonce=\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\", algorithm=AKAv1-MD5, qop=\"auth\"\r\n"
-		"Content-Length: 0\r\n\r\n", via, from, to, cid, cseq, GOLDEN_DOMAIN);
+		"%s"
+		"Content-Length: 0\r\n\r\n", via, from, to, cid, cseq, ctx.domain,
+		ctx.sec_state == IMSD_SEC_OFFERED ?
+		"Security-Server: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=4444;spi-s=5555;port-c=6101;port-s=6100\r\n" : "");
 	to_ue_str(&ctx, resp);
+	if (getenv("GOLDEN_REAL_IP") && ctx.sec.installed) {
+		/*
+		 * Both ends share one kernel here: the P-CSCF's sockets need out
+		 * policies mirroring the UE's in policies, so its packets to the UE
+		 * are ESP too. The UE's own policies and SAs are imsroha's.
+		 */
+		char cmd[512];
+		snprintf(cmd, sizeof(cmd),
+			 "ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport %u dport %u dir out "
+			 "tmpl src ::1 dst ::1 proto esp spi 0x%08x mode transport && "
+			 "ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport %u dport %u dir out "
+			 "tmpl src ::1 dst ::1 proto esp spi 0x%08x mode transport",
+			 ctx.sec.port_ps, ctx.sec.port_uc, ctx.sec.spi_uc,
+			 ctx.sec.port_pc, ctx.sec.port_us, ctx.sec.spi_us);
+		if (system(cmd) != 0)
+			fprintf(stderr, "golden: mirror policies failed\n");
+	}
 	capture_last();
 	drain("authenticated REGISTER");
 
@@ -162,7 +242,7 @@ int main(void)
 		"SIP/2.0 200 OK\r\nVia: %s\r\nFrom: %s\r\nTo: %s;tag=pcscf1\r\nCall-ID: %s\r\nCSeq: %s\r\n"
 		"Service-Route: <sip:scscf.%s;lr>\r\nP-Associated-URI: <sip:01000000000@%s>\r\n"
 		"Contact: <sip:x@[::1]>;expires=3600\r\nExpires: 3600\r\nContent-Length: 0\r\n\r\n",
-		via, from, to, cid, cseq, GOLDEN_DOMAIN, GOLDEN_DOMAIN);
+		via, from, to, cid, cseq, ctx.domain, ctx.domain);
 	to_ue_str(&ctx, resp);
 	drain("after 200 OK to REGISTER");
 
@@ -198,7 +278,7 @@ int main(void)
 		"From: <tel:+821020921827>;tag=smsc1\r\nTo: <sip:01000000000@%s>\r\n"
 		"Call-ID: mt-sms-1@%s\r\nCSeq: 1 MESSAGE\r\n"
 		"Content-Type: application/vnd.3gpp.sms\r\nContent-Length: %zu\r\n\r\n",
-		GOLDEN_DOMAIN, GOLDEN_DOMAIN, sizeof(rp));
+		ctx.domain, ctx.domain, sizeof(rp));
 	memcpy(mt + hl, rp, sizeof(rp));
 	to_ue(&ctx, mt, hl + sizeof(rp));
 	drain("MT-SMS answers");
@@ -217,7 +297,7 @@ int main(void)
 		"From: <tel:01012345678;phone-context=%s>;tag=far2\r\nTo: <sip:01000000000@%s>\r\n"
 		"Call-ID: mt-call-1@%s\r\nCSeq: 1 INVITE\r\nContact: <sip:far@[::1]:5060>\r\n"
 		"Content-Type: application/sdp\r\nContent-Length: %zu\r\n\r\n%s",
-		GOLDEN_DOMAIN, GOLDEN_DOMAIN, GOLDEN_DOMAIN, strlen(sdp), sdp);
+		ctx.domain, ctx.domain, ctx.domain, strlen(sdp), sdp);
 	to_ue_str(&ctx, resp);
 	drain("MT INVITE provisional");
 	imsd_sip_answer_call(&ctx);
@@ -227,8 +307,11 @@ int main(void)
 		"Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKbye1\r\n"
 		"From: <tel:01012345678;phone-context=%s>;tag=far2\r\nTo: <sip:01000000000@%s>;tag=%s\r\n"
 		"Call-ID: mt-call-1@%s\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n",
-		GOLDEN_DOMAIN, GOLDEN_DOMAIN, ctx.call_to_tag, GOLDEN_DOMAIN);
+		ctx.domain, ctx.domain, ctx.call_to_tag, ctx.domain);
 	to_ue_str(&ctx, resp);
 	drain("MT BYE answer");
+	if (getenv("GOLDEN_REAL_IP"))
+		/* Proof that the kernel carried it as ESP: per-SA packet counters. */
+		system("ip -s -6 xfrm state | grep -E '^\\s+proto esp|packets' 1>&2");
 	return 0;
 }

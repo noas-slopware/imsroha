@@ -11,6 +11,15 @@
 #include <net/if.h>
 #include "codec.h"
 #include "config.h"
+#include "ipsec.h"
+
+/* sec-agree state: not configured, offered in REGISTER, SAs up, or given up. */
+enum imsd_sec_state {
+	IMSD_SEC_OFF = 0,
+	IMSD_SEC_OFFERED = 1,
+	IMSD_SEC_PROTECTED = 2,
+	IMSD_SEC_FALLBACK = -1,
+};
 
 /* At most this many P-CSCFs are tried, in order (PCO first, then the carrier's). */
 #define IMSD_MAX_PCSCF 8
@@ -44,7 +53,13 @@ struct imsd_sip_ctx {
 	struct imsroha_config cfg;
 	char iface[IFNAMSIZ];
 	char domain[128];       /* home network domain: R-URI, realm, phone-context */
-	uint16_t sip_port;
+	uint16_t sip_port;      /* the unprotected socket's port */
+	uint16_t ua_port;       /* the port Via and Contact name: sip_port, or port_us once protected */
+
+	/* sec-agree (TS 33.203): fd_c on port_uc sends requests, fd_s on port_us takes them. */
+	int sec_state;
+	struct imsroha_ipsec sec;
+	int fd_c, fd_s;
 	char user_agent[256];
 	char pani[160];         /* P-Access-Network-Info value */
 	unsigned char smsc[12]; /* RP destination: the SC address element (length, TON/NPI, BCD) */

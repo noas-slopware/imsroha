@@ -56,6 +56,7 @@ struct imsroha_carrier {
 	int sms_rp_in_response;     /* MT-SMS RP-ACK in the 200 OK body, not as its own MESSAGE */
 	int ipsec;                  /* sec-agree with IPsec ESP (TS 33.203) */
 	char ealg[32];              /* offered ESP encryption: null, aes-cbc, or "null,aes-cbc" */
+	char alg[48];               /* offered integrity: hmac-sha-1-96, hmac-md5-96 */
 	int pt_amrwb, pt_amr, pt_dtmf_wb, pt_dtmf; /* payload types we offer */
 	uint16_t rtp_port;
 	unsigned session_expires;

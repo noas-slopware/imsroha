@@ -24,7 +24,7 @@ common = static_library('imsroha-common',
 
 executable('imsroha',
   'src/imsroha.c', 'src/aka.c', 'src/sms.c', 'src/sip.c', 'src/dbus.c',
-  'src/inbox.c', 'src/audio.c', 'src/codec.c', 'src/dns.c',
+  'src/inbox.c', 'src/audio.c', 'src/codec.c', 'src/dns.c', 'src/ipsec.c',
   link_with: common,
   dependencies: [glib, gio, qmi, qrtr, systemd, amrwb, amrnb, amrwbenc],
   install: true)
@@ -60,7 +60,7 @@ install_data('data/imsroha.conf', install_dir: prefix / 'share/doc/imsroha',
   rename: 'imsroha.conf.example')
 install_data('data/99-imsroha.rules', install_dir: prefix / 'lib/udev/rules.d')
 
-golden = executable('sip-golden', 'tests/sip-golden.c', 'src/sms.c', 'src/dns.c',
+golden = executable('sip-golden', 'tests/sip-golden.c', 'src/sms.c', 'src/dns.c', 'src/ipsec.c',
   link_with: common,
   c_args: ['-DGOLDEN_SRCDIR="@0@"'.format(meson.project_source_root()), '-Wno-unused-function'],
   include_directories: include_directories('src'),
@@ -68,5 +68,14 @@ golden = executable('sip-golden', 'tests/sip-golden.c', 'src/sms.c', 'src/dns.c'
   build_by_default: false)
 test('sip-golden', find_program('tests/run-golden.sh'),
   args: [golden.full_path(), meson.project_source_root() / 'tests/golden-lguplus.txt',
+         meson.project_source_root() / 'tests/normalize.sh'],
+  depends: golden)
+test('sip-golden-kt', find_program('tests/run-golden.sh'),
+  args: [golden.full_path(), meson.project_source_root() / 'tests/golden-kt.txt',
+         meson.project_source_root() / 'tests/normalize.sh'],
+  env: ['GOLDEN_CARRIER=KT'],
+  depends: golden)
+test('esp-loopback', find_program('tests/esp-loopback.sh'),
+  args: [golden.full_path(), meson.project_source_root() / 'tests/golden-kt.txt',
          meson.project_source_root() / 'tests/normalize.sh'],
   depends: golden)

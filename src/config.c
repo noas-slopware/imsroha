@@ -177,6 +177,7 @@ static void carrier_defaults(struct imsroha_carrier *car)
 	car->sms_over_ip = 1;
 	car->ipsec = 1;
 	snprintf(car->ealg, sizeof(car->ealg), "null,aes-cbc");
+	snprintf(car->alg, sizeof(car->alg), "hmac-sha-1-96");
 	car->pt_amrwb = 106;
 	car->pt_amr = 104;
 	car->pt_dtmf_wb = 107;
@@ -205,6 +206,7 @@ static void carrier_from(GKeyFile *kf, const char *g, struct imsroha_carrier *ca
 		fprintf(stderr, "imsroha: [%s] sms-rp-ack=%s is neither response nor message, ignored\n", g, rp);
 	get_bool(kf, g, "ipsec", &car->ipsec);
 	get_str(kf, g, "ipsec-ealg", car->ealg, sizeof(car->ealg));
+	get_str(kf, g, "ipsec-alg", car->alg, sizeof(car->alg));
 	get_int(kf, g, "pt-amr-wb", &car->pt_amrwb);
 	get_int(kf, g, "pt-amr", &car->pt_amr);
 	get_int(kf, g, "pt-dtmf-wb", &car->pt_dtmf_wb);
