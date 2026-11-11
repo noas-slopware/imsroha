@@ -19,6 +19,14 @@ void imsd_emit_pdu_received(sd_bus *bus, const char *inbox_id, const char *pdu_h
 			   "PduReceived", "ss", inbox_id, pdu_hex);
 }
 
+void imsd_emit_port_pdu_received(sd_bus *bus, uint16_t port, const char *pdu_hex)
+{
+	if (!bus || !pdu_hex)
+		return;
+	sd_bus_emit_signal(bus, IMSD_BUS_PATH, IMSD_BUS_NAME,
+			   "PortPduReceived", "qs", port, pdu_hex);
+}
+
 void imsd_emit_call_added(sd_bus *bus, uint32_t call_id, const char *number, int direction)
 {
 	if (!bus)

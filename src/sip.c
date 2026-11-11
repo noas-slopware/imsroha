@@ -8,6 +8,7 @@
 #include "dns.h"
 #include "imei.h"
 #include "amr_be.h"
+#include "smsport.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -1948,6 +1949,25 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 			const unsigned char rp_ack[2] = { 0x02, mr };
 			send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
 			fprintf(stderr, "imsroha: duplicate MT-SMS (MR 0x%02x), acked again\n", mr);
+			return 0;
+		}
+
+		/*
+		 * Application port addressing (TS 23.040 9.2.3.24.4/5): the message
+		 * is for an application, not the user's inbox (RCS's OTP and
+		 * "-rcscfg" requests, visual voicemail). It goes out on
+		 * PortPduReceived only and never reaches ModemManager, so messaging
+		 * apps do not show it. WAP push (2948, 2949) stays with
+		 * ModemManager: MMS notifications arrive that way.
+		 */
+		int port = imsd_sms_app_port(hex);
+		if (port >= 0) {
+			imsd_inbox_remember(hex);
+			const unsigned char rp_ack[2] = { 0x02, mr };
+			send_rp_reply(ctx, via, from, to, tag, call_id, cseq, rp_ack, sizeof(rp_ack));
+			fprintf(stderr, "imsroha: MT-SMS for application port %d (MR 0x%02x, %zu bytes), "
+				"sent RP-ACK, not for ModemManager\n", port, mr, tpdu_len);
+			imsd_emit_port_pdu_received(ctx->bus, (uint16_t)port, hex);
 			return 0;
 		}
 

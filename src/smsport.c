@@ -166,3 +166,13 @@ int sms_parse_deliver_hex(const char *hex, struct sms_deliver *out)
 	g_string_free(t, TRUE);
 	return 0;
 }
+
+int imsd_sms_app_port(const char *hex)
+{
+	struct sms_deliver d;
+	if (sms_parse_deliver_hex(hex, &d) < 0 || d.dest_port < 0)
+		return -1;
+	if (d.dest_port == 2948 || d.dest_port == 2949)
+		return -1;
+	return d.dest_port;
+}

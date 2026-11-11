@@ -189,6 +189,7 @@ static const sd_bus_vtable imsd_vtable[] = {
 	SD_BUS_METHOD("AckPdu", "s", "", method_ack_pdu, 0),
 	SD_BUS_SIGNAL("RegistrationStateChanged", "i", 0),
 	SD_BUS_SIGNAL("PduReceived", "ss", 0),
+	SD_BUS_SIGNAL("PortPduReceived", "qs", 0),
 	SD_BUS_SIGNAL("CallAdded", "usi", 0),
 	SD_BUS_SIGNAL("CallStateChanged", "uii", 0),
 	SD_BUS_VTABLE_END

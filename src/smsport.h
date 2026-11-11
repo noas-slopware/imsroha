@@ -18,3 +18,11 @@ struct sms_deliver {
 };
 
 int sms_parse_deliver_hex(const char *hex, struct sms_deliver *out);
+
+/*
+ * The application port an MT-SMS (same hex) is addressed to, when it is for
+ * an application rather than the user's inbox; -1 otherwise: no port
+ * addressing, WAP push (2948, 2949: MMS notifications, which ModemManager
+ * handles), or not an SMS-DELIVER it can read.
+ */
+int imsd_sms_app_port(const char *hex);

@@ -102,10 +102,19 @@ static void otp_text_candidate(struct rcsd *r, const char *text)
 static void on_pdu(GDBusConnection *c, const char *sender, const char *path, const char *iface,
 		   const char *signal, GVariant *params, gpointer ud)
 {
-	(void)c; (void)sender; (void)path; (void)iface; (void)signal;
+	(void)c; (void)sender; (void)path; (void)iface;
 	struct rcsd *r = ud;
-	const char *id = NULL, *hex = NULL;
-	g_variant_get(params, "(&s&s)", &id, &hex);
+	/* PortPduReceived (q port, s pdu): port-addressed SMS, which imsroha keeps
+	 * from ModemManager; PduReceived (s inbox id, s pdu): the rest, also the
+	 * OTP of carriers that send it as plain text. */
+	const char *id = "port", *hex = NULL;
+	guint16 port = 0;
+	if (!strcmp(signal, "PortPduReceived") && g_variant_is_of_type(params, G_VARIANT_TYPE("(qs)")))
+		g_variant_get(params, "(q&s)", &port, &hex);
+	else if (g_variant_is_of_type(params, G_VARIANT_TYPE("(ss)")))
+		g_variant_get(params, "(&s&s)", &id, &hex);
+	else
+		return;
 	struct sms_deliver sms;
 	if (sms_parse_deliver_hex(hex, &sms) < 0)
 		return;
@@ -448,6 +457,8 @@ int main(int argc, char **argv)
 		msisdn_from_mm(r);
 
 	g_dbus_connection_signal_subscribe(r->bus, NULL, IMSD_BUS_NAME, "PduReceived", IMSD_BUS_PATH, NULL,
+					   G_DBUS_SIGNAL_FLAGS_NONE, on_pdu, r, NULL);
+	g_dbus_connection_signal_subscribe(r->bus, NULL, IMSD_BUS_NAME, "PortPduReceived", IMSD_BUS_PATH, NULL,
 					   G_DBUS_SIGNAL_FLAGS_NONE, on_pdu, r, NULL);
 	g_unix_signal_add(SIGINT, on_signal, r);
 	g_unix_signal_add(SIGTERM, on_signal, r);

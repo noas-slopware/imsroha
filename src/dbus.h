@@ -16,5 +16,7 @@ enum imsd_state {
 
 void imsd_emit_state_changed(sd_bus *bus, int state);
 void imsd_emit_pdu_received(sd_bus *bus, const char *inbox_id, const char *pdu_hex);
+/* An MT-SMS with application port addressing, for applications, not ModemManager. */
+void imsd_emit_port_pdu_received(sd_bus *bus, uint16_t port, const char *pdu_hex);
 void imsd_emit_call_added(sd_bus *bus, uint32_t call_id, const char *number, int direction);
 void imsd_emit_call_state_changed(sd_bus *bus, uint32_t call_id, int state, int reason);

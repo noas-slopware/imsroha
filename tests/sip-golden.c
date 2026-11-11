@@ -50,6 +50,7 @@ int imsd_inbox_seen(const char *pdu) { (void)pdu; return 0; }
 void imsd_inbox_remember(const char *pdu) { (void)pdu; }
 void imsd_emit_state_changed(sd_bus *b, int s) { (void)b; (void)s; }
 void imsd_emit_pdu_received(sd_bus *b, const char *id, const char *pdu) { (void)b; (void)id; (void)pdu; }
+void imsd_emit_port_pdu_received(sd_bus *b, uint16_t port, const char *pdu) { (void)b; (void)port; (void)pdu; }
 void imsd_emit_call_added(sd_bus *b, uint32_t c, const char *n, int d) { (void)b; (void)c; (void)n; (void)d; }
 void imsd_emit_call_state_changed(sd_bus *b, uint32_t c, int s, int r) { (void)b; (void)c; (void)s; (void)r; }
 

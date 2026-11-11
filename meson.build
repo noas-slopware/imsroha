@@ -20,7 +20,7 @@ amrnb = cc.find_library('opencore-amrnb')
 amrwbenc = cc.find_library('vo-amrwbenc')
 
 common = static_library('imsroha-common',
-  'src/config.c', 'src/qmidev.c', 'src/rmnet_links.c',
+  'src/config.c', 'src/qmidev.c', 'src/rmnet_links.c', 'src/smsport.c',
   dependencies: [glib, gio, qmi, qrtr])
 
 executable('imsroha',
@@ -32,7 +32,7 @@ executable('imsroha',
 
 # RCS: its own executable on the internet PDN; nothing above links it.
 rcs_core = static_library('imsroha-rcs-core',
-  'src/rcs/rcs_config.c', 'src/rcs/acs.c', 'src/rcs/http.c', 'src/rcs/net.c', 'src/rcs/smsport.c',
+  'src/rcs/rcs_config.c', 'src/rcs/acs.c', 'src/rcs/http.c', 'src/rcs/net.c',
   'src/rcs/sipmsg.c', 'src/rcs/cpim.c', 'src/rcs/msrp.c', 'src/rcs/cert.c',
   include_directories: include_directories('src'),
   link_with: common,

@@ -39,5 +39,18 @@ int main(void)
 	expect("7-bit no port", d.dest_port == -1);
 	expect("7-bit text hello", !strcmp(d.text, "hello"));
 	expect("7-bit sender +82100", !strcmp(d.sender, "+82100"));
+
+	/* Which ones imsroha keeps from ModemManager (PortPduReceived). */
+	expect("OTP is for an application (37273)", imsd_sms_app_port(otp) == 37273);
+	expect("plain SMS is for the inbox", imsd_sms_app_port(plain) == -1);
+	/* WAP push (MMS notification): 8-bit, UDH 06 05 04 0b84 23f0, 3 data octets. */
+	const char *wap = "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "0a"
+			  "0605040b8423f0" "010203";
+	expect("WAP push parses", sms_parse_deliver_hex(wap, &d) == 0 && d.dest_port == 2948);
+	expect("WAP push stays with ModemManager", imsd_sms_app_port(wap) == -1);
+	/* 8-bit to another port (e.g. visual voicemail on 5499). */
+	const char *vvm = "00" "40" "04" "81" "2143" "00" "04" "52111131000000" "0a"
+			  "060504157b0000" "010203";
+	expect("8-bit port SMS is for an application (5499)", imsd_sms_app_port(vvm) == 5499);
 	return fails ? 1 : 0;
 }

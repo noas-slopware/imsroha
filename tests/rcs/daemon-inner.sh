@@ -100,15 +100,15 @@ exec 7<"$t/acs2.out"
 read -r _ <&7
 conf '[rcs]' 'enable=true' "ca-file=$t/ca.pem" 'msisdn=+821099999999'
 sed -i 's|18080|18081|; s|18443|18444|' "$t/imsroha.conf"
-# "654321", UCS-2, application port 37273 (R9 6.3.1.1.2), as imsroha's PduReceived carries it.
+# "654321", UCS-2, application port 37273 (R9 6.3.1.1.2), as imsroha's PortPduReceived carries it.
 otp=0040048121430008521111310000001306050491990000003600350034003300320031
 IMSROHA_RCS_STATE="$t/state2" dbus-run-session -- sh -c '
 	# Held open read-write so the daemon can open its end at once.
 	exec 8<>"$2/rcs2.pipe"
 	"$1" 2> "$2/rcs2.pipe" & d=$!
 	if timeout 20 sh -c "read -r l < \"\$0\" && [ \"\$l\" = otp-cookie ]" "$2/acs2.ev"; then
-		gdbus emit --session --object-path /codes/noa/IMSroha --signal codes.noa.IMSroha.PduReceived \
-			"\"sms1\"" "\"$3\"" > /dev/null || echo "gdbus emit failed" >&2
+		gdbus emit --session --object-path /codes/noa/IMSroha --signal codes.noa.IMSroha.PortPduReceived \
+			"uint16 37273" "\"$3\"" > /dev/null || echo "gdbus emit failed" >&2
 	fi
 	timeout 30 sh -c "while IFS= read -r l; do printf \"%s\n\" \"\$l\" >> \"\$0\"; case \$l in *\"not asking it again\"*) exit 0;; esac; done; exit 1" \
 		"$2/rcs2.err" < "$2/rcs2.pipe"; rc=$?
