@@ -37,6 +37,8 @@ struct rcsd {
 const char *rcsd_state_name(enum rcsd_state s);
 void rcsd_set_state(struct rcsd *r, enum rcsd_state s);
 void rcsd_reconfigure(struct rcsd *r);
+/* No ACS run and no registration until imsroha-rcs restarts. */
+void rcsd_halt(struct rcsd *r);
 
 /* rcs_dbus.c: codes.noa.IMSroha.Rcs */
 int rcsd_dbus_init(struct rcsd *r);

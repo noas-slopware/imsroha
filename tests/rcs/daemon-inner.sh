@@ -122,6 +122,36 @@ n2=$(grep -c '^connect' "$t/acs2.log" || true)
 grep -q 'P-CSCF is unreachable; asking the ACS again' "$t/rcs2.err" || bad "no return to the ACS after the P-CSCF failed"
 echo "OTP flow: SMS -> OTP -> configuration; unreachable P-CSCF: the ACS asked $n2 times in all"
 
+# --- 403 to REGISTER: back to the ACS once (which the floor holds back), then
+# the stored configuration, a second 403, and nothing more (R9 A.5 b) ---
+sed 's/@SIP_PORT@/15063/' "$src/tests/rcs/acs.xml" > "$t/acs3.xml"
+mkfifo "$t/acs3.in" "$t/acs3.out" "$t/net3.in" "$t/net3.out" "$t/rcs3.pipe"
+exec 8<>"$t/acs3.in"
+python3 -I "$src/tests/rcs/fake-acs.py" --http-port 18082 --https-port 18445 --cert "$t/server.pem" \
+	--key "$t/server.key" --xml "$t/acs3.xml" --scenario netauth --log "$t/acs3.log" <&8 > "$t/acs3.out" &
+pids="$pids $!"
+exec 9<"$t/acs3.out"
+read -r _ <&9
+exec 6<>"$t/net3.in"
+python3 -I "$src/tests/rcs/fake-pcscf.py" --sip-port 15063 --msrp-port 12856 --cert "$t/server.pem" \
+	--key "$t/server.key" --log "$t/net3.log" --reg403 <&6 > "$t/net3.out" &
+pids="$pids $!"
+exec 7<"$t/net3.out"
+read -r _ <&7
+sed -i 's|18081|18082|; s|18444|18445|' "$t/imsroha.conf"
+IMSROHA_RCS_STATE="$t/state3" dbus-run-session -- sh -c '
+	exec 8<>"$2/rcs3.pipe"
+	"$1" 2> "$2/rcs3.pipe" & d=$!
+	timeout 30 sh -c "while IFS= read -r l; do printf \"%s\n\" \"\$l\" >> \"\$0\"; case \$l in *\"second 403\"*) exit 0;; esac; done; exit 1" \
+		"$2/rcs3.err" < "$2/rcs3.pipe"; rc=$?
+	kill -TERM $d 2>/dev/null; wait $d 2>/dev/null
+	exit $rc' sh "$rcs" "$t" || bad "403: never got to the second 403"
+n3=$(grep -c '^connect' "$t/acs3.log" || true)
+[ "$n3" = 2 ] || bad "403: the ACS was contacted $n3 times, not 2 (HTTP, HTTPS)"
+[ "$(grep -c 'event register-403' "$t/net3.log")" = 2 ] || bad "403: not exactly two 403s"
+grep -q 'not asking it again' "$t/rcs3.err" || bad "403: the first 403 did not meet the floor"
+echo "403 to REGISTER: two 403s, the ACS asked $n3 times in all, then nothing"
+
 # --- off after on: one rcs_state=-4, then nothing ---
 conf '[rcs]' 'enable=false' "ca-file=$t/ca.pem" 'msisdn=+821099999999'
 before=$(conns)
@@ -138,6 +168,7 @@ if [ $fail != 0 ]; then
 	echo "--- network"; cat "$t/net.log"
 	echo "--- off2"; cat "$t/off2.err"
 	echo "--- otp run"; cat "$t/rcs2.err" 2>/dev/null; cat "$t/acs2.log" 2>/dev/null
+	echo "--- 403 run"; cat "$t/rcs3.err" 2>/dev/null
 	exit 1
 fi
 echo "rcs-daemon: passed"

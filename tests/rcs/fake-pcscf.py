@@ -15,6 +15,7 @@ ap.add_argument('--msrp-port', type=int, required=True)
 ap.add_argument('--cert', required=True)
 ap.add_argument('--key', required=True)
 ap.add_argument('--log', required=True)
+ap.add_argument('--reg403', action='store_true', help='answer every authenticated REGISTER with 403')
 a = ap.parse_args()
 
 USER, REALM, PWD = '+821099999999@rcs.test', 'rcs.test', 'testPassword'
@@ -136,6 +137,9 @@ def sip_conn(conn):
             if meth == 'REGISTER':
                 if h(hdrs, 'Expires') == '0':
                     respond(conn, first, hdrs, 200, 'OK')
+                elif check_auth(first, hdrs) and a.reg403:
+                    respond(conn, first, hdrs, 403, 'Forbidden')
+                    L('event register-403')
                 elif not check_auth(first, hdrs):
                     respond(conn, first, hdrs, 401, 'Unauthorized',
                             f'WWW-Authenticate: Digest realm="{REALM}",nonce="{NONCE}",qop="auth",opaque="op1",algorithm=MD5\r\n')

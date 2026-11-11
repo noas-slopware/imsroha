@@ -156,7 +156,7 @@ glib-networking, GMarkup); the SIM and modem reads reuse `src/aka.c` and `src/im
 | `src/rcs/http.c` | HTTP/1.1 GET over GIO, plain or TLS, written by hand so every byte on the wire is ours (no library headers, no redirects followed) |
 | `src/rcs/net.c` | every RCS socket: optional `SO_BINDTODEVICE` to the internet PDN's netdev, never the IMS netdev |
 | `src/rcs/smsport.c` | SMS-DELIVER TPDUs: the application port (TS 23.040 9.2.3.24.4) and the text |
-| `src/rcs/sipua.c` | a second SIP user agent: TLS, NAPTR/SRV, Digest, REGISTER, OPTIONS, INVITE/MESSAGE/BYE for chat |
+| `src/rcs/sipua.c` | a second SIP user agent: TLS, NAPTR/SRV, Digest, REGISTER, PUBLISH (presence), OPTIONS, INVITE/MESSAGE/BYE for chat |
 | `src/rcs/msrp.c` | MSRP (RFC 4975) over TLS, as the active end |
 | `src/rcs/cpim.c` | CPIM (RFC 3862), IMDN (RFC 5438), isComposing (RFC 3994) |
 | `src/rcs/rcsd.c` | the daemon: state machine, OTP from SMS, D-Bus service |
@@ -336,11 +336,22 @@ namespace, ignored when received as RFC 3862 says).
 ### Status (2026-11-11)
 
 Built and tested on loopback only (`meson test`: `rcs-acs-request`, `rcs-acs-flow`,
-`rcs-smsport`, `rcs-daemon`, each in a network namespace with nothing but `lo`).
+`rcs-smsport`, `rcs-daemon`, each in a network namespace with nothing but `lo`; also
+clean under ASan/UBSan). Covered: every ACS outcome, the first activation with the OTP
+SMS, the ACS floor with an unreachable P-CSCF and with two 403s to REGISTER, chat both
+ways with IMDNs and isComposing, presence (PUBLISH, anonymous fetch), the -4 request.
 No request has gone to any carrier. Spacebar's side is the patch series in
 linux-zflip3 `userspace/spacebar/` (0004-0006), compile-checked only.
 
-Not done yet:
+Not done yet, or different from R9's own examples:
+
+- R9's INVITE examples use `TCP/MSRP` with `msrp://...;tcp` and the real local port,
+  `accept-types:message/cpim` only, `Session-Expires: 7200;refresher=uac`, and every
+  request carries P-Access-Network-Info. imsroha-rcs follows `psMedia` (MSRPoTLS in
+  the sample: `msrps://`), puts port 9 in the SDP, offers no session timer and sends no
+  P-Access-Network-Info.
+- The P-CSCF's certificate is checked against the SRV target when NAPTR/SRV found
+  one, against the configured name otherwise.
 
 - AKA for the RCS registration (only Digest, what R9's sample configuration has).
 - OTP for carriers whose SMS stays with the modem (SKT): imsroha-rcs takes the OTP

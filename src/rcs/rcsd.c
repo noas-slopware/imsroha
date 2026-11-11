@@ -273,6 +273,15 @@ void rcsd_reconfigure(struct rcsd *r)
 	acs_start(r, 0);
 }
 
+void rcsd_halt(struct rcsd *r)
+{
+	/* R9 A.5 b: neither the ACS nor REGISTER again before a restart. */
+	if (r->acs_timer)
+		g_source_remove(r->acs_timer);
+	r->acs_timer = 0;
+	rcsd_set_state(r, RCSD_UNREGISTERED);
+}
+
 /* ---- identity ----------------------------------------------------------- */
 
 static void msisdn_from_mm(struct rcsd *r)
@@ -456,8 +465,8 @@ int main(int argc, char **argv)
 		rcsd_ua_start(r);
 		arm_acs_timer(r);
 	} else {
-		/* Turned on again after a -4: the user enabled it. */
-		r->st.disable_sent = 0;
+		/* Also after a -4: the run tells the ACS RCS is back (rcs_state=version),
+		 * and only its answer clears disable_sent. */
 		acs_start(r, 0);
 	}
 	g_main_loop_run(r->loop);

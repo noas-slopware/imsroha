@@ -514,7 +514,7 @@ static void on_reg_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 		if (++r->forbidden >= 2) {
 			fprintf(stderr, "imsroha-rcs: second 403: no RCS until imsroha-rcs restarts\n");
 			rcsd_ua_stop(r);
-			rcsd_set_state(r, RCSD_UNREGISTERED);
+			rcsd_halt(r);
 		} else {
 			rcsd_ua_stop(r);
 			rcsd_reconfigure(r);
