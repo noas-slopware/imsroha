@@ -38,5 +38,19 @@ Patches, in order:
   `markChatAsRead` (where 0005 sends `MarkDisplayed`) never sees them; `saveMessage`
   sends it then, unless the screen is locked.
 
-0004-0007 are inert without imsroha-rcs on the bus. Build: `cd spacebar && makepkg -sC`
+- `0010-daemon-RCS-chatbot-messages-through-IMSroha.patch`: RCS chatbot messages
+  (`RichMessageReceived`): RCC.07 rich cards and carousels, TTA R9's extended bot
+  message and open rich card, texts with suggestions. Stored with their body, chip
+  list and bot ID (new columns, a `BotInfo` table), and a readable summary as the
+  text, which the list, the notification and any fallback show. Suggestion responses
+  (`SendSuggestionResponse`, never as SMS) and chatbot information (`GetBotInfo`,
+  kept a day). A shared `lib/chatbot` reads the formats.
+- `0011-app-show-RCS-chatbot-messages-their-suggestions-and-.patch`: the app side:
+  header and footer outside the card, cards, carousels, open rich cards, the chip
+  list under the newest message, the actions (URL, dial, map, calendar, draft, copy,
+  share as copy), pictures fetched into the conversation's attachment folder, the
+  bot's name, icon and description, and no input where R9 says the sender takes no
+  replies. Needs Qt Network (in qt6-base).
+
+0004-0007 and 0009-0011 are inert without imsroha-rcs on the bus. Build: `cd spacebar && makepkg -sC`
 (`-C`: 0004 creates a file, so a stale `src/` makes `prepare()` fail).

@@ -1,0 +1,1574 @@
+From f8c9dd3aef264a2715869fdd7ff8c1641ceb3da2 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 23:26:18 +0900
+Subject: [PATCH 10/11] daemon: RCS chatbot messages through IMSroha
+
+IMSroha's RichMessageReceived (codes.noa.IMSroha.Rcs): a rich card or
+carousel (application/vnd.gsma.botmessage, RCC.07 3.6.10), TTA R9's
+extended bot message and open rich card (xbotmessage, openrichcard, R9
+7.7.4), or a chatbot text with suggestions, each with its botsuggestion
+chip list and the chatbot's service ID. It is stored as an incoming RCS
+message with the content type, body, chip list and bot ID in new columns;
+its text is a readable summary (R9's header, the titles and descriptions,
+the open rich card's texts, the footer), which the conversation list, the
+notification and anything that cannot show the card use. A message
+nobody here understands says "Unsupported message" and the text fields it
+has; never nothing. A new lib/chatbot (RichMessage) reads all of it, for
+the daemon and the app alike, from RCC.07's wire form and from R9's
+RCSMessage/richcardMessage wrapping.
+
+sendSuggestionResponse: a tapped suggested reply is stored as a sent RCS
+message showing its display text, and its RCC.07 response (the reply as
+received) goes to the bot through SendSuggestionResponse, in reply to the
+card's imdn.Message-ID. A suggested action sends its display text and
+postback, and nothing when it has no postback. These never go as SMS: a
+failed one is failed (R9 7.7.3.1).
+
+botInfo: the chatbot information of a conversation's bot, kept in a
+BotInfo table, fetched with GetBotInfo when it is missing or a day old,
+and announced with botInfoChanged; its name titles the notification. A
+conversation keyed by a chatbot's SIP URI only ever goes over RCS.
+
+Inert without IMSroha, like 0004-0009.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ daemon/CMakeLists.txt                         |   1 +
+ daemon/channellogger.cpp                      | 198 +++++-
+ daemon/channellogger.h                        |  29 +
+ daemon/org.kde.spacebar.Daemon.xml            |  14 +
+ daemon/rcstransport.cpp                       |  49 ++
+ daemon/rcstransport.h                         |  23 +-
+ lib/CMakeLists.txt                            |   1 +
+ lib/chatbot/CMakeLists.txt                    |   8 +
+ lib/chatbot/richmessage.cpp                   | 646 ++++++++++++++++++
+ lib/chatbot/richmessage.h                     |  64 ++
+ lib/database/database.cpp                     |  76 ++-
+ lib/database/database.h                       |  29 +-
+ lib/database/migrations.qrc                   |   2 +
+ .../2026-11-12-000000_chatbot/down.sql        |   7 +
+ .../2026-11-12-000000_chatbot/up.sql          |  13 +
+ 15 files changed, 1151 insertions(+), 9 deletions(-)
+ create mode 100644 lib/chatbot/CMakeLists.txt
+ create mode 100644 lib/chatbot/richmessage.cpp
+ create mode 100644 lib/chatbot/richmessage.h
+ create mode 100644 lib/database/migrations/2026-11-12-000000_chatbot/down.sql
+ create mode 100644 lib/database/migrations/2026-11-12-000000_chatbot/up.sql
+
+diff --git a/daemon/CMakeLists.txt b/daemon/CMakeLists.txt
+index 6b2a380..7c00a44 100644
+--- a/daemon/CMakeLists.txt
++++ b/daemon/CMakeLists.txt
+@@ -35,6 +35,7 @@ target_link_libraries(spacebar-daemon PRIVATE
+     KF6::ModemManagerQt
+     KF6::Crash
+     database
++    chatbot
+     kTelephonySupport
+     macros
+     mms
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index 16bf526..6cc8eff 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -38,6 +38,8 @@
+ 
+ #include <algorithm>
+ 
++#include <richmessage.h>
++
+ // The conversation's attachment folder, where the app looks for its files.
+ static QString attachmentsFolder(const PhoneNumberList &phoneNumberList)
+ {
+@@ -111,6 +113,15 @@ static QString rcsFileFailedText(const QString &reason)
+     return i18nc("@info RCS file transfer", "A file was sent to you, but downloading it failed.");
+ }
+ 
++// A conversation with a chatbot known only by its SIP URI (IMSroha keys
++// those by "sip:..."): RCS or nothing, never SMS or MMS.
++static bool isChatbotUri(const PhoneNumberList &phoneNumberList)
++{
++    return phoneNumberList.size() == 1 && phoneNumberList.first().toString().startsWith(u"sip:");
++}
++
++static const QString BOT_RESPONSE_TYPE = SL("application/vnd.gsma.botsuggestion.response.v1.0+json");
++
+ static bool isScreenSaverActive()
+ {
+     bool active = false;
+@@ -186,6 +197,18 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+                    const QDateTime &time) {
+                 handleRcsFile(number, messageId, path, contentType, size, thumbnailPath, time);
+             });
++    connect(&m_rcs,
++            &RcsTransport::richMessageReceived,
++            this,
++            [this](const QString &number,
++                   const QString &messageId,
++                   const QString &contentType,
++                   const QString &body,
++                   const QString &suggestions,
++                   const QString &botId,
++                   const QDateTime &time) {
++                handleRichMessage(number, messageId, contentType, body, suggestions, botId, time);
++            });
+     connect(&m_rcs, &RcsTransport::fileReceiveFailed, this, [this](const QString &number, const QString &messageId, const QString &reason) {
+         // No messageId: nothing was displayed, so no displayed notification goes back.
+         qDebug() << "RCS: file" << messageId << "from" << number << "not received:" << reason;
+@@ -498,7 +521,11 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+     message.expires = expires;
+     message.size = size;
+     message.transport = transport;
++    co_await receiveMessage(message);
++}
+ 
++QCoro::Task<void> ChannelLogger::receiveMessage(Message message)
++{
+     // prevent chronologically misordered chat history
+     if (message.read && message.datetime.secsTo(QDateTime::currentDateTime()) < 60) {
+         // adjust for small delays if conversation is currently open
+@@ -511,7 +538,8 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+         message.datetime = QDateTime::currentDateTime();
+     }
+ 
+-    if (co_await handleTapbackReaction(message, message.fromNumber.isEmpty() ? message.phoneNumberList.toString() : message.fromNumber)) {
++    if (message.richContentType.isEmpty()
++        && co_await handleTapbackReaction(message, message.fromNumber.isEmpty() ? message.phoneNumberList.toString() : message.fromNumber)) {
+         updateMessage(message);
+ 
+         if (SettingsManager::self()->ignoreTapbacks()) {
+@@ -564,6 +592,24 @@ ChannelLogger::sendMessageTask(const PhoneNumberList phoneNumberList, const QStr
+     }
+     if (rcsResult) {
+         result = *rcsResult;
++    } else if (isChatbotUri(phoneNumberList)) {
++        // A chatbot by SIP URI: chat, and no SMS or MMS to fall back to.
++        if (files.isEmpty()) {
++            result = co_await sendMessageRCS(phoneNumberList.first(), id, text);
++        } else {
++            Message message;
++            message.id = id;
++            message.phoneNumberList = phoneNumberList;
++            message.text = text;
++            message.datetime = QDateTime::currentDateTime();
++            message.read = true;
++            message.sentByMe = true;
++            message.deliveryStatus = MessageState::Failed;
++            message.transport = SL("rcs");
++            co_await addMessage(message);
++            updateMessage(message);
++            result = SL("no file transfer to this chatbot");
++        }
+     } else if (phoneNumberList.size() > 1 || files.length() > 0) {
+         // check if it is a MMS message
+         if (SettingsManager::self()->groupConversation()) {
+@@ -629,6 +675,12 @@ QCoro::Task<QString> ChannelLogger::sendMessageRCS(const PhoneNumber &phoneNumbe
+     updateMessage(message);
+ 
+     const auto rcsId = co_await m_rcs.send(phoneNumber.toE164(), text);
++    if (!rcsId && isChatbotUri(message.phoneNumberList)) {
++        co_await m_database.updateMessageDeliveryState(id, MessageState::Failed);
++        message.deliveryStatus = MessageState::Failed;
++        updateMessage(message);
++        co_return SL("RCS refused the message");
++    }
+     if (!rcsId) {
+         // RCS would not take it: the same message goes as SMS.
+         co_await m_database.updateMessageTransport(id, QString());
+@@ -734,6 +786,143 @@ QCoro::Task<void> ChannelLogger::handleRcsFile(const QString number,
+                          SL("rcs"));
+ }
+ 
++QCoro::Task<void> ChannelLogger::handleRichMessage(const QString number,
++                                                   const QString messageId,
++                                                   const QString contentType,
++                                                   const QString body,
++                                                   const QString suggestions,
++                                                   const QString botId,
++                                                   const QDateTime time)
++{
++    const PhoneNumberList phoneNumberList(number);
++    if (!botId.isEmpty() && !m_botNames.contains(botId)) {
++        // the name for the notification, when it is known
++        const auto info = co_await m_database.botInfo(botId);
++        if (info) {
++            m_botNames.insert(botId, RichMessage::botInfo(info->first).value(u"name").toString());
++        }
++    }
++
++    Message message;
++    message.phoneNumberList = phoneNumberList;
++    message.datetime = time.isValid() ? time : QDateTime::currentDateTime();
++    message.deliveryStatus = MessageState::Received;
++    message.sentByMe = false;
++    message.id = Database::generateRandomId();
++    message.read = phoneNumberList == m_disabledNotificationNumber;
++    message.messageId = messageId;
++    message.transport = SL("rcs");
++    message.richContentType = contentType;
++    message.richBody = body;
++    message.suggestions = suggestions;
++    message.botId = botId;
++    // What the conversation list, the notification and anything that cannot
++    // show the card read: header, titles, descriptions, texts, footer.
++    message.text = RichMessage::summary(contentType, body, suggestions);
++    co_await receiveMessage(message);
++
++    if (!botId.isEmpty()) {
++        refreshBotInfo(phoneNumberList.toString(), botId, true);
++    }
++}
++
++void ChannelLogger::sendSuggestionResponse(const QString &numbers, const QString &id, const QString &inReplyTo, const QString &suggestion)
++{
++    sendSuggestionResponseTask(PhoneNumberList(numbers), id, inReplyTo, suggestion);
++}
++
++QCoro::Task<void>
++ChannelLogger::sendSuggestionResponseTask(const PhoneNumberList phoneNumberList, const QString id, const QString inReplyTo, const QString suggestion)
++{
++    if (phoneNumberList.size() != 1) {
++        co_return;
++    }
++    const QJsonObject raw = QJsonDocument::fromJson(suggestion.toUtf8()).object();
++    const QString response = RichMessage::responseJson(raw);
++    // RCC.07 3.6.10.6.2.1: a suggested reply shows as a message we sent.
++    const bool shown = RichMessage::isReply(raw) && !id.isEmpty();
++
++    QString inReplyToMessageId;
++    if (!inReplyTo.isEmpty()) {
++        const auto found = co_await m_database.messagesForNumber(PhoneNumberList(), inReplyTo);
++        if (!found.empty()) {
++            inReplyToMessageId = found.front().messageId;
++        }
++    }
++
++    Message message;
++    if (shown) {
++        message.id = id;
++        message.phoneNumberList = phoneNumberList;
++        message.text = RichMessage::displayText(raw);
++        message.datetime = QDateTime::currentDateTime();
++        message.read = true;
++        message.sentByMe = true;
++        message.deliveryStatus = MessageState::Pending;
++        message.transport = SL("rcs");
++        message.richContentType = BOT_RESPONSE_TYPE;
++        message.richBody = response;
++        co_await addMessage(message);
++        updateMessage(message);
++    }
++    if (response.isEmpty()) {
++        // an action without postback data: nothing goes back
++        co_return;
++    }
++
++    const auto rcsId = co_await m_rcs.sendSuggestionResponse(phoneNumberList.first().toE164(), inReplyToMessageId, response);
++    if (!shown) {
++        co_return;
++    }
++    if (rcsId) {
++        co_await m_database.updateMessageSent(id, *rcsId, QString());
++    } else {
++        // never as SMS: the bot would get the label without its postback
++        co_await m_database.updateMessageDeliveryState(id, MessageState::Failed);
++        message.deliveryStatus = MessageState::Failed;
++        updateMessage(message);
++    }
++}
++
++QString ChannelLogger::botInfo(const QString &numbers)
++{
++    const PhoneNumberList phoneNumberList(numbers);
++    if (phoneNumberList.size() != 1) {
++        return {};
++    }
++    const QString botId = QCoro::waitFor(m_database.botIdForNumber(phoneNumberList));
++    if (botId.isEmpty()) {
++        return {};
++    }
++    const auto info = QCoro::waitFor(m_database.botInfo(botId));
++    refreshBotInfo(phoneNumberList.toString(), botId, true);
++    return info ? info->first : QString();
++}
++
++QCoro::Task<void> ChannelLogger::refreshBotInfo(const QString phoneNumber, const QString botId, bool onlyWhenStale)
++{
++    if (m_botInfoPending.contains(botId)) {
++        co_return;
++    }
++    if (onlyWhenStale) {
++        const auto info = co_await m_database.botInfo(botId);
++        if (info && info->second.secsTo(QDateTime::currentDateTime()) < 86400) {
++            co_return;
++        }
++    }
++    m_botInfoPending.insert(botId);
++    // IMSroha keeps it by ETag and Cache-Control; this is for when it is not
++    // there, and for the conversation list.
++    const auto json = co_await m_rcs.botInfo(botId);
++    m_botInfoPending.remove(botId);
++    if (!json || RichMessage::botInfo(*json).isEmpty()) {
++        co_return;
++    }
++    co_await m_database.setBotInfo(botId, *json);
++    m_botNames.insert(botId, RichMessage::botInfo(*json).value(u"name").toString());
++    Q_EMIT botInfoChanged(phoneNumber, *json);
++}
++
+ QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString messageId, const QString status)
+ {
+     const auto id = co_await m_database.idForMessageId(messageId);
+@@ -752,6 +941,10 @@ QCoro::Task<void> ChannelLogger::handleRcsStatus(const QString messageId, const
+         co_await m_database.updateMessageDeliveryReport(messageId);
+     } else if (status == SL("displayed")) {
+         co_await m_database.updateMessageReadReport(messageId, message.phoneNumberList.first());
++    } else if (status == SL("failed") && (!message.richContentType.isEmpty() || isChatbotUri(message.phoneNumberList))) {
++        // A suggested reply, or anything to a chatbot by SIP URI: these do
++        // not go as SMS (R9 7.7.3.1), they failed.
++        co_await m_database.updateMessageDeliveryState(*id, MessageState::Failed);
+     } else if (status == SL("failed") && message.deliveryStatus != MessageState::Sent && !message.attachments.isEmpty()) {
+         // A file that did not go (the upload failed): it goes as MMS, which
+         // stores the attachments its own way.
+@@ -965,6 +1158,9 @@ void ChannelLogger::createNotification(Message &message)
+     if (SettingsManager::self()->showSenderInfo()) {
+         const PhoneNumber from = message.fromNumber.isEmpty() ? message.phoneNumberList.first() : PhoneNumber(message.fromNumber);
+         title = KPeople::PersonData(ContactPhoneNumberMapper::instance().uriForNumber(from), this).name();
++        if (title.isEmpty() && !message.botId.isEmpty()) {
++            title = m_botNames.value(message.botId);
++        }
+         if (title.isEmpty()) {
+             title = from.toNational();
+         }
+diff --git a/daemon/channellogger.h b/daemon/channellogger.h
+index 6c0b258..dc7cde9 100644
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -41,6 +41,20 @@ public:
+     Q_SCRIPTABLE void sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize);
+     Q_SCRIPTABLE void sendTapback(const QString &numbers, const QString &id, const QString &tapback, const bool &isRemoved);
+     Q_SCRIPTABLE void setComposing(const QString &numbers, bool active);
++    /*
++     * RCS chatbots: the user tapped a suggestion (the suggestion JSON as the
++     * bot sent it) of the message with our id inReplyTo. A suggested reply
++     * is stored as a sent message under id and goes back to the bot; an
++     * action goes back only when it carries postback data.
++     */
++    Q_SCRIPTABLE void
++    sendSuggestionResponse(const QString &numbers, const QString &id, const QString &inReplyTo, const QString &suggestion);
++    /*
++     * The chatbot information (botinfo JSON) kept for a chatbot's conversation,
++     * "" when there is none; a missing or day-old one is fetched again and
++     * comes with botInfoChanged.
++     */
++    Q_SCRIPTABLE QString botInfo(const QString &numbers);
+     Q_SCRIPTABLE void syncSettings();
+     Q_SCRIPTABLE QString ownNumber();
+     Q_SCRIPTABLE QString countryCode();
+@@ -82,6 +96,7 @@ private:
+                                   const QDateTime &expires = QDateTime(),
+                                   const int size = 0,
+                                   const QString &transport = QString());
++    QCoro::Task<void> receiveMessage(Message message);
+     QCoro::Task<void>
+     sendMessageTask(const PhoneNumberList phoneNumberList, const QString id, const QString text, const QStringList files, const qint64 totalSize);
+     QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, bool addToDatabase = true);
+@@ -97,6 +112,15 @@ private:
+                                     qulonglong size,
+                                     const QString thumbnailPath,
+                                     const QDateTime time);
++    QCoro::Task<void> handleRichMessage(const QString number,
++                                        const QString messageId,
++                                        const QString contentType,
++                                        const QString body,
++                                        const QString suggestions,
++                                        const QString botId,
++                                        const QDateTime time);
++    QCoro::Task<void> sendSuggestionResponseTask(const PhoneNumberList phoneNumberList, const QString id, const QString inReplyTo, const QString suggestion);
++    QCoro::Task<void> refreshBotInfo(const QString phoneNumber, const QString botId, bool onlyWhenStale);
+     QCoro::Task<QString>
+     sendMessageMMS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files, const qint64 totalSize);
+     QCoro::Task<void> sendCancelResponse(const QString &transactionId);
+@@ -135,9 +159,14 @@ private:
+ 
+     QStringList m_deferredIndicators;
+ 
++    // chatbot information being fetched, and the names known, by service ID
++    QSet<QString> m_botInfoPending;
++    QHash<QString, QString> m_botNames;
++
+ Q_SIGNALS:
+     Q_SCRIPTABLE void messageAdded(const QString &phoneNumber, const QString &id);
+     Q_SCRIPTABLE void messageUpdated(const QString &phoneNumber, const QString &id);
+     Q_SCRIPTABLE void manualDownloadFinished(const QString &id, const bool isEmpty);
+     Q_SCRIPTABLE void composingChanged(const QString &phoneNumber, bool active);
++    Q_SCRIPTABLE void botInfoChanged(const QString &phoneNumber, const QString &info);
+ };
+diff --git a/daemon/org.kde.spacebar.Daemon.xml b/daemon/org.kde.spacebar.Daemon.xml
+index 89955dc..620362f 100644
+--- a/daemon/org.kde.spacebar.Daemon.xml
++++ b/daemon/org.kde.spacebar.Daemon.xml
+@@ -13,6 +13,10 @@
+       <arg name="phoneNumber" type="s" direction="out"/>
+       <arg name="active" type="b" direction="out"/>
+     </signal>
++    <signal name="botInfoChanged">
++      <arg name="phoneNumber" type="s" direction="out"/>
++      <arg name="info" type="s" direction="out"/>
++    </signal>
+     <signal name="manualDownloadFinished">
+       <arg name="id" type="s" direction="out"/>
+       <arg name="isEmpty" type="b" direction="out"/>
+@@ -43,6 +47,16 @@
+       <arg name="numbers" type="s" direction="in"/>
+       <arg name="active" type="b" direction="in"/>
+     </method>
++    <method name="sendSuggestionResponse">
++      <arg name="numbers" type="s" direction="in"/>
++      <arg name="id" type="s" direction="in"/>
++      <arg name="inReplyTo" type="s" direction="in"/>
++      <arg name="suggestion" type="s" direction="in"/>
++    </method>
++    <method name="botInfo">
++      <arg type="s" direction="out"/>
++      <arg name="numbers" type="s" direction="in"/>
++    </method>
+     <method name="syncSettings">
+     </method>
+     <method name="ownNumber">
+diff --git a/daemon/rcstransport.cpp b/daemon/rcstransport.cpp
+index 1908ff8..1a0aece 100644
+--- a/daemon/rcstransport.cpp
++++ b/daemon/rcstransport.cpp
+@@ -36,6 +36,12 @@ RcsTransport::RcsTransport(QObject *parent)
+                 this,
+                 SLOT(onFileReceived(QString, QString, QString, QString, qulonglong, QString, qlonglong)));
+     bus.connect(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("FileReceiveFailed"), this, SLOT(onFileReceiveFailed(QString, QString, QString)));
++    bus.connect(RCS_SERVICE,
++                RCS_PATH,
++                RCS_IFACE,
++                SL("RichMessageReceived"),
++                this,
++                SLOT(onRichMessageReceived(QString, QString, QString, QString, QString, QString, qlonglong)));
+ 
+     connect(&m_watcher, &QDBusServiceWatcher::serviceOwnerChanged, this, [this](const QString &, const QString &, const QString &newOwner) {
+         m_caps.clear();
+@@ -168,6 +174,36 @@ QCoro::Task<std::optional<QString>> RcsTransport::sendFile(const QString &e164,
+     co_return reply.value();
+ }
+ 
++QCoro::Task<std::optional<QString>> RcsTransport::sendSuggestionResponse(const QString &number, const QString &inReplyTo, const QString &responseJson)
++{
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("SendSuggestionResponse"));
++    call << number << inReplyTo << responseJson;
++    const QDBusPendingReply<QString> pending = QDBusConnection::systemBus().asyncCall(call);
++    const QDBusPendingReply<QString> reply = co_await pending;
++    if (!reply.isValid()) {
++        qDebug() << "RCS: SendSuggestionResponse to" << number << reply.error().message();
++        co_return std::nullopt;
++    }
++    co_return reply.value();
++}
++
++QCoro::Task<std::optional<QString>> RcsTransport::botInfo(const QString &botId)
++{
++    if (!isRegistered()) {
++        co_return std::nullopt;
++    }
++    QDBusMessage call = QDBusMessage::createMethodCall(RCS_SERVICE, RCS_PATH, RCS_IFACE, SL("GetBotInfo"));
++    call << botId;
++    // an HTTP query on IMSroha's side
++    const QDBusPendingReply<QString> pending = QDBusConnection::systemBus().asyncCall(call, 30000);
++    const QDBusPendingReply<QString> reply = co_await pending;
++    if (!reply.isValid()) {
++        qDebug() << "RCS: chatbot information of" << botId << reply.error().name() << reply.error().message();
++        co_return std::nullopt;
++    }
++    co_return reply.value();
++}
++
+ void RcsTransport::setComposing(const QString &e164, bool active)
+ {
+     if (!isRegistered()) {
+@@ -221,3 +257,16 @@ void RcsTransport::onFileReceiveFailed(const QString &number, const QString &mes
+     sawChat(number, true);
+     Q_EMIT fileReceiveFailed(number, messageId, reason);
+ }
++
++void RcsTransport::onRichMessageReceived(const QString &number,
++                                         const QString &messageId,
++                                         const QString &contentType,
++                                         const QString &body,
++                                         const QString &suggestions,
++                                         const QString &botId,
++                                         qlonglong timestampMs)
++{
++    // Nothing about the capabilities here: an A2P sender with a tel URI
++    // takes SMS for what the user types (R9 7.7.3.1), GetCapabilities says.
++    Q_EMIT richMessageReceived(number, messageId, contentType, body, suggestions, botId, QDateTime::fromMSecsSinceEpoch(timestampMs));
++}
+diff --git a/daemon/rcstransport.h b/daemon/rcstransport.h
+index 9d0be2d..4e45cef 100644
+--- a/daemon/rcstransport.h
++++ b/daemon/rcstransport.h
+@@ -14,7 +14,7 @@
+ #include <optional>
+ 
+ /*
+- * RCS chat and file transfer through IMSroha's codes.noa.IMSroha.Rcs on the system bus.
++ * RCS chat, file transfer and chatbots through IMSroha's codes.noa.IMSroha.Rcs on the system bus.
+  * Inert while that service is absent or not registered: then everything goes
+  * the SMS/MMS way through ModemManager, as before.
+  */
+@@ -39,6 +39,11 @@ public:
+     QCoro::Task<std::optional<QString>> sendFile(const QString &e164, const QString &path);
+     void setComposing(const QString &e164, bool active);
+     void markDisplayed(const QString &e164, const QString &messageId);
++    // Chatbots: a botsuggestion.response to the bot of that conversation (the
++    // imdn.Message-ID, nothing when IMSroha refused it), and the bot's
++    // chatbot information JSON (nothing when it is not available).
++    QCoro::Task<std::optional<QString>> sendSuggestionResponse(const QString &number, const QString &inReplyTo, const QString &responseJson);
++    QCoro::Task<std::optional<QString>> botInfo(const QString &botId);
+ 
+ Q_SIGNALS:
+     void messageReceived(const QString &number, const QString &messageId, const QString &text, const QDateTime &time);
+@@ -56,6 +61,15 @@ Q_SIGNALS:
+     // A file was sent to us but not fetched: "expired", "too-large",
+     // "unauthorized", "gone", "invalid" or "failed".
+     void fileReceiveFailed(const QString &number, const QString &messageId, const QString &reason);
++    // A chatbot message: a rich card, carousel, open rich card or a text
++    // with suggestions, as received, with its chip list ("" when none).
++    void richMessageReceived(const QString &number,
++                             const QString &messageId,
++                             const QString &contentType,
++                             const QString &body,
++                             const QString &suggestions,
++                             const QString &botId,
++                             const QDateTime &time);
+ 
+ private Q_SLOTS:
+     void onMessageReceived(const QString &number, const QString &messageId, const QString &text, qlonglong timestampMs);
+@@ -69,6 +83,13 @@ private Q_SLOTS:
+                         const QString &thumbnailPath,
+                         qlonglong timestampMs);
+     void onFileReceiveFailed(const QString &number, const QString &messageId, const QString &reason);
++    void onRichMessageReceived(const QString &number,
++                               const QString &messageId,
++                               const QString &contentType,
++                               const QString &body,
++                               const QString &suggestions,
++                               const QString &botId,
++                               qlonglong timestampMs);
+     void onStateChanged(const QString &state);
+ 
+ private:
+diff --git a/lib/CMakeLists.txt b/lib/CMakeLists.txt
+index 455307c..48093e4 100644
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -5,3 +5,4 @@ add_subdirectory(telephonySupport)
+ add_subdirectory(database)
+ add_subdirectory(mms)
+ add_subdirectory(config)
++add_subdirectory(chatbot)
+diff --git a/lib/chatbot/CMakeLists.txt b/lib/chatbot/CMakeLists.txt
+new file mode 100644
+index 0000000..e6e514e
+--- /dev/null
++++ b/lib/chatbot/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++# SPDX-License-Identifier: BSD-2-Clause
++
++# RCS chatbot messages (RCC.07, TTA R9 7.7), shared by the daemon and the app
++add_library(chatbot STATIC richmessage.cpp)
++target_compile_definitions(chatbot PRIVATE -DQT_NO_CAST_FROM_ASCII)
++target_link_libraries(chatbot PUBLIC Qt6::Core KF6::I18n)
++target_include_directories(chatbot PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/lib/chatbot/richmessage.cpp b/lib/chatbot/richmessage.cpp
+new file mode 100644
+index 0000000..95d8fb1
+--- /dev/null
++++ b/lib/chatbot/richmessage.cpp
+@@ -0,0 +1,646 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#include "richmessage.h"
++
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QStringList>
++#include <QUrl>
++
++#include <KLocalizedString>
++
++using namespace Qt::StringLiterals;
++
++namespace
++{
++// R9's examples have keys with stray spaces (" clipboardAction"); a bot
++// that copied them is still understood.
++QJsonValue member(const QJsonObject &o, const QString &key)
++{
++    const auto it = o.constFind(key);
++    if (it != o.constEnd()) {
++        return *it;
++    }
++    for (auto i = o.constBegin(); i != o.constEnd(); ++i) {
++        if (i.key().trimmed() == key) {
++            return i.value();
++        }
++    }
++    return QJsonValue(QJsonValue::Undefined);
++}
++
++QJsonObject object(const QJsonObject &o, const QString &key)
++{
++    return member(o, key).toObject();
++}
++
++bool has(const QJsonObject &o, const QString &key)
++{
++    return !member(o, key).isUndefined();
++}
++
++QString text(const QJsonObject &o, const QString &key)
++{
++    const QJsonValue v = member(o, key);
++    if (v.isString()) {
++        return v.toString().trimmed();
++    }
++    if (v.isDouble()) {
++        return QString::number(v.toDouble());
++    }
++    return {};
++}
++
++// "true", true and 1 are all true; absent is the default.
++bool flag(const QJsonObject &o, const QString &key, bool fallback)
++{
++    const QJsonValue v = member(o, key);
++    if (v.isBool()) {
++        return v.toBool();
++    }
++    if (v.isString()) {
++        const QString s = v.toString().trimmed().toLower();
++        if (s == u"true" || s == u"1") {
++            return true;
++        }
++        if (s == u"false" || s == u"0") {
++            return false;
++        }
++    }
++    if (v.isDouble()) {
++        return v.toDouble() != 0;
++    }
++    return fallback;
++}
++
++// The first of these objects that has the key.
++QJsonValue lookup(const QList<QJsonObject> &levels, const QString &key)
++{
++    for (const auto &o : levels) {
++        const QJsonValue v = member(o, key);
++        if (!v.isUndefined() && !v.isNull()) {
++            return v;
++        }
++    }
++    return {};
++}
++
++// Only web addresses are fetched or opened from a card's media.
++bool isWebUrl(const QString &url)
++{
++    const QUrl u(url);
++    return u.isValid() && (u.scheme() == u"https" || u.scheme() == u"http") && !u.host().isEmpty();
++}
++
++QJsonObject suggestion(const QJsonObject &raw)
++{
++    QJsonObject out{{u"raw"_s, raw}};
++    if (has(raw, u"reply"_s)) {
++        const QJsonObject reply = object(raw, u"reply"_s);
++        out[u"type"_s] = u"reply"_s;
++        out[u"action"_s] = u"reply"_s;
++        out[u"displayText"_s] = text(reply, u"displayText"_s);
++        out[u"hasPostback"_s] = has(reply, u"postback"_s);
++        return out;
++    }
++
++    const QJsonObject a = object(raw, u"action"_s);
++    out[u"type"_s] = u"action"_s;
++    out[u"displayText"_s] = text(a, u"displayText"_s);
++    out[u"hasPostback"_s] = has(a, u"postback"_s);
++
++    QString kind = u"unknown"_s;
++    if (has(a, u"urlAction"_s)) {
++        const QJsonObject open = object(object(a, u"urlAction"_s), u"openUrl"_s);
++        kind = u"url"_s;
++        out[u"url"_s] = text(open, u"url"_s);
++        out[u"application"_s] = text(open, u"application"_s);
++    } else if (has(a, u"localBrowserAction"_s)) {
++        // R9 7.7.4.8: an in-app browser that posts parameters and reports a
++        // result. Spacebar has none: the page opens in the browser.
++        const QJsonObject open = object(object(a, u"localBrowserAction"_s), u"openUrl"_s);
++        kind = u"localBrowser"_s;
++        out[u"url"_s] = text(open, u"url"_s);
++    } else if (has(a, u"dialerAction"_s)) {
++        const QJsonObject dialer = object(a, u"dialerAction"_s);
++        kind = u"dial"_s;
++        for (const auto &variant : {u"dialPhoneNumber"_s, u"dialEnrichedCall"_s, u"dialVideoCall"_s}) {
++            if (has(dialer, variant)) {
++                const QJsonObject d = object(dialer, variant);
++                out[u"phoneNumber"_s] = text(d, u"phoneNumber"_s);
++                out[u"fallbackUrl"_s] = text(d, u"fallbackUrl"_s);
++                out[u"video"_s] = variant == u"dialVideoCall";
++                break;
++            }
++        }
++    } else if (has(a, u"mapAction"_s)) {
++        const QJsonObject map = object(a, u"mapAction"_s);
++        if (has(map, u"showLocation"_s)) {
++            const QJsonObject show = object(map, u"showLocation"_s);
++            const QJsonObject location = object(show, u"location"_s);
++            kind = u"map"_s;
++            if (member(location, u"latitude"_s).isDouble() && member(location, u"longitude"_s).isDouble()) {
++                out[u"latitude"_s] = member(location, u"latitude"_s).toDouble();
++                out[u"longitude"_s] = member(location, u"longitude"_s).toDouble();
++            }
++            out[u"label"_s] = text(location, u"label"_s);
++            out[u"query"_s] = text(location, u"query"_s);
++            out[u"fallbackUrl"_s] = text(show, u"fallbackUrl"_s);
++        } else {
++            // requestLocationPush, also R9 7.7.4.9's currentLocation
++            kind = u"locationPush"_s;
++        }
++    } else if (has(a, u"calendarAction"_s)) {
++        const QJsonObject event = object(object(a, u"calendarAction"_s), u"createCalendarEvent"_s);
++        kind = u"calendar"_s;
++        out[u"startTime"_s] = text(event, u"startTime"_s);
++        out[u"endTime"_s] = text(event, u"endTime"_s);
++        out[u"title"_s] = text(event, u"title"_s);
++        out[u"description"_s] = text(event, u"description"_s);
++        out[u"fallbackUrl"_s] = text(event, u"fallbackUrl"_s);
++    } else if (has(a, u"composeAction"_s)) {
++        const QJsonObject compose = object(a, u"composeAction"_s);
++        if (has(compose, u"composeTextMessage"_s)) {
++            const QJsonObject c = object(compose, u"composeTextMessage"_s);
++            kind = u"compose"_s;
++            out[u"phoneNumber"_s] = text(c, u"phoneNumber"_s);
++            out[u"text"_s] = text(c, u"text"_s);
++        } else {
++            const QJsonObject c = object(compose, u"composeRecordingMessage"_s);
++            kind = u"composeRecording"_s;
++            out[u"phoneNumber"_s] = text(c, u"phoneNumber"_s);
++        }
++    } else if (has(a, u"deviceAction"_s)) {
++        kind = u"device"_s;
++    } else if (has(a, u"settingsAction"_s)) {
++        kind = u"settings"_s;
++    } else if (has(a, u"copyAction"_s)) {
++        // RCC.07
++        kind = u"copy"_s;
++        out[u"text"_s] = text(object(object(a, u"copyAction"_s), u"copyText"_s), u"text"_s);
++    } else if (has(a, u"clipboardAction"_s)) {
++        // R9 7.7.4.6
++        kind = u"copy"_s;
++        out[u"text"_s] = text(object(object(a, u"clipboardAction"_s), u"copyToClipboard"_s), u"text"_s);
++    } else if (has(a, u"shareAction"_s)) {
++        // R9 7.7.4.7
++        kind = u"share"_s;
++        out[u"text"_s] = text(object(object(a, u"shareAction"_s), u"shareText"_s), u"text"_s);
++    } else if (has(a, u"deeplinkAction"_s)) {
++        // R9 7.7.4.10
++        kind = u"deeplink"_s;
++        out[u"url"_s] = text(object(a, u"deeplinkAction"_s), u"deeplink"_s);
++    }
++    out[u"action"_s] = kind;
++    return out;
++}
++
++QJsonArray suggestionList(const QJsonValue &value)
++{
++    QJsonArray out;
++    const QJsonArray items = value.toArray();
++    for (const auto &item : items) {
++        const QJsonObject s = item.toObject();
++        if (has(s, u"reply"_s) || has(s, u"action"_s)) {
++            out.append(suggestion(s));
++        }
++    }
++    return out;
++}
++
++QJsonObject media(const QJsonObject &m)
++{
++    if (m.isEmpty()) {
++        return {};
++    }
++    const QString url = text(m, u"mediaUrl"_s);
++    const QString type = text(m, u"mediaContentType"_s).toLower();
++    const QString thumbnail = text(m, u"thumbnailUrl"_s);
++    const qint64 size = member(m, u"mediaFileSize"_s).toInteger();
++    QJsonObject out{
++        {u"mediaUrl"_s, url},
++        {u"mediaContentType"_s, type},
++        {u"thumbnailUrl"_s, thumbnail},
++        {u"height"_s, text(m, u"height"_s)},
++        {u"contentDescription"_s, text(m, u"contentDescription"_s)},
++    };
++    // What is shown: a picture itself (up to 5 MB; a larger one by its
++    // thumbnail), anything else by its thumbnail. Video, audio and R9's
++    // iframe play open the media outside.
++    const bool image = type.startsWith(u"image/");
++    QString shown;
++    if (image && isWebUrl(url) && (size <= 5 * 1024 * 1024 || !isWebUrl(thumbnail))) {
++        shown = url;
++    } else if (isWebUrl(thumbnail)) {
++        shown = thumbnail;
++    }
++    out[u"image"_s] = shown;
++    out[u"playable"_s] = !image && isWebUrl(url);
++    if (has(m, u"click"_s)) {
++        out[u"click"_s] = suggestion(object(m, u"click"_s));
++    }
++    return out;
++}
++
++QJsonObject card(const QJsonObject &content)
++{
++    return {
++        {u"title"_s, text(content, u"title"_s)},
++        {u"description"_s, text(content, u"description"_s)},
++        {u"media"_s, media(object(content, u"media"_s))},
++        {u"suggestions"_s, suggestionList(member(content, u"suggestions"_s))},
++    };
++}
++
++// An open rich card's widget tree with every click normalised, and its
++// text the way R9 7.7.4.4 copies it: TextViews joined by a space, the
++// children of a vertical LinearLayout by a newline.
++QJsonObject openRichNode(const QJsonObject &node, QString *textOut)
++{
++    QJsonObject out = node;
++    const QString widget = text(node, u"widget"_s);
++    const bool gone = text(node, u"visibility"_s) == u"gone";
++    if (has(node, u"click"_s)) {
++        out[u"click"_s] = suggestion(object(node, u"click"_s));
++    }
++    if (widget == u"ImageView") {
++        out[u"image"_s] = media(node).value(u"image"_s);
++        out[u"playable"_s] = media(node).value(u"playable"_s);
++    }
++    if (widget == u"TextView" || widget == u"Button") {
++        if (!gone) {
++            *textOut = text(node, u"text"_s);
++        }
++        return out;
++    }
++    if (widget == u"LinearLayout") {
++        const bool vertical = text(node, u"orientation"_s) != u"horizontal";
++        QJsonArray children;
++        QStringList parts;
++        const QJsonArray items = member(node, u"children"_s).toArray();
++        for (const auto &child : items) {
++            QString childText;
++            children.append(openRichNode(child.toObject(), &childText));
++            if (!childText.isEmpty()) {
++                parts.append(childText);
++            }
++        }
++        out[u"children"_s] = children;
++        if (!gone) {
++            *textOut = parts.join(vertical ? u"\n"_s : u" "_s);
++        }
++    }
++    return out;
++}
++
++// For a message nobody here understands: its text fields, an object's own
++// before those of what it contains, and the suggestions' labels last.
++void collectTexts(const QJsonValue &value, const QStringList &keys, QStringList *texts, int depth = 0)
++{
++    if (depth > 32) {
++        return;
++    }
++    if (value.isObject()) {
++        const QJsonObject o = value.toObject();
++        for (const auto &key : keys) {
++            const QString s = text(o, key);
++            if (!s.isEmpty() && !texts->contains(s)) {
++                texts->append(s);
++            }
++        }
++        for (auto it = o.constBegin(); it != o.constEnd(); ++it) {
++            if (it->isObject() || it->isArray()) {
++                collectTexts(*it, keys, texts, depth + 1);
++            }
++        }
++    } else if (value.isArray()) {
++        const QJsonArray a = value.toArray();
++        for (const auto &v : a) {
++            collectTexts(v, keys, texts, depth + 1);
++        }
++    }
++}
++
++QString findString(const QJsonValue &value, const QString &key, int depth = 0)
++{
++    if (depth > 32) {
++        return {};
++    }
++    if (value.isObject()) {
++        const QJsonObject o = value.toObject();
++        const QString direct = text(o, key);
++        if (!direct.isEmpty()) {
++            return direct;
++        }
++        for (auto it = o.constBegin(); it != o.constEnd(); ++it) {
++            const QString found = findString(*it, key, depth + 1);
++            if (!found.isEmpty()) {
++                return found;
++            }
++        }
++    } else if (value.isArray()) {
++        const QJsonArray a = value.toArray();
++        for (const auto &v : a) {
++            const QString found = findString(v, key, depth + 1);
++            if (!found.isEmpty()) {
++                return found;
++            }
++        }
++    }
++    return {};
++}
++
++QString cardText(const QJsonObject &c)
++{
++    QStringList parts;
++    for (const auto &key : {u"title"_s, u"description"_s}) {
++        const QString s = c.value(key).toString();
++        if (!s.isEmpty()) {
++            parts.append(s);
++        }
++    }
++    return parts.join(u'\n');
++}
++}
++
++namespace RichMessage
++{
++QJsonObject parse(const QString &contentType, const QString &body, const QString &suggestions)
++{
++    QJsonObject out{{u"kind"_s, u"unknown"_s}, {u"shareAllowed"_s, true}, {u"copyAllowed"_s, false}};
++    QJsonParseError error;
++    const QJsonDocument suggestionDoc = QJsonDocument::fromJson(suggestions.toUtf8(), &error);
++    out[u"suggestions"_s] = suggestionList(member(suggestionDoc.object(), u"suggestions"_s));
++
++    const QString type = contentType.trimmed().toLower();
++    QJsonObject root;
++    if (type.startsWith(u"text/")) {
++        out[u"kind"_s] = u"text"_s;
++        out[u"text"_s] = body.trimmed();
++    } else {
++        const QJsonDocument doc = QJsonDocument::fromJson(body.toUtf8(), &error);
++        root = doc.object();
++    }
++
++    // The wire form is RCC.07's {"message": ...}; R9's examples wrap it as
++    // FNW.11 does, {"RCSMessage": {"richcardMessage": {"message": ...}}},
++    // and show open rich cards bare. All of them are taken.
++    QJsonObject level = root;
++    QList<QJsonObject> levels;
++    if (has(level, u"RCSMessage"_s)) {
++        level = object(level, u"RCSMessage"_s);
++    }
++    levels.prepend(level);
++    if (has(level, u"richcardMessage"_s)) {
++        level = object(level, u"richcardMessage"_s);
++        levels.prepend(level);
++    }
++    QJsonObject container; // the object that carries header, footer, copyAllowed...
++    if (has(level, u"openrichcardMessage"_s)) {
++        container = object(level, u"openrichcardMessage"_s);
++        out[u"kind"_s] = u"openrichcard"_s;
++    } else {
++        const QJsonObject message = has(level, u"message"_s) ? object(level, u"message"_s) : level;
++        if (has(message, u"generalPurposeCard"_s)) {
++            container = object(message, u"generalPurposeCard"_s);
++            out[u"kind"_s] = u"card"_s;
++        } else if (has(message, u"generalPurposeCardCarousel"_s)) {
++            container = object(message, u"generalPurposeCardCarousel"_s);
++            out[u"kind"_s] = u"carousel"_s;
++        } else if (text(level, u"card"_s) == u"open_rich_card" || object(level, u"layout"_s).contains(u"widget"_s)) {
++            container = level;
++            out[u"kind"_s] = u"openrichcard"_s;
++        } else if (member(level, u"textMessage"_s).isString()) {
++            out[u"kind"_s] = u"text"_s;
++            out[u"text"_s] = text(level, u"textMessage"_s);
++        }
++    }
++    levels.prepend(container);
++
++    const QString kind = out[u"kind"_s].toString();
++    out[u"header"_s] = lookup(levels, u"messageHeader"_s).toString().trimmed();
++    out[u"footer"_s] = lookup(levels, u"messageFooter"_s).toString().trimmed();
++    out[u"copyAllowed"_s] = flag(container, u"copyAllowed"_s, false);
++    out[u"shareAllowed"_s] = flag(container, u"shareAllowed"_s, true);
++    // R9 7.7.4.13, on RCSMessage; IMSroha may also put the CPIM headers' values there.
++    out[u"verified"_s] = lookup(levels, u"verifiedIndicator"_s).toVariant().toString() == u"1";
++    out[u"headerExtension"_s] = lookup(levels, u"messageHeaderExtension"_s).toString().trimmed();
++
++    QJsonArray cards;
++    QStringList copy;
++    if (kind == u"card" || kind == u"carousel") {
++        const QJsonObject layout = object(container, u"layout"_s);
++        out[u"orientation"_s] = text(layout, u"cardOrientation"_s).toUpper();
++        out[u"imageAlignment"_s] = text(layout, u"imageAlignment"_s).toUpper();
++        out[u"cardWidth"_s] = text(layout, u"cardWidth"_s).toUpper();
++        out[u"titleFontStyle"_s] = member(layout, u"titleFontStyle"_s).toArray();
++        out[u"descriptionFontStyle"_s] = member(layout, u"descriptionFontStyle"_s).toArray();
++        const QJsonValue content = member(container, u"content"_s);
++        const QJsonArray items = kind == u"card" ? QJsonArray{content} : content.toArray();
++        for (const auto &item : items) {
++            const QJsonObject c = card(item.toObject());
++            cards.append(c);
++            const QString t = cardText(c);
++            if (!t.isEmpty()) {
++                copy.append(t);
++            }
++        }
++        if (cards.isEmpty()) {
++            out[u"kind"_s] = u"unknown"_s;
++        }
++    } else if (kind == u"openrichcard") {
++        QString layoutText;
++        out[u"layout"_s] = openRichNode(object(container, u"layout"_s), &layoutText);
++        out[u"cardSuggestions"_s] = suggestionList(member(container, u"suggestions"_s));
++        if (!layoutText.isEmpty()) {
++            copy.append(layoutText);
++        }
++    } else if (kind == u"text") {
++        if (!out[u"text"_s].toString().isEmpty()) {
++            copy.append(out[u"text"_s].toString());
++        }
++    }
++    out[u"cards"_s] = cards;
++    out[u"copyText"_s] = copy.join(u"\n\n"_s);
++
++    // The text it is stored, listed, notified and copied with, and what is
++    // shown when nothing else can be.
++    QStringList lines;
++    QString header = out[u"header"_s].toString();
++    if (out[u"verified"_s].toBool() && !out[u"headerExtension"_s].toString().isEmpty()) {
++        header = (header.isEmpty() ? QString() : header + u' ') + out[u"headerExtension"_s].toString();
++    }
++    if (!header.isEmpty()) {
++        lines.append(header);
++    }
++    QString main = out[u"copyText"_s].toString();
++    if (out[u"kind"_s].toString() == u"unknown") {
++        QStringList texts;
++        collectTexts(root, {u"title"_s, u"description"_s, u"text"_s, u"textMessage"_s}, &texts);
++        collectTexts(root, {u"displayText"_s}, &texts);
++        texts.removeAll(out[u"header"_s].toString());
++        texts.removeAll(out[u"footer"_s].toString());
++        main = i18nc("@info a chatbot message Spacebar cannot show", "Unsupported message");
++        if (!texts.isEmpty()) {
++            main += u'\n' + texts.join(u'\n');
++        }
++    }
++    if (main.isEmpty()) {
++        // a card that is only a picture
++        main = findString(root, u"contentDescription"_s);
++    }
++    if (!main.isEmpty()) {
++        lines.append(main);
++    }
++    if (!out[u"footer"_s].toString().isEmpty()) {
++        lines.append(out[u"footer"_s].toString());
++    }
++    if (lines.isEmpty()) {
++        QStringList labels;
++        const QJsonArray chips = out[u"suggestions"_s].toArray();
++        for (const auto &chip : chips) {
++            const QString label = chip.toObject().value(u"displayText"_s).toString();
++            if (!label.isEmpty()) {
++                labels.append(label);
++            }
++        }
++        lines.append(labels.isEmpty() ? i18nc("@info a chatbot message without any text", "Chatbot message") : labels.join(u" · "_s));
++    }
++    out[u"fallbackText"_s] = lines.join(u'\n');
++    return out;
++}
++
++QString summary(const QString &contentType, const QString &body, const QString &suggestions)
++{
++    return parse(contentType, body, suggestions).value(u"fallbackText"_s).toString();
++}
++
++bool isReply(const QJsonObject &rawSuggestion)
++{
++    return has(rawSuggestion, u"reply"_s);
++}
++
++QString displayText(const QJsonObject &rawSuggestion)
++{
++    return text(object(rawSuggestion, isReply(rawSuggestion) ? u"reply"_s : u"action"_s), u"displayText"_s);
++}
++
++QString responseJson(const QJsonObject &rawSuggestion)
++{
++    QJsonObject response;
++    if (isReply(rawSuggestion)) {
++        // "a reply object including all properties that were provided"
++        response[u"reply"_s] = object(rawSuggestion, u"reply"_s);
++    } else if (has(rawSuggestion, u"action"_s)) {
++        const QJsonObject action = object(rawSuggestion, u"action"_s);
++        if (!has(action, u"postback"_s)) {
++            return {};
++        }
++        response[u"action"_s] = QJsonObject{
++            {u"displayText"_s, member(action, u"displayText"_s)},
++            {u"postback"_s, member(action, u"postback"_s)},
++        };
++    } else {
++        return {};
++    }
++    return QString::fromUtf8(QJsonDocument(QJsonObject{{u"response"_s, response}}).toJson(QJsonDocument::Compact));
++}
++
++QJsonObject botInfo(const QString &json)
++{
++    const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
++    if (root.isEmpty()) {
++        return {};
++    }
++    const QJsonObject info = object(root, u"botinfo"_s);
++    const QJsonObject pcc = object(info, u"pcc"_s);
++    const QJsonObject details = object(pcc, u"org-details"_s);
++    const QList<QJsonObject> levels{info, root, pcc, details};
++    auto value = [&levels](const QString &key) {
++        const QJsonValue v = lookup(levels, key);
++        return v.isString() ? v.toString().trimmed() : v.isDouble() ? QString::number(v.toInt()) : QString();
++    };
++    // RCC.07 has these as arrays in its example and as objects in places.
++    auto entries = [](const QJsonValue &v) {
++        return v.isArray() ? v.toArray() : v.isObject() ? QJsonArray{v} : QJsonArray{};
++    };
++
++    QJsonObject out;
++    QString name = value(u"subTitle"_s); // R9: the conversation's title
++    if (name.isEmpty()) {
++        const QJsonArray names = entries(member(details, u"org-name"_s));
++        for (const auto &n : names) {
++            const QString display = text(n.toObject(), u"display-name"_s);
++            if (!display.isEmpty() && (name.isEmpty() || text(n.toObject(), u"org-name-type"_s) == u"OfficialName")) {
++                name = display;
++            }
++        }
++    }
++    out[u"name"_s] = name;
++
++    QString icon = value(u"subImage"_s);
++    if (icon.isEmpty()) {
++        const QJsonArray media = entries(member(object(details, u"media-list"_s), u"media-entry"_s));
++        for (const auto &m : media) {
++            const QJsonObject entry = m.toObject();
++            if (text(entry, u"label"_s).compare(u"icon"_s, Qt::CaseInsensitive) == 0) {
++                icon = text(object(entry, u"media"_s), u"media-url"_s);
++                break;
++            }
++        }
++    }
++    out[u"icon"_s] = isWebUrl(icon) ? icon : QString();
++
++    QString description = value(u"subDescription"_s);
++    if (description.isEmpty()) {
++        description = value(u"org-description"_s);
++    }
++    out[u"description"_s] = description;
++
++    const QJsonObject commAddr = object(details, u"comm-addr"_s);
++    QString phone = value(u"subNum"_s);
++    if (phone.isEmpty()) {
++        const QJsonArray tels = entries(member(commAddr, u"tel"_s));
++        for (const auto &t : tels) {
++            phone = text(object(t.toObject(), u"tel-nb"_s), u"tel-str"_s);
++            if (!phone.isEmpty()) {
++                break;
++            }
++        }
++    }
++    out[u"phoneNumber"_s] = phone;
++    const QJsonArray uris = entries(member(commAddr, u"uri-entry"_s));
++    for (const auto &u : uris) {
++        if (text(u.toObject(), u"label"_s).compare(u"ServiceID"_s, Qt::CaseInsensitive) == 0) {
++            out[u"serviceId"_s] = text(u.toObject(), u"addr-uri"_s);
++        }
++    }
++
++    // RCC.07: "base64 url encoded hexadecimal RGB colour representation"
++    const QByteArray colour = QByteArray::fromBase64(value(u"colour"_s).toLatin1(), QByteArray::Base64UrlEncoding);
++    if (colour.size() == 7 && colour.startsWith('#')) {
++        out[u"colour"_s] = QString::fromLatin1(colour);
++    }
++
++    // Whether the user may type here. R9: userInputCtrlCd '0' no, '1' yes,
++    // anything else the app decides; an ordinary A2P sender (bot-a2p-cd 0)
++    // is one-way unless a2pTypeCd says '1'. RCC.07: Disable_User_feedback.
++    const bool a2p = value(u"bot-a2p-cd"_s) == u"0";
++    out[u"a2p"_s] = a2p;
++    const QString control = value(u"userInputCtrlCd"_s);
++    bool disabled;
++    if (control == u"0") {
++        disabled = true;
++    } else if (control == u"1") {
++        disabled = false;
++    } else if (flag(info, u"Disable_User_feedback"_s, false)) {
++        disabled = true;
++    } else {
++        disabled = a2p && value(u"a2pTypeCd"_s) != u"1";
++    }
++    out[u"inputDisabled"_s] = disabled;
++    return out;
++}
++}
+diff --git a/lib/chatbot/richmessage.h b/lib/chatbot/richmessage.h
+new file mode 100644
+index 0000000..c0297c1
+--- /dev/null
++++ b/lib/chatbot/richmessage.h
+@@ -0,0 +1,64 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#pragma once
++
++#include <QJsonObject>
++#include <QString>
++
++/*
++ * RCS chatbot messages (GSMA RCC.07 3.6.10, TTAK.KO-06.0410/R9 7.7) as
++ * IMSroha hands them over, reduced to what the conversation shows.
++ *
++ * parse() takes the content type, the body and the botsuggestion part, and
++ * returns one object for the view:
++ *
++ *   kind          "card", "carousel", "openrichcard", "text" or "unknown"
++ *   header        R9 messageHeader ("(광고)[Web발신]"), shown above the card
++ *   footer        R9 messageFooter ("수신거부:080-..."), shown below it
++ *   verified      R9 7.7.4.13 verifiedIndicator, with headerExtension
++ *   copyAllowed   R9 7.7.4.4
++ *   shareAllowed  R9 7.7.4.15.1, true unless the message says false
++ *   orientation, imageAlignment, cardWidth, titleFontStyle,
++ *   descriptionFontStyle   the RCC.07 card layout
++ *   cards         [{title, description, media, suggestions}]
++ *   layout        the open rich card's widget tree, as received
++ *   text          the text of a text message
++ *   suggestions   the chip list (botsuggestion), normalised
++ *   copyText      what "copy" copies (R9 7.7.4.4)
++ *   fallbackText  the readable text of all of it; never empty
++ *
++ * Every suggestion is {type: "reply"|"action", displayText, hasPostback,
++ * action: "url"|"localBrowser"|"dial"|"map"|"calendar"|"compose"|"device"|
++ * "settings"|"copy"|"share"|"deeplink"|"unknown", the action's parameters,
++ * raw: the suggestion as received}. The raw object is what goes back to
++ * responseJson() when it is tapped.
++ */
++namespace RichMessage
++{
++QJsonObject parse(const QString &contentType, const QString &body, const QString &suggestions);
++
++// The text a received chatbot message is stored and notified with.
++QString summary(const QString &contentType, const QString &body, const QString &suggestions);
++
++// The application/vnd.gsma.botsuggestion.response.v1.0+json body for a
++// tapped suggestion (RCC.07 3.6.10.6.2): a reply with everything it came
++// with, an action with its displayText and postback. Empty for an action
++// without postback: then nothing goes back.
++QString responseJson(const QJsonObject &rawSuggestion);
++
++// The display text of a suggestion ("" when it has none).
++QString displayText(const QJsonObject &rawSuggestion);
++bool isReply(const QJsonObject &rawSuggestion);
++
++/*
++ * Chatbot information (RCC.07 3.6.4.1.3, R9 7.7.2) for the conversation:
++ *   name, icon, description, phoneNumber (R9 subNum or the callback number),
++ *   colour, a2p, inputDisabled (whether the user may not type, R9
++ *   userInputCtrlCd/a2pTypeCd, RCC.07 Disable_User_feedback), serviceId.
++ * R9 does not say where in the JSON its extra fields sit; they are looked
++ * up in botinfo, at the top and next to the PCC.
++ */
++QJsonObject botInfo(const QString &json);
++}
+diff --git a/lib/database/database.cpp b/lib/database/database.cpp
+index 6e7aa56..62b1867 100644
+--- a/lib/database/database.cpp
++++ b/lib/database/database.cpp
+@@ -75,7 +75,11 @@ QCoro::Task<std::vector<Message>> Database::messagesForNumber(const PhoneNumberL
+             expires,
+             size,
+             tapbacks,
+-            transport
++            transport,
++            richContentType,
++            richBody,
++            suggestions,
++            botId
+         FROM Messages
+     )");
+ 
+@@ -168,6 +172,13 @@ QCoro::Task<QVector<Chat>> Database::chats(const PhoneNumberList &phoneNumberLis
+             chat.lastSentByMe = message.sentByMe;
+             chat.lastAttachment = message.attachments;
+         }
++        const QString botId = co_await botIdForNumber(chat.phoneNumberList);
++        if (!botId.isEmpty()) {
++            const auto info = co_await botInfo(botId);
++            if (info) {
++                chat.botInfo = info->first;
++            }
++        }
+ 
+         chats.push_back(std::move(chat));
+     } else {
+@@ -231,6 +242,45 @@ QCoro::Task<> Database::updateMessageTransport(const QString &id, const QString
+     co_await m_database->execute(SL("UPDATE Messages SET transport = ? WHERE id == ?"), transport.isEmpty() ? QVariant() : transport, id);
+ }
+ 
++QCoro::Task<QString> Database::botIdForNumber(const PhoneNumberList &phoneNumberList) const
++{
++    const auto id = co_await m_database->getResult<SingleValue<QString>>(
++        SL("SELECT botId FROM Messages WHERE phoneNumber == ? AND botId IS NOT NULL AND botId != '' ORDER BY time DESC LIMIT 1"),
++        phoneNumberList.toString());
++    co_return id ? id->value : QString();
++}
++
++namespace
++{
++struct BotInfoRow {
++    using ColumnTypes = std::tuple<QString, qint64>;
++    static BotInfoRow fromSql(ColumnTypes tuple)
++    {
++        auto [info, updated] = tuple;
++        return BotInfoRow{info, updated};
++    }
++    QString info;
++    qint64 updated;
++};
++}
++
++QCoro::Task<std::optional<std::pair<QString, QDateTime>>> Database::botInfo(const QString &botId) const
++{
++    const auto row = co_await m_database->getResult<BotInfoRow>(SL("SELECT info, updated FROM BotInfo WHERE botId == ?"), botId);
++    if (!row) {
++        co_return std::nullopt;
++    }
++    co_return std::make_pair(row->info, QDateTime::fromMSecsSinceEpoch(row->updated));
++}
++
++QCoro::Task<> Database::setBotInfo(const QString &botId, const QString &info)
++{
++    co_await m_database->execute(SL("INSERT OR REPLACE INTO BotInfo (botId, info, updated) VALUES (?, ?, ?)"),
++                                 botId,
++                                 info,
++                                 QDateTime::currentMSecsSinceEpoch());
++}
++
+ QCoro::Task<> Database::markChatAsRead(const PhoneNumberList &phoneNumberList)
+ {
+     co_await m_database->execute(SL("UPDATE Messages SET read = True WHERE phoneNumber = ? AND NOT read == True"), phoneNumberList.toString());
+@@ -262,8 +312,12 @@ QCoro::Task<> Database::addMessage(const Message &message)
+             contentLocation,
+             expires,
+             size,
+-            transport)
+-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++            transport,
++            richContentType,
++            richBody,
++            suggestions,
++            botId)
++        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         )"),
+                                  message.id,
+                                  message.phoneNumberList.toString(),
+@@ -282,7 +336,11 @@ QCoro::Task<> Database::addMessage(const Message &message)
+                                  message.contentLocation,
+                                  message.expires.isNull() ? QVariant() : message.expires.toMSecsSinceEpoch(),
+                                  message.size,
+-                                 message.transport.isEmpty() ? QVariant() : message.transport);
++                                 message.transport.isEmpty() ? QVariant() : message.transport,
++                                 message.richContentType.isEmpty() ? QVariant() : message.richContentType,
++                                 message.richBody.isEmpty() ? QVariant() : message.richBody,
++                                 message.suggestions.isEmpty() ? QVariant() : message.suggestions,
++                                 message.botId.isEmpty() ? QVariant() : message.botId);
+ }
+ 
+ QCoro::Task<> Database::deleteMessage(const QString &id)
+@@ -554,7 +612,11 @@ Message Message::fromSql(ColumnTypes &&tuple)
+           expires,
+           size,
+           tapbacks,
+-          transport] = tuple;
++          transport,
++          richContentType,
++          richBody,
++          suggestions,
++          botId] = tuple;
+ 
+     Message message;
+     message.id = id, message.phoneNumberList = PhoneNumberList(phoneNumberList);
+@@ -575,5 +637,9 @@ Message Message::fromSql(ColumnTypes &&tuple)
+     message.size = size;
+     message.tapbacks = tapbacks;
+     message.transport = transport;
++    message.richContentType = richContentType;
++    message.richBody = richBody;
++    message.suggestions = suggestions;
++    message.botId = botId;
+     return message;
+ }
+diff --git a/lib/database/database.h b/lib/database/database.h
+index 2f38c03..88fe179 100644
+--- a/lib/database/database.h
++++ b/lib/database/database.h
+@@ -46,7 +46,7 @@ Q_DECLARE_METATYPE(StringMapList)
+ 
+ struct Message {
+     using ColumnTypes =
+-        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString, QString>;
++        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString, QString, QString, QString, QString, QString>;
+ 
+     static Message fromSql(ColumnTypes &&tuple);
+ 
+@@ -72,6 +72,14 @@ struct Message {
+     // RCS chat through IMSroha (codes.noa.IMSroha.Rcs). For RCS, messageId is
+     // the imdn.Message-ID.
+     QString transport;
++    // An RCS chatbot message (IMSroha's RichMessageReceived): the content
++    // type and body as received, its botsuggestion chip list and the
++    // chatbot's service ID; text is its readable summary. For a suggested
++    // reply we sent, richContentType is the botsuggestion.response type.
++    QString richContentType;
++    QString richBody;
++    QString suggestions;
++    QString botId;
+ 
+     Message() = default;
+ 
+@@ -96,6 +104,10 @@ struct Message {
+         size = map[SL("size")].toInt();
+         tapbacks = map[SL("tapbacks")];
+         transport = map[SL("transport")];
++        richContentType = map[SL("richContentType")];
++        richBody = map[SL("richBody")];
++        suggestions = map[SL("suggestions")];
++        botId = map[SL("botId")];
+     }
+ 
+     StringMap toMap() const
+@@ -120,6 +132,10 @@ struct Message {
+             {SL("size"), QString::number(size)},
+             {SL("tapbacks"), tapbacks},
+             {SL("transport"), transport},
++            {SL("richContentType"), richContentType},
++            {SL("richBody"), richBody},
++            {SL("suggestions"), suggestions},
++            {SL("botId"), botId},
+         };
+     }
+ };
+@@ -132,6 +148,8 @@ struct Chat {
+     QDateTime lastDateTime;
+     bool lastSentByMe = false;
+     QString lastAttachment;
++    // RCS chatbot information (botinfo JSON) for a chatbot's conversation
++    QString botInfo;
+ 
+     Chat() = default;
+ 
+@@ -143,6 +161,7 @@ struct Chat {
+         lastDateTime = QDateTime::fromString(map[SL("lastDateTime")]);
+         lastSentByMe = QVariant{map[SL("lastSentByMe")]}.toBool();
+         lastAttachment = map[SL("lastAttachment")];
++        botInfo = map[SL("botInfo")];
+     }
+ 
+     StringMap toMap() const
+@@ -152,7 +171,8 @@ struct Chat {
+                 {SL("lastMessage"), lastMessage},
+                 {SL("lastDateTime"), lastDateTime.toString()},
+                 {SL("lastSentByMe"), QString::number(lastSentByMe)},
+-                {SL("lastAttachment"), lastAttachment}};
++                {SL("lastAttachment"), lastAttachment},
++                {SL("botInfo"), botInfo}};
+     }
+ };
+ 
+@@ -182,6 +202,11 @@ public:
+     QCoro::Task<std::optional<QString>> idForMessageId(const QString &messageId);
+     QCoro::Task<QStringList> unreadRcsMessageIds(const PhoneNumberList &phoneNumberList);
+     QCoro::Task<> updateMessageTransport(const QString &id, const QString &transport);
++    // RCS chatbots: the service ID a conversation last heard from, and the
++    // chatbot information kept for it (with when it was fetched).
++    QCoro::Task<QString> botIdForNumber(const PhoneNumberList &phoneNumberList) const;
++    QCoro::Task<std::optional<std::pair<QString, QDateTime>>> botInfo(const QString &botId) const;
++    QCoro::Task<> setBotInfo(const QString &botId, const QString &info);
+ 
+     // Chats
+     QCoro::Task<QVector<Chat>> chats(const PhoneNumberList &phoneNumberList) const;
+diff --git a/lib/database/migrations.qrc b/lib/database/migrations.qrc
+index 8f4de05..4a703f5 100644
+--- a/lib/database/migrations.qrc
++++ b/lib/database/migrations.qrc
+@@ -4,5 +4,7 @@
+         <file>migrations/2023-05-07-102621_init/up.sql</file>
+         <file>migrations/2026-11-11-000000_transport/down.sql</file>
+         <file>migrations/2026-11-11-000000_transport/up.sql</file>
++        <file>migrations/2026-11-12-000000_chatbot/down.sql</file>
++        <file>migrations/2026-11-12-000000_chatbot/up.sql</file>
+     </qresource>
+ </RCC>
+diff --git a/lib/database/migrations/2026-11-12-000000_chatbot/down.sql b/lib/database/migrations/2026-11-12-000000_chatbot/down.sql
+new file mode 100644
+index 0000000..deb76a2
+--- /dev/null
++++ b/lib/database/migrations/2026-11-12-000000_chatbot/down.sql
+@@ -0,0 +1,7 @@
++-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++DROP TABLE BotInfo;
++ALTER TABLE Messages DROP COLUMN botId;
++ALTER TABLE Messages DROP COLUMN suggestions;
++ALTER TABLE Messages DROP COLUMN richBody;
++ALTER TABLE Messages DROP COLUMN richContentType;
+diff --git a/lib/database/migrations/2026-11-12-000000_chatbot/up.sql b/lib/database/migrations/2026-11-12-000000_chatbot/up.sql
+new file mode 100644
+index 0000000..05eeab2
+--- /dev/null
++++ b/lib/database/migrations/2026-11-12-000000_chatbot/up.sql
+@@ -0,0 +1,13 @@
++-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++-- RCS chatbot messages through IMSroha: the message as received (content
++-- type and body, the botsuggestion chip list) and the chatbot it came from.
++-- text holds its readable summary. NULL for everything else.
++ALTER TABLE Messages ADD COLUMN richContentType TEXT;
++ALTER TABLE Messages ADD COLUMN richBody TEXT;
++ALTER TABLE Messages ADD COLUMN suggestions TEXT;
++ALTER TABLE Messages ADD COLUMN botId TEXT;
++
++-- Chatbot information (RCC.07 botinfo) by service ID, as IMSroha's
++-- GetBotInfo returned it, updated in milliseconds since the epoch.
++CREATE TABLE BotInfo (botId TEXT PRIMARY KEY NOT NULL, info TEXT NOT NULL, updated INTEGER NOT NULL);
+-- 
+2.56.0
+

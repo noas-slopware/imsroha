@@ -1,0 +1,1733 @@
+From 916957313d58842bd1204cd1d6b96306a38691f7 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 23:26:18 +0900
+Subject: [PATCH 11/11] app: show RCS chatbot messages, their suggestions and
+ the bot
+
+A chatbot message in the conversation: R9's header and footer outside the
+card (7.7.4.3, with 7.7.4.13's verified mark), a rich card vertical or
+horizontal with its media, title, description and buttons, a carousel
+swiped sideways, and R9's open rich card from its own widget tree
+(LinearLayout with weights, TextView, ImageView, Button, View; dp taken as
+a logical pixel). The chip list sits under the newest message. A text with
+suggestions, an unknown type or a broken body shows the stored summary in
+the usual bubble, with the chips.
+
+Pictures (media, thumbnails, open rich card images, the bot's icon) are
+fetched over HTTP(S) through the QML engine's network access into the
+conversation's attachment folder (rbm/, by URL hash, up to 10 MB) and
+decoded for the screen's pixels as in 0008. Video, audio and R9's iframe
+play show their thumbnail and open the media outside.
+
+Tapping a suggested reply shows it as a sent message and answers the bot.
+Actions: open a URL (also R9's local browser and deep link, in the
+browser), dial, a map (geo:, or the fallback URL), a calendar event (an
+.ics for the calendar), a draft (into this conversation's input, or copied
+for another), copy (RCC.07 copyAction, R9 clipboardAction) and R9's share
+(copied: there is no share service here); the bot hears of each one that
+was done. Location push, device specifics, settings and recordings say
+Spacebar cannot do them.
+
+The bot's name titles the conversation and the list, its icon is the
+avatar, its description heads the chat (R9 subTitle, subImage,
+subDescription), its number is the one Call dials; where R9 says the user
+may not type (userInputCtrlCd, a one-way A2P sender), the input is off.
+A card is copied only when it allows it (R9 7.7.4.4).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L5scTQJJDo2PTt6GBeDFah
+---
+ CMakeLists.txt                     |   2 +-
+ src/CMakeLists.txt                 |   3 +
+ src/chatlistmodel.cpp              |  14 ++
+ src/chatlistmodel.h                |   3 +-
+ src/contents/ui/ChatsPage.qml      |  21 ++-
+ src/contents/ui/MessagesPage.qml   | 173 +++++++++++++++++--
+ src/contents/ui/OpenRichNode.qml   | 262 +++++++++++++++++++++++++++++
+ src/contents/ui/RichCard.qml       | 141 ++++++++++++++++
+ src/contents/ui/RichImage.qml      | 105 ++++++++++++
+ src/contents/ui/RichMessage.qml    | 193 +++++++++++++++++++++
+ src/contents/ui/RichSuggestion.qml |  89 ++++++++++
+ src/main.cpp                       |   5 +
+ src/messagemodel.cpp               | 113 ++++++++++++-
+ src/messagemodel.h                 |  23 ++-
+ src/resources.qrc                  |   5 +
+ src/richmedia.cpp                  |  94 +++++++++++
+ src/richmedia.h                    |  43 +++++
+ 17 files changed, 1271 insertions(+), 18 deletions(-)
+ create mode 100644 src/contents/ui/OpenRichNode.qml
+ create mode 100644 src/contents/ui/RichCard.qml
+ create mode 100644 src/contents/ui/RichImage.qml
+ create mode 100644 src/contents/ui/RichMessage.qml
+ create mode 100644 src/contents/ui/RichSuggestion.qml
+ create mode 100644 src/richmedia.cpp
+ create mode 100644 src/richmedia.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4057e95..dd9df4c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -40,7 +40,7 @@ ecm_setup_version(${PROJECT_VERSION}
+ )
+ 
+ ################# Find dependencies #################
+-find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Concurrent Gui Qml Quick QuickControls2 Widgets Sql)
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Concurrent Gui Network Qml Quick QuickControls2 Widgets Sql)
+ find_package(KF6 ${KF6_MIN_VERSION} REQUIRED COMPONENTS Kirigami I18n Contacts People Notifications Config CoreAddons DBusAddons ModemManagerQt KIO WindowSystem Crash)
+ find_package(KF6KirigamiAddons 1.4 REQUIRED)
+ find_package(PhoneNumber COMPONENTS PhoneNumber REQUIRED)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 80501e7..bdd2ca3 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(spacebar_SRCS
+     main.cpp
+     chatlistmodel.cpp
+     messagemodel.cpp
++    richmedia.cpp
+     utils.cpp
+     channelhandler.cpp
+ )
+@@ -23,6 +24,7 @@ target_compile_definitions(spacebar PRIVATE -DQT_NO_CAST_FROM_ASCII)
+ target_link_libraries(spacebar PRIVATE
+     Qt6::Core
+     Qt6::Gui
++    Qt6::Network
+     Qt6::Qml
+     Qt6::Quick
+     Qt6::QuickControls2
+@@ -40,6 +42,7 @@ target_link_libraries(spacebar PRIVATE
+     KF6::WindowSystem
+     KF6::Crash
+     database
++    chatbot
+     kTelephonySupport
+     macros
+     config
+diff --git a/src/chatlistmodel.cpp b/src/chatlistmodel.cpp
+index c3a9840..d43d3e6 100644
+--- a/src/chatlistmodel.cpp
++++ b/src/chatlistmodel.cpp
+@@ -22,6 +22,7 @@
+ #include "utils.h"
+ #include <database.h>
+ #include <global.h>
++#include <richmessage.h>
+ 
+ ChatListModel::ChatListModel(ChannelHandler &handler, QObject *parent)
+     : QAbstractListModel(parent)
+@@ -43,6 +44,11 @@ ChatListModel::ChatListModel(ChannelHandler &handler, QObject *parent)
+         }
+     });
+ 
++    // RCS chatbots: a name or icon that arrived for a conversation
++    connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::botInfoChanged, this, [this](const QString &numbers, const QString &) {
++        fetchChatDetails(PhoneNumberList(numbers));
++    });
++
+     fetchChats(PhoneNumberList(SL("")));
+ 
+     Q_EMIT m_handler.interface()->disableNotificationsForNumber(QString());
+@@ -65,6 +71,7 @@ QHash<int, QByteArray> ChatListModel::roleNames() const
+         {Role::LastAttachmentRole, BL("lastAttachment")},
+         {Role::LastContactedRole, BL("lastContacted")},
+         {Role::IsContactRole, BL("isContact")},
++        {Role::BotIconRole, BL("botIcon")},
+     };
+ }
+ 
+@@ -85,6 +92,10 @@ QVariant ChatListModel::data(const QModelIndex &index, int role) const
+                 names.append(SL(", "));
+             }
+             QString name = KPeople::PersonData(m_mapper.uriForNumber(number)).name();
++            if (name.isEmpty() && phoneNumberList.count() == 1 && !m_chats.at(index.row()).botInfo.isEmpty()) {
++                // an RCS chatbot (R9 7.7.2 subTitle, or its service name)
++                name = RichMessage::botInfo(m_chats.at(index.row()).botInfo).value(u"name").toString();
++            }
+             if (name.isEmpty()) {
+                 name = number.toInternational();
+             } else if (phoneNumberList.count() >= 2) {
+@@ -125,6 +136,8 @@ QVariant ChatListModel::data(const QModelIndex &index, int role) const
+     }
+     case IsContactRole:
+         return phoneNumberList.size() == 1 && !KPeople::PersonData(m_mapper.uriForNumber(phoneNumberList.first())).name().isEmpty();
++    case BotIconRole:
++        return m_chats.at(index.row()).botInfo.isEmpty() ? QString() : RichMessage::botInfo(m_chats.at(index.row()).botInfo).value(u"icon").toString();
+     }
+ 
+     return {};
+@@ -232,6 +245,7 @@ void ChatListModel::fetchChatDetailsInternal(const PhoneNumberList &phoneNumberL
+             chat->lastDateTime = chats.first().lastDateTime;
+             chat->lastSentByMe = chats.first().lastSentByMe;
+             chat->lastAttachment = chats.first().lastAttachment;
++            chat->botInfo = chats.first().botInfo;
+ 
+             Q_EMIT dataChanged(index(idx), index(idx));
+         }
+diff --git a/src/chatlistmodel.h b/src/chatlistmodel.h
+index 992554c..2a21a25 100644
+--- a/src/chatlistmodel.h
++++ b/src/chatlistmodel.h
+@@ -35,7 +35,8 @@ public:
+         LastSentByMeRole,
+         LastAttachmentRole,
+         LastContactedRole,
+-        IsContactRole
++        IsContactRole,
++        BotIconRole
+     };
+     Q_ENUM(Role)
+ 
+diff --git a/src/contents/ui/ChatsPage.qml b/src/contents/ui/ChatsPage.qml
+index 15fcf5f..39eae57 100644
+--- a/src/contents/ui/ChatsPage.qml
++++ b/src/contents/ui/ChatsPage.qml
+@@ -127,6 +127,23 @@ Kirigami.ScrollablePage {
+             required property var lastAttachment
+             required property string lastContacted
+             required property bool isContact
++            // RCS chatbot: its icon (R9 subImage or the botinfo icon), fetched once
++            required property string botIcon
++            property string botIconFile: ""
++            function fetchBotIcon() {
++                // phoneNumberList may not be set yet while the delegate is made
++                botIconFile = botIcon && phoneNumberList ? RichMedia.localFile(botIcon, ChatListModel.attachmentsFolder(phoneNumberList)) : ""
++            }
++            onBotIconChanged: fetchBotIcon()
++            Component.onCompleted: fetchBotIcon()
++            Connections {
++                target: RichMedia
++                function onFetched(url, localUrl) {
++                    if (url === delegateRoot.botIcon) {
++                        delegateRoot.botIconFile = localUrl
++                    }
++                }
++            }
+ 
+             property var attachments: lastAttachment ? JSON.parse(lastAttachment) : []
+             property var image: attachments.find(o => o.mimeType.indexOf("image/") >= 0)
+@@ -145,10 +162,10 @@ Kirigami.ScrollablePage {
+                             Layout.rightMargin: Kirigami.Units.largeSpacing
+                             Layout.topMargin: Kirigami.Units.largeSpacing
+                             Layout.bottomMargin: Kirigami.Units.largeSpacing
+-                            source: isContact ? "image://avatar/" + Utils.phoneNumberListToString(delegateRoot.phoneNumberList) : ""
++                            source: isContact ? "image://avatar/" + Utils.phoneNumberListToString(delegateRoot.phoneNumberList) : delegateRoot.botIconFile
+                             name: delegateRoot.displayName
+                             imageMode: Components.Avatar.ImageMode.AdaptiveImageOrInitals
+-                            initialsMode: isContact ? Components.Avatar.InitialsMode.UseInitials : Components.Avatar.InitialsMode.UseIcon
++                            initialsMode: isContact || delegateRoot.botIconFile ? Components.Avatar.InitialsMode.UseInitials : Components.Avatar.InitialsMode.UseIcon
+ 
+                             Rectangle {
+                                 anchors.fill: parent
+diff --git a/src/contents/ui/MessagesPage.qml b/src/contents/ui/MessagesPage.qml
+index b1c7a00..1e380a4 100644
+--- a/src/contents/ui/MessagesPage.qml
++++ b/src/contents/ui/MessagesPage.qml
+@@ -29,6 +29,77 @@ Kirigami.ScrollablePage {
+     property ListModel files: ListModel {}
+     property var tapbackKeys: ["♥️", "👍" , "👎", "😂", "‼️", "❓"]
+     property real lastHeight: applicationWindow().height
++    // RCS chatbots: the bot's name, icon and description, and whether the
++    // user may type here (R9 7.7.2)
++    property var botInfo: messageModel ? messageModel.botInfo : ({})
++
++    Connections {
++        target: messageModel
++        function onBotInfoChanged() {
++            if (people.length === 1 && !people[0].name && botInfo.name) {
++                title = botInfo.name
++            }
++        }
++    }
++
++    // A tapped suggestion of a chatbot message: do what it says, then tell
++    // the bot (RCC.07 3.6.10.6.2). What Spacebar cannot do goes nowhere.
++    function runSuggestion(id, s) {
++        const notify = text => applicationWindow().showPassiveNotification(text)
++        const open = url => !!url && Qt.openUrlExternally(url)
++        let done = true
++        switch (s.action) {
++        case "reply":
++            break
++        case "url":
++        case "localBrowser": // R9's in-app browser: the browser, without its result
++        case "deeplink":
++            done = open(s.url)
++            break
++        case "dial":
++            done = open(s.phoneNumber ? "tel:" + s.phoneNumber : "") || open(s.fallbackUrl)
++            break
++        case "map": {
++            const geo = s.latitude !== undefined
++                ? "geo:" + s.latitude + "," + s.longitude + (s.label ? "?q=" + s.latitude + "," + s.longitude + "(" + encodeURIComponent(s.label) + ")" : "")
++                : "geo:0,0?q=" + encodeURIComponent(s.query || "")
++            done = open(geo) || open(s.fallbackUrl)
++            break
++        }
++        case "calendar":
++            done = open(messageModel.calendarFile(s)) || open(s.fallbackUrl)
++            break
++        case "compose":
++            if (!s.phoneNumber || (people.length === 1 && Utils.phoneNumberToInternationalString(Utils.phoneNumber(s.phoneNumber)) === people[0].phoneNumber)) {
++                textarea.text = s.text || ""
++            } else {
++                Utils.copyTextToClipboard(s.text || "")
++                ChatListModel.startChat(Utils.phoneNumberList([s.phoneNumber]))
++                notify(i18nc("@info a chatbot's draft message", "The draft was copied to the clipboard"))
++            }
++            break
++        case "copy":
++            Utils.copyTextToClipboard(s.text || "")
++            notify(i18nc("@info", "Copied to the clipboard"))
++            break
++        case "share":
++            // no share service here: the text goes to the clipboard to paste
++            Utils.copyTextToClipboard(s.text || "")
++            notify(i18nc("@info a chatbot's text to share", "Copied to the clipboard, to share"))
++            break
++        default:
++            // location push, device specifics, settings, recordings
++            notify(i18nc("@info a chatbot's suggested action", "Spacebar cannot do this"))
++            done = false
++        }
++        if (!done && s.action !== "reply") {
++            if (s.action === "url" || s.action === "dial" || s.action === "map" || s.action === "calendar" || s.action === "localBrowser" || s.action === "deeplink") {
++                notify(i18nc("@info", "No application can open this"))
++            }
++            return
++        }
++        messageModel.sendSuggestion(id, s.raw)
++    }
+ 
+     Connections {
+         target: pageStack
+@@ -57,7 +128,7 @@ Kirigami.ScrollablePage {
+                 title += name
+             }
+         } else if (people.length === 1) {
+-            title = people[0].name || people[0].phoneNumber
++            title = people[0].name || botInfo.name || people[0].phoneNumber
+         } else {
+             title = i18n("New message")
+         }
+@@ -123,10 +194,11 @@ Kirigami.ScrollablePage {
+     actions: [
+         Kirigami.Action {
+             displayHint: Kirigami.DisplayHint.IconOnly
+-            visible: people.length === 1
++            // a chatbot by SIP URI only by the number its information gives
++            visible: people.length === 1 && (!people[0].phoneNumber.startsWith("sip:") || !!botInfo.phoneNumber)
+             icon.name: "call-start"
+             text: i18n("Call")
+-            onTriggered: Qt.openUrlExternally("tel:" + people[0].phoneNumber)
++            onTriggered: Qt.openUrlExternally("tel:" + (people[0].phoneNumber.startsWith("sip:") ? botInfo.phoneNumber : people[0].phoneNumber))
+         },
+         Kirigami.Action {
+             displayHint: Kirigami.DisplayHint.IconOnly
+@@ -137,6 +209,40 @@ Kirigami.ScrollablePage {
+     ]
+ 
+     header: ColumnLayout {
++        // RCS chatbot: who it is (R9 7.7.2 subDescription)
++        RowLayout {
++            visible: !!botInfo.description
++            Layout.fillWidth: true
++            Layout.margins: Kirigami.Units.largeSpacing
++            spacing: Kirigami.Units.largeSpacing
++
++            RichImage {
++                visible: !!botInfo.icon
++                Layout.preferredWidth: Kirigami.Units.iconSizes.medium
++                Layout.preferredHeight: Kirigami.Units.iconSizes.medium
++                fixedHeight: Kirigami.Units.iconSizes.medium
++                url: botInfo.icon || ""
++                folder: attachmentsFolder
++                layer.enabled: true
++                layer.effect: OpacityMask {
++                    maskSource: Rectangle {
++                        width: Kirigami.Units.iconSizes.medium
++                        height: width
++                        radius: width / 2
++                    }
++                }
++            }
++            Controls.Label {
++                Layout.fillWidth: true
++                text: botInfo.description || ""
++                wrapMode: Text.Wrap
++                maximumLineCount: 3
++                elide: Text.ElideRight
++                font: Kirigami.Theme.smallFont
++                color: Kirigami.Theme.disabledTextColor
++            }
++        }
++
+         Kirigami.InlineMessage {
+             id: noDaemonError
+             Layout.fillWidth: true
+@@ -333,17 +439,18 @@ Kirigami.ScrollablePage {
+                 anchors.left: model.sentByMe ? undefined : parent.left
+                 anchors.right: model.sentByMe ? parent.right : undefined
+ 
+-                property int padding: Kirigami.Units.largeSpacing * 2
++                property int padding: content.richRendered ? 0 : Kirigami.Units.largeSpacing * 2
+                 property var tapbacks: model.tapbacks ? JSON.parse(model.tapbacks) : ""
+ 
+                 radius: Kirigami.Units.gridUnit
+                 corners.bottomRightRadius: model.sentByMe ? 0 : -1
+                 corners.topLeftRadius: model.sentByMe ? -1 : 0
+                 shadow.size: Kirigami.Units.smallSpacing
+-                shadow.color: !model.isHighlighted ? Qt.rgba(0.0, 0.0, 0.0, 0.10) : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.10)
+-                border.color: Kirigami.ColorUtils.tintWithAlpha(color, Kirigami.Theme.textColor, 0.15)
++                border.color: content.richRendered ? "transparent" : Kirigami.ColorUtils.tintWithAlpha(color, Kirigami.Theme.textColor, 0.15)
+                 border.width: 1
+-                color: model.sentByMe ? listView.outgoingColor : listView.incomingColor
++                // a chatbot's card is its own bubble
++                color: content.richRendered ? "transparent" : model.sentByMe ? listView.outgoingColor : listView.incomingColor
++                shadow.color: content.richRendered ? "transparent" : !model.isHighlighted ? Qt.rgba(0.0, 0.0, 0.0, 0.10) : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.10)
+                 height: content.height + padding
+                 width: content.width + padding * 1.5
+ 
+@@ -361,7 +468,8 @@ Kirigami.ScrollablePage {
+                     onPressAndHold: {
+                         menu.index = model.index
+                         menu.id = model.id
+-                        menu.text = model.text
++                        // R9 7.7.4.4: a card is copied only when it allows it
++                        menu.text = content.richRendered ? (model.rich.copyAllowed ? model.rich.copyText : "") : model.text
+                         menu.attachments = content.attachments
+                         menu.smil = model.smil
+                         menu.resend = model.sentByMe && model.deliveryState == MessageModel.Failed
+@@ -396,6 +504,8 @@ Kirigami.ScrollablePage {
+                     property color textColor: model.sentByMe ? listView.outgoingTextColor : listView.incomingTextColor
+                     property var attachments: model.attachments ? JSON.parse(model.attachments) : []
+                     property bool clipped: false
++                    // RCS chatbot message shown as its card, carousel or open rich card
++                    readonly property bool richRendered: !!model.rich && (model.rich.kind === "card" || model.rich.kind === "carousel" || model.rich.kind === "openrichcard")
+ 
+                     Component.onCompleted: {
+                         if (attachments.length === 1 && attachments[0].mimeType.indexOf("image/") >= 0) {
+@@ -409,10 +519,10 @@ Kirigami.ScrollablePage {
+                         }
+                     }
+ 
+-                    // message contents
++                    // message contents (for a chatbot card its summary, shown when the card is not)
+                     Controls.Label {
+                         id: modelText
+-                        visible: !!model.text
++                        visible: !!model.text && !content.richRendered
+                         Layout.alignment: model.text && model.text.length > 1 ? Qt.AlignTop : Qt.AlignHCenter
+                         Layout.minimumWidth: Kirigami.Units.gridUnit / 5
+                         Layout.maximumWidth: Math.round(delegateParent.width * 0.7)
+@@ -427,6 +537,40 @@ Kirigami.ScrollablePage {
+                         onLinkActivated: Qt.openUrlExternally(link)
+                     }
+ 
++                    // RCS chatbot message: cards, header, footer, suggestions
++                    Loader {
++                        active: !!model.rich && !!model.rich.kind
++                        visible: active
++                        sourceComponent: Component {
++                            RichMessage {
++                                rich: model.rich
++                                folder: attachmentsFolder
++                                // room for the time on the side, as for the other bubbles
++                                cardWidth: Math.round(Math.min(delegateParent.width * 0.7, Kirigami.Units.gridUnit * 18))
++                                carouselWidth: Math.max(cardWidth, Math.round(delegateParent.width - Kirigami.Units.gridUnit * 6))
++                                cardColor: listView.incomingColor
++                                textColor: listView.incomingTextColor
++                                pointSize: msgPage.pointSize
++                                // the chip list stays while the message is the newest
++                                showChips: model.index === listView.count - 1
++                                onSuggestionTriggered: suggestion => msgPage.runSuggestion(model.id, suggestion)
++                                onMediaClicked: (media, localUrl) => {
++                                    if (media.click) {
++                                        msgPage.runSuggestion(model.id, media.click)
++                                    } else if (media.playable && media.mediaUrl) {
++                                        Qt.openUrlExternally(media.mediaUrl)
++                                    } else if (localUrl) {
++                                        pageStack.layers.push("qrc:/PreviewPage.qml", {
++                                            filePath: localUrl,
++                                            type: media.mediaContentType || "image/png"
++                                        })
++                                    }
++                                }
++                                onPressAndHold: rectMouse.pressAndHold(null)
++                            }
++                        }
++                    }
++
+                     // download message contents
+                     RowLayout {
+                         visible: model.pendingDownload
+@@ -1132,6 +1276,7 @@ Kirigami.ScrollablePage {
+                 icon.height: Kirigami.Units.iconSizes.smallMedium
+                 flat: true
+                 hoverEnabled: false
++                enabled: !botInfo.inputDisabled
+                 onPressed: fileDialog.open()
+             }
+ 
+@@ -1140,8 +1285,12 @@ Kirigami.ScrollablePage {
+                 Layout.fillWidth: true
+                 Layout.minimumHeight: sendButton.height + Kirigami.Units.smallSpacing * 2
+                 verticalAlignment: TextEdit.AlignVCenter
++                // R9 7.7.2: a sender that does not take replies
++                enabled: !botInfo.inputDisabled
+                 placeholderText: {
+-                    if (!sendingNumber) {
++                    if (botInfo.inputDisabled) {
++                        return i18nc("@info:placeholder an RCS business sender", "This sender does not take replies")
++                    } else if (!sendingNumber) {
+                         return i18n("Write Message...")
+                     } else {
+                         return i18nc("%1 is a phone number", "Send Message from %1...", sendingNumber)
+@@ -1182,7 +1331,7 @@ Kirigami.ScrollablePage {
+                 icon.width: Kirigami.Units.iconSizes.smallMedium
+                 icon.height: Kirigami.Units.iconSizes.smallMedium
+                 hoverEnabled: false
+-                enabled: people.length > 0 && (textarea.length > 0 || files.count > 0) && !maxAttachmentsError.visible
++                enabled: people.length > 0 && (textarea.length > 0 || files.count > 0) && !maxAttachmentsError.visible && !botInfo.inputDisabled
+                 onPressed: sendAction.trigger()
+ 
+                 Controls.Label {
+diff --git a/src/contents/ui/OpenRichNode.qml b/src/contents/ui/OpenRichNode.qml
+new file mode 100644
+index 0000000..8d64aac
+--- /dev/null
++++ b/src/contents/ui/OpenRichNode.qml
+@@ -0,0 +1,262 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as Controls
++
++import org.kde.kirigami as Kirigami
++
++// One widget of an R9 open rich card (TTAK.KO-06.0410/R9 7.7.4.14):
++// LinearLayout, TextView, ImageView, Button or View, and its children.
++// dp is taken as a logical pixel.
++Item {
++    id: node
++
++    // the widget as RichMessage::parse() left it (clicks normalised)
++    property var widget: ({})
++    property string folder
++    property color textColor: Kirigami.Theme.textColor
++    // the width "match" takes
++    property real availableWidth: 0
++    property bool isRoot: false
++
++    signal suggestionTriggered(var suggestion)
++    signal imageClicked(string localUrl, var widget)
++
++    readonly property string type: widget.widget || ""
++
++    function dp(value, fallback) {
++        if (typeof value === "number") {
++            return value
++        }
++        const m = /^\s*(-?[0-9.]+)\s*(dp)?\s*$/.exec(value || "")
++        return m ? parseFloat(m[1]) : fallback
++    }
++    function side(name) {
++        // "padding"/"margin" set: the sides are ignored (R9 table 7-9)
++        const all = dp(widget[name], NaN)
++        if (!isNaN(all)) {
++            return { top: all, bottom: all, left: all, right: all }
++        }
++        return {
++            top: dp(widget[name + "Top"], 0),
++            bottom: dp(widget[name + "Bottom"], 0),
++            left: dp(widget[name + "Left"], dp(widget[name + "Start"], 0)),
++            right: dp(widget[name + "Right"], dp(widget[name + "End"], 0))
++        }
++    }
++    function colour(value, fallback) {
++        // #RRGGBB or #AARRGGBB; "bot_color" would be the bot's colour
++        return /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value || "") ? value : fallback
++    }
++
++    readonly property var margin: side("margin")
++    readonly property var padding: side("padding")
++    readonly property real horizontalExtra: margin.left + margin.right + padding.left + padding.right
++    readonly property real verticalExtra: margin.top + margin.bottom + padding.top + padding.bottom
++    // the root's width is always "match"
++    readonly property string widthSpec: isRoot ? "match" : String(widget.width || "content")
++    readonly property real fixedWidth: dp(widthSpec, NaN)
++    readonly property real fixedHeight: dp(widget.height, NaN)
++    readonly property real contentWidth: widthSpec === "match" ? Math.max(0, availableWidth - horizontalExtra)
++                                       : !isNaN(fixedWidth) ? fixedWidth
++                                       : Math.min(inner.item ? (inner.item as Item).implicitWidth : 0, Math.max(0, availableWidth - horizontalExtra))
++
++    visible: widget.visibility !== "gone"
++    opacity: widget.visibility === "invisible" ? 0 : 1
++
++    implicitWidth: contentWidth + horizontalExtra
++    implicitHeight: (!isNaN(fixedHeight) ? fixedHeight : (inner.item ? (inner.item as Item).implicitHeight : 0)) + verticalExtra
++
++    Rectangle {
++        id: frame
++        x: node.margin.left
++        y: node.margin.top
++        width: Math.max(0, node.width - node.margin.left - node.margin.right)
++        height: Math.max(0, node.height - node.margin.top - node.margin.bottom)
++        color: node.colour(node.widget.background, "transparent")
++        radius: node.dp(node.widget.corner_radius, node.dp(node.widget.corner_radious, 0))
++        clip: node.type === "ImageView"
++
++        Loader {
++            id: inner
++            x: node.padding.left
++            y: node.padding.top
++            width: Math.max(0, parent.width - node.padding.left - node.padding.right)
++            height: Math.max(0, parent.height - node.padding.top - node.padding.bottom)
++            sourceComponent: {
++                switch (node.type) {
++                case "LinearLayout":
++                    return linear
++                case "TextView":
++                    return textView
++                case "Button":
++                    return button
++                case "ImageView":
++                    return imageView
++                default:
++                    return null // View: a gap or a line, its background is all
++                }
++            }
++        }
++    }
++
++    // a click on any widget but a Button, which takes it itself
++    MouseArea {
++        anchors.fill: parent
++        enabled: !!node.widget.click && node.type !== "Button" && node.type !== "ImageView"
++        onClicked: node.suggestionTriggered(node.widget.click)
++    }
++
++    // R9: weight shares what the other children left; in a vertical layout
++    // the height is then ignored, in a horizontal one the width
++    component Child: Loader {
++        required property var modelData
++        required property bool vertical
++        readonly property real weight: Number(modelData.weight) || 0
++        source: "qrc:/OpenRichNode.qml"
++        Layout.fillWidth: vertical || weight > 0 || String(modelData.width) === "match"
++        Layout.horizontalStretchFactor: !vertical && weight > 0 ? Math.round(weight * 100) : -1
++        Layout.preferredWidth: !vertical && weight > 0 ? 0 : -1
++        Layout.alignment: vertical ? Qt.AlignLeft | Qt.AlignTop : Qt.AlignVCenter
++        onLoaded: {
++            const child = item as OpenRichNode
++            child.widget = Qt.binding(() => modelData)
++            child.folder = Qt.binding(() => node.folder)
++            child.textColor = Qt.binding(() => node.textColor)
++            // a child's "match" is this layout's width
++            child.availableWidth = Qt.binding(() => inner.width)
++            child.suggestionTriggered.connect(node.suggestionTriggered)
++            child.imageClicked.connect(node.imageClicked)
++        }
++    }
++
++    Component {
++        id: linear
++
++        Loader {
++            sourceComponent: node.widget.orientation === "horizontal" ? row : column
++        }
++    }
++
++    Component {
++        id: column
++
++        ColumnLayout {
++            spacing: 0
++            Repeater {
++                model: node.widget.children || []
++                Child {
++                    vertical: true
++                }
++            }
++        }
++    }
++
++    Component {
++        id: row
++
++        RowLayout {
++            spacing: 0
++            Repeater {
++                model: node.widget.children || []
++                Child {
++                    vertical: false
++                }
++            }
++        }
++    }
++
++    Component {
++        id: textView
++
++        Controls.Label {
++            id: label
++            property bool expanded: false
++            // R9 7.7.4.14.6 viewAll: the first lines, and all of it on a tap
++            readonly property int viewAll: parseInt(node.widget.viewAll) || 0
++            text: node.widget.text || ""
++            wrapMode: Text.Wrap
++            maximumLineCount: viewAll > 0 && !expanded ? viewAll : undefined
++            elide: viewAll > 0 && !expanded ? Text.ElideRight : Text.ElideNone
++            color: node.colour(node.widget.textColor, node.textColor)
++            font.pixelSize: node.dp(node.widget.textSize, Kirigami.Theme.defaultFont.pixelSize > 0 ? Kirigami.Theme.defaultFont.pixelSize : 14)
++            font.weight: String(node.widget.textStyle || "").indexOf("bold") >= 0 ? Font.Bold : Font.Normal
++            font.italic: String(node.widget.textStyle || "").indexOf("italic") >= 0
++            horizontalAlignment: {
++                const a = String(node.widget.textAlignment || node.widget.gravity || "")
++                return a.indexOf("center") >= 0 ? Text.AlignHCenter
++                     : (a.indexOf("textEnd") >= 0 || a.indexOf("viewEnd") >= 0 || a.indexOf("end") >= 0 || a.indexOf("right") >= 0) ? Text.AlignRight
++                     : Text.AlignLeft
++            }
++            MouseArea {
++                anchors.fill: parent
++                enabled: label.viewAll > 0 && (label.truncated || label.expanded) && !node.widget.click
++                onClicked: label.expanded = !label.expanded
++            }
++        }
++    }
++
++    Component {
++        id: button
++
++        Controls.AbstractButton {
++            id: control
++            text: node.widget.text || ""
++            implicitWidth: buttonLabel.implicitWidth + Kirigami.Units.largeSpacing * 2
++            implicitHeight: buttonLabel.implicitHeight + Kirigami.Units.largeSpacing * 2
++            Accessible.name: text
++            contentItem: Controls.Label {
++                id: buttonLabel
++                text: control.text
++                horizontalAlignment: Text.AlignHCenter
++                verticalAlignment: Text.AlignVCenter
++                wrapMode: Text.Wrap
++                color: node.colour(node.widget.textColor, Kirigami.Theme.highlightColor)
++                font.pixelSize: node.dp(node.widget.textSize, Kirigami.Theme.defaultFont.pixelSize > 0 ? Kirigami.Theme.defaultFont.pixelSize : 14)
++                font.weight: String(node.widget.textStyle || "").indexOf("bold") >= 0 ? Font.Bold : Font.Normal
++            }
++            background: Rectangle {
++                radius: frame.radius
++                color: control.down ? Kirigami.ColorUtils.tintWithAlpha(frame.color, Kirigami.Theme.highlightColor, 0.3) : "transparent"
++                border.width: node.widget.background ? 0 : 1
++                border.color: Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor, 0.6)
++            }
++            onClicked: if (node.widget.click) node.suggestionTriggered(node.widget.click)
++        }
++    }
++
++    Component {
++        id: imageView
++
++        RichImage {
++            id: picture
++            url: node.widget.image || ""
++            folder: node.folder
++            playable: !!node.widget.playable
++            fixedHeight: isNaN(node.fixedHeight) ? -1 : node.fixedHeight
++            fillMode: {
++                switch (node.widget.scaleType) {
++                case "fitXY":
++                    return Image.Stretch
++                case "fitCenter":
++                case "fitStart":
++                case "fitEnd":
++                case "centerInside":
++                    return Image.PreserveAspectFit
++                case "center":
++                case "matrix":
++                    return Image.Pad
++                default:
++                    return Image.PreserveAspectCrop
++                }
++            }
++            // R9 7.7.4.14.5: the click's action, or the picture itself
++            onClicked: node.widget.click ? node.suggestionTriggered(node.widget.click) : node.imageClicked(picture.localUrl, node.widget)
++        }
++    }
++}
+diff --git a/src/contents/ui/RichCard.qml b/src/contents/ui/RichCard.qml
+new file mode 100644
+index 0000000..26346c7
+--- /dev/null
++++ b/src/contents/ui/RichCard.qml
+@@ -0,0 +1,141 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as Controls
++
++import org.kde.kirigami as Kirigami
++
++// One RCS rich card (RCC.07 3.6.10.5): media, title, description and the
++// card's own suggestions, vertical or horizontal.
++Rectangle {
++    id: card
++
++    // {title, description, media, suggestions} from RichMessage::parse()
++    property var cardData: ({})
++    // the message: orientation, imageAlignment, font styles
++    property var rich: ({})
++    property bool horizontal: false
++    property string folder
++    property color textColor: Kirigami.Theme.textColor
++    property real pointSize: Kirigami.Theme.defaultFont.pointSize
++
++    signal suggestionTriggered(var suggestion)
++    signal mediaClicked(var media, string localUrl)
++    signal pressAndHold()
++
++    readonly property var media: cardData.media || ({})
++    readonly property bool hasMedia: !!media.image || !!media.playable
++    // SHORT/MEDIUM/TALL_HEIGHT as 112/168/264 logical pixels: RCC.07 names the
++    // heights but gives no sizes; these are the usual RBM dp values (chosen)
++    readonly property real mediaHeight: media.height === "SHORT_HEIGHT" ? 112 : media.height === "TALL_HEIGHT" ? 264 : 168
++
++    function styles(list) {
++        return {
++            bold: !!list && list.indexOf("bold") >= 0,
++            italic: !!list && list.indexOf("italics") >= 0,
++            underline: !!list && list.indexOf("underline") >= 0
++        }
++    }
++    readonly property var titleStyle: styles(rich.titleFontStyle)
++    readonly property var descriptionStyle: styles(rich.descriptionFontStyle)
++
++    implicitHeight: layout.implicitHeight
++    radius: Kirigami.Units.gridUnit / 2
++    border.width: 1
++    border.color: Kirigami.ColorUtils.tintWithAlpha(color, Kirigami.Theme.textColor, 0.15)
++    clip: true
++
++    GridLayout {
++        id: layout
++        width: parent.width
++        columns: card.horizontal ? 2 : 1
++        columnSpacing: 0
++        rowSpacing: 0
++        layoutDirection: card.horizontal && card.rich.imageAlignment === "RIGHT" ? Qt.RightToLeft : Qt.LeftToRight
++
++        RichImage {
++            id: image
++            visible: card.hasMedia
++            Layout.preferredWidth: card.horizontal ? Math.round(card.width * 0.4) : card.width
++            Layout.fillHeight: card.horizontal
++            Layout.alignment: Qt.AlignTop
++            fixedHeight: card.horizontal ? Math.max(text.implicitHeight, 112) : card.mediaHeight
++            url: card.media.image || ""
++            folder: card.folder
++            playable: !!card.media.playable
++            contentDescription: card.media.contentDescription || ""
++            onClicked: card.mediaClicked(card.media, image.localUrl)
++            onPressAndHold: card.pressAndHold()
++        }
++
++        ColumnLayout {
++            id: text
++            Layout.fillWidth: true
++            Layout.alignment: Qt.AlignTop
++            Layout.margins: Kirigami.Units.largeSpacing
++            spacing: Kirigami.Units.smallSpacing
++
++            Controls.Label {
++                visible: !!card.cardData.title
++                Layout.fillWidth: true
++                text: card.cardData.title || ""
++                wrapMode: Text.Wrap
++                maximumLineCount: 3
++                elide: Text.ElideRight
++                color: card.textColor
++                font.pointSize: card.pointSize
++                font.weight: Font.Bold
++                font.italic: card.titleStyle.italic
++                font.underline: card.titleStyle.underline
++            }
++            Controls.Label {
++                visible: !!card.cardData.description
++                Layout.fillWidth: true
++                text: card.cardData.description || ""
++                wrapMode: Text.Wrap
++                maximumLineCount: 12
++                elide: Text.ElideRight
++                color: card.textColor
++                font.pointSize: card.pointSize - 1
++                font.weight: card.descriptionStyle.bold ? Font.Bold : Font.Normal
++                font.italic: card.descriptionStyle.italic
++                font.underline: card.descriptionStyle.underline
++            }
++        }
++
++        // the card's suggestions: buttons along its bottom
++        ColumnLayout {
++            visible: (card.cardData.suggestions || []).length > 0
++            Layout.columnSpan: layout.columns
++            Layout.fillWidth: true
++            spacing: 0
++
++            Repeater {
++                model: card.cardData.suggestions || []
++
++                ColumnLayout {
++                    Layout.fillWidth: true
++                    spacing: 0
++                    required property var modelData
++
++                    Rectangle {
++                        Layout.fillWidth: true
++                        implicitHeight: 1
++                        color: card.border.color
++                    }
++                    RichSuggestion {
++                        Layout.fillWidth: true
++                        chip: false
++                        suggestion: parent.modelData
++                        onTriggered: suggestion => card.suggestionTriggered(suggestion)
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/src/contents/ui/RichImage.qml b/src/contents/ui/RichImage.qml
+new file mode 100644
+index 0000000..c279925
+--- /dev/null
++++ b/src/contents/ui/RichImage.qml
+@@ -0,0 +1,105 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++
++import org.kde.spacebar
++
++// A picture of an RCS chatbot message (http/https), fetched once into the
++// conversation's attachment folder. Decoded for the screen's pixels and
++// shown at the logical size, as the attachment images are.
++Item {
++    id: root
++
++    property string url
++    property string folder
++    // when it is set, the picture fills this height; otherwise its own
++    // aspect ratio decides at the given width
++    property real fixedHeight: -1
++    property int fillMode: Image.PreserveAspectCrop
++    property bool playable: false
++    property string contentDescription
++    readonly property alias status: image.status
++    property string localUrl: ""
++
++    signal clicked()
++    signal pressAndHold()
++
++    implicitHeight: fixedHeight >= 0 ? fixedHeight
++                  : image.implicitWidth > 0 ? Math.round(image.implicitHeight * width / image.implicitWidth)
++                  : Kirigami.Units.gridUnit * 6
++
++    function refresh() {
++        localUrl = url ? RichMedia.localFile(url, folder) : ""
++    }
++    onUrlChanged: refresh()
++    onFolderChanged: refresh()
++    Component.onCompleted: refresh()
++
++    Connections {
++        target: RichMedia
++        function onFetched(fetchedUrl, local) {
++            if (fetchedUrl === root.url) {
++                root.localUrl = local
++            }
++        }
++    }
++
++    Rectangle {
++        anchors.fill: parent
++        visible: image.status !== Image.Ready
++        color: Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.08)
++
++        Kirigami.Icon {
++            anchors.centerIn: parent
++            width: Kirigami.Units.iconSizes.medium
++            height: width
++            source: "image-x-generic"
++            color: Kirigami.Theme.disabledTextColor
++            visible: !root.playable
++        }
++    }
++
++    Image {
++        id: image
++        anchors.fill: parent
++        // not before the width is known: it decides the decoded size
++        source: root.width > 0 ? root.localUrl : ""
++        fillMode: root.fillMode
++        asynchronous: true
++        cache: false
++        // Qt scales sourceSize by the device pixel ratio only for SVG/PDF
++        sourceSize: Qt.size(Math.round(root.width * Screen.devicePixelRatio),
++                            root.fixedHeight >= 0 && root.fillMode === Image.PreserveAspectCrop ? Math.round(root.height * Screen.devicePixelRatio) : 0)
++        Accessible.name: root.contentDescription
++    }
++
++    // video, audio, R9's iframe play: it opens outside
++    Rectangle {
++        visible: root.playable
++        anchors.centerIn: parent
++        width: Kirigami.Units.iconSizes.large
++        height: width
++        radius: width / 2
++        color: Qt.rgba(0, 0, 0, 0.55)
++
++        Kirigami.Icon {
++            anchors.centerIn: parent
++            width: Kirigami.Units.iconSizes.medium
++            height: width
++            source: "media-playback-start"
++            color: "white"
++        }
++    }
++
++    MouseArea {
++        anchors.fill: parent
++        onClicked: root.clicked()
++        onPressAndHold: root.pressAndHold()
++    }
++}
+diff --git a/src/contents/ui/RichMessage.qml b/src/contents/ui/RichMessage.qml
+new file mode 100644
+index 0000000..fb6e22b
+--- /dev/null
++++ b/src/contents/ui/RichMessage.qml
+@@ -0,0 +1,193 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as Controls
++
++import org.kde.kirigami as Kirigami
++
++// An RCS chatbot message (RCC.07 3.6.10, R9 7.7) in the conversation: the
++// header and footer outside the card (R9 7.7.4.3), a rich card, a carousel
++// or an open rich card, and the chip list. What it cannot show (a text, an
++// unknown or broken message) the bubble's text shows: the summary the
++// daemon stored.
++ColumnLayout {
++    id: root
++
++    // RichMessage::parse() of the message
++    property var rich: ({})
++    property string folder
++    // the width a single card takes, and the carousel's
++    property real cardWidth: Kirigami.Units.gridUnit * 16
++    property real carouselWidth: cardWidth
++    property color cardColor: Kirigami.Theme.backgroundColor
++    property color textColor: Kirigami.Theme.textColor
++    property real pointSize: Kirigami.Theme.defaultFont.pointSize
++    // the chip list belongs to the newest message only
++    property bool showChips: true
++
++    signal suggestionTriggered(var suggestion)
++    signal mediaClicked(var media, string localUrl)
++    signal pressAndHold()
++
++    readonly property string kind: rich.kind || ""
++    // shown here, card and all; otherwise the bubble's text is the message
++    readonly property bool rendered: kind === "card" || kind === "carousel" || kind === "openrichcard"
++    readonly property var chips: rich.suggestions || []
++
++    spacing: Kirigami.Units.smallSpacing
++
++    // (광고)[Web발신], with R9 7.7.4.13's verified mark and its text
++    RowLayout {
++        visible: root.rendered && (!!root.rich.header || (root.rich.verified && !!root.rich.headerExtension))
++        Layout.maximumWidth: root.kind === "carousel" ? root.carouselWidth : root.cardWidth
++        spacing: Kirigami.Units.smallSpacing
++
++        Controls.Label {
++            visible: !!root.rich.header
++            text: root.rich.header || ""
++            wrapMode: Text.Wrap
++            Layout.fillWidth: !root.rich.verified
++            font: Kirigami.Theme.smallFont
++            color: Kirigami.Theme.disabledTextColor
++        }
++        Kirigami.Icon {
++            visible: !!root.rich.verified
++            implicitWidth: Kirigami.Units.iconSizes.small
++            implicitHeight: implicitWidth
++            source: "security-high"
++        }
++        Controls.Label {
++            visible: !!root.rich.verified && !!root.rich.headerExtension
++            text: root.rich.headerExtension || ""
++            Layout.fillWidth: true
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            color: Kirigami.Theme.positiveTextColor
++        }
++    }
++
++    RichCard {
++        visible: root.kind === "card"
++        Layout.preferredWidth: root.cardWidth
++        color: root.cardColor
++        textColor: root.textColor
++        pointSize: root.pointSize
++        cardData: root.kind === "card" && root.rich.cards.length > 0 ? root.rich.cards[0] : ({})
++        rich: root.rich
++        horizontal: root.rich.orientation === "HORIZONTAL"
++        folder: root.folder
++        onSuggestionTriggered: suggestion => root.suggestionTriggered(suggestion)
++        onMediaClicked: (media, localUrl) => root.mediaClicked(media, localUrl)
++        onPressAndHold: root.pressAndHold()
++    }
++
++    // RCC.07 carousel: cards side by side, swiped through
++    Flickable {
++        id: carousel
++        visible: root.kind === "carousel"
++        Layout.preferredWidth: root.carouselWidth
++        Layout.preferredHeight: cards.implicitHeight
++        contentWidth: cards.implicitWidth
++        contentHeight: cards.implicitHeight
++        flickableDirection: Flickable.HorizontalFlick
++        boundsBehavior: Flickable.StopAtBounds
++        clip: true
++        // RCC.07: SMALL_WIDTH (the default) or MEDIUM_WIDTH
++        readonly property real itemWidth: root.rich.cardWidth === "MEDIUM_WIDTH" ? Kirigami.Units.gridUnit * 13 : Kirigami.Units.gridUnit * 9
++
++        Row {
++            id: cards
++            spacing: Kirigami.Units.largeSpacing
++
++            Repeater {
++                model: root.kind === "carousel" ? root.rich.cards : []
++
++                RichCard {
++                    required property var modelData
++                    width: carousel.itemWidth
++                    height: implicitHeight
++                    color: root.cardColor
++                    textColor: root.textColor
++                    pointSize: root.pointSize
++                    cardData: modelData
++                    rich: root.rich
++                    folder: root.folder
++                    onSuggestionTriggered: suggestion => root.suggestionTriggered(suggestion)
++                    onMediaClicked: (media, localUrl) => root.mediaClicked(media, localUrl)
++                    onPressAndHold: root.pressAndHold()
++                }
++            }
++        }
++    }
++
++    // R9 open rich card: the bot's own layout
++    Rectangle {
++        visible: root.kind === "openrichcard"
++        Layout.preferredWidth: root.cardWidth
++        implicitHeight: openRich.implicitHeight
++        radius: Kirigami.Units.gridUnit / 2
++        color: root.cardColor
++        border.width: 1
++        border.color: Kirigami.ColorUtils.tintWithAlpha(color, Kirigami.Theme.textColor, 0.15)
++        clip: true
++
++        OpenRichNode {
++            id: openRich
++            width: parent.width
++            isRoot: true
++            widget: root.kind === "openrichcard" ? (root.rich.layout || ({})) : ({})
++            folder: root.folder
++            textColor: root.textColor
++            availableWidth: width
++            onSuggestionTriggered: suggestion => root.suggestionTriggered(suggestion)
++            onImageClicked: (localUrl, widget) => root.mediaClicked(widget, localUrl)
++        }
++    }
++
++    // an open rich card's own suggestions
++    Repeater {
++        model: root.kind === "openrichcard" ? (root.rich.cardSuggestions || []) : []
++
++        RichSuggestion {
++            required property var modelData
++            Layout.preferredWidth: root.cardWidth
++            chip: false
++            suggestion: modelData
++            onTriggered: suggestion => root.suggestionTriggered(suggestion)
++        }
++    }
++
++    // 수신거부:080-...
++    Controls.Label {
++        visible: root.rendered && !!root.rich.footer
++        Layout.maximumWidth: root.kind === "carousel" ? root.carouselWidth : root.cardWidth
++        text: root.rich.footer || ""
++        wrapMode: Text.Wrap
++        font: Kirigami.Theme.smallFont
++        color: Kirigami.Theme.disabledTextColor
++    }
++
++    // the chip list (botsuggestion)
++    Flow {
++        visible: root.showChips && root.chips.length > 0
++        // under a card as wide as the carousel; in a text bubble as wide as a card
++        Layout.preferredWidth: root.rendered ? root.carouselWidth : root.cardWidth
++        Layout.topMargin: Kirigami.Units.smallSpacing
++        spacing: Kirigami.Units.smallSpacing
++
++        Repeater {
++            model: root.chips
++
++            RichSuggestion {
++                required property var modelData
++                suggestion: modelData
++                onTriggered: suggestion => root.suggestionTriggered(suggestion)
++            }
++        }
++    }
++}
+diff --git a/src/contents/ui/RichSuggestion.qml b/src/contents/ui/RichSuggestion.qml
+new file mode 100644
+index 0000000..7ac5516
+--- /dev/null
++++ b/src/contents/ui/RichSuggestion.qml
+@@ -0,0 +1,89 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as Controls
++
++import org.kde.kirigami as Kirigami
++
++// One suggested reply or suggested action of an RCS chatbot (RCC.07
++// 3.6.10.6): a chip under the message, or a button in a card.
++Controls.Button {
++    id: root
++
++    // normalised by RichMessage::parse(): type, action, displayText, raw...
++    property var suggestion: ({})
++    // a chip of the chip list (rounded, outlined) rather than a card's button
++    property bool chip: true
++
++    signal triggered(var suggestion)
++
++    readonly property string kind: suggestion.action || ""
++
++    text: suggestion.displayText || suggestion.url || suggestion.phoneNumber || suggestion.text || ""
++    icon.name: {
++        switch (kind) {
++        case "url":
++        case "localBrowser":
++        case "deeplink":
++            return "internet-web-browser-symbolic"
++        case "dial":
++            return suggestion.video ? "camera-video-symbolic" : "call-start-symbolic"
++        case "map":
++        case "locationPush":
++            return "mark-location-symbolic"
++        case "calendar":
++            return "view-calendar-symbolic"
++        case "compose":
++        case "composeRecording":
++            return "document-edit-symbolic"
++        case "copy":
++            return "edit-copy-symbolic"
++        case "share":
++            return "emblem-shared-symbolic"
++        default:
++            return ""
++        }
++    }
++    icon.width: Kirigami.Units.iconSizes.small
++    icon.height: Kirigami.Units.iconSizes.small
++    flat: !chip
++    Accessible.name: text
++
++    background: Rectangle {
++        visible: root.chip || root.down || root.hovered
++        radius: root.chip ? height / 2 : Kirigami.Units.smallSpacing
++        color: root.down ? Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor, 0.3)
++             : root.chip ? Kirigami.Theme.backgroundColor
++             : Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor, 0.1)
++        border.width: root.chip ? 1 : 0
++        border.color: Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor, 0.6)
++    }
++    contentItem: RowLayout {
++        spacing: Kirigami.Units.smallSpacing
++
++        Kirigami.Icon {
++            visible: !!root.icon.name
++            Layout.preferredWidth: root.icon.width
++            Layout.preferredHeight: root.icon.height
++            source: root.icon.name
++            color: Kirigami.Theme.highlightColor
++        }
++        Controls.Label {
++            Layout.fillWidth: true
++            text: root.text
++            color: Kirigami.Theme.highlightColor
++            elide: Text.ElideRight
++        }
++    }
++    leftPadding: Kirigami.Units.largeSpacing
++    rightPadding: Kirigami.Units.largeSpacing
++    topPadding: Kirigami.Units.smallSpacing * 1.5
++    bottomPadding: Kirigami.Units.smallSpacing * 1.5
++
++    onClicked: triggered(suggestion)
++}
+diff --git a/src/main.cpp b/src/main.cpp
+index f966cec..ffcdac7 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -20,6 +20,7 @@
+ // Models
+ #include "chatlistmodel.h"
+ #include "messagemodel.h"
++#include "richmedia.h"
+ 
+ #include "avatarimageprovider.h"
+ #include "channelhandler.h"
+@@ -102,6 +103,10 @@ Q_DECL_EXPORT int main(int argc, char *argv[])
+     qRegisterMetaType<PhoneNumber>();
+     qRegisterMetaType<PhoneNumberList>();
+ 
++    // RCS chatbot pictures, through the engine's network access
++    RichMedia richMedia(engine.networkAccessManager());
++    qmlRegisterSingletonInstance<RichMedia>(APPLICATION_ID, 1, 0, "RichMedia", &richMedia);
++
+     engine.rootContext()->setContextObject(new KLocalizedContext(&engine));
+     engine.addImageProvider(SL("avatar"), new AvatarImageProvider());
+     engine.load(QUrl(SL("qrc:///main.qml")));
+diff --git a/src/messagemodel.cpp b/src/messagemodel.cpp
+index 366a0ac..49acb8f 100644
+--- a/src/messagemodel.cpp
++++ b/src/messagemodel.cpp
+@@ -7,6 +7,8 @@
+ #include "channelhandler.h"
+ #include "utils.h"
+ 
++#include <QDir>
++#include <QJsonDocument>
+ #include <QJsonObject>
+ #include <QMimeDatabase>
+ #include <QMimeType>
+@@ -17,6 +19,7 @@
+ #include <database.h>
+ #include <global.h>
+ #include <phonenumberlist.h>
++#include <richmessage.h>
+ 
+ #include <QCoroFuture>
+ 
+@@ -72,6 +75,17 @@ MessageModel::MessageModel(ChannelHandler &handler, const PhoneNumberList &phone
+         }
+     });
+ 
++    // RCS chatbots: what is known about the bot, and news of it
++    if (m_phoneNumberList.size() == 1) {
++        m_botInfo = RichMessage::botInfo(m_handler.interface()->botInfo(m_phoneNumberList.toString())).toVariantMap();
++    }
++    connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::botInfoChanged, this, [this](const QString &numbers, const QString &info) {
++        if (PhoneNumberList(numbers) == m_phoneNumberList) {
++            m_botInfo = RichMessage::botInfo(info).toVariantMap();
++            Q_EMIT botInfoChanged();
++        }
++    });
++
+     connect(m_handler.interface(), &OrgKdeSpacebarDaemonInterface::manualDownloadFinished, this, [this](const QString &id, const bool isEmpty) {
+         if (isEmpty) {
+             updateMessageState(id, MessageState::Failed, true);
+@@ -132,6 +146,11 @@ void MessageModel::fetchUpdatedMessage(const QString &id)
+         message->readReport = messages.front().readReport;
+         message->tapbacks = messages.front().tapbacks;
+         message->transport = messages.front().transport;
++        message->richContentType = messages.front().richContentType;
++        message->richBody = messages.front().richBody;
++        message->suggestions = messages.front().suggestions;
++        message->botId = messages.front().botId;
++        m_rich.remove(id);
+ 
+         Q_EMIT dataChanged(index(i), index(i));
+     }
+@@ -163,7 +182,8 @@ QHash<int, QByteArray> MessageModel::roleNames() const
+             {Role::ExpiresDateTimeRole, BL("expiresDateTime")},
+             {Role::SizeRole, BL("size")},
+             {Role::TapbacksRole, BL("tapbacks")},
+-            {Role::TransportRole, BL("transport")}};
++            {Role::TransportRole, BL("transport")},
++            {Role::RichRole, BL("rich")}};
+ }
+ 
+ QVariant MessageModel::data(const QModelIndex &index, int role) const
+@@ -215,6 +235,18 @@ QVariant MessageModel::data(const QModelIndex &index, int role) const
+         return message.tapbacks;
+     case Role::TransportRole:
+         return message.transport;
++    case Role::RichRole: {
++        // a chatbot message as the view shows it; {} for everything else,
++        // and for the replies we sent (they are their display text)
++        if (message.richContentType.isEmpty() || message.sentByMe) {
++            return QVariantMap();
++        }
++        auto it = m_rich.constFind(message.id);
++        if (it == m_rich.constEnd()) {
++            it = m_rich.insert(message.id, RichMessage::parse(message.richContentType, message.richBody, message.suggestions).toVariantMap());
++        }
++        return *it;
++    }
+     }
+ 
+     return {};
+@@ -337,6 +369,85 @@ void MessageModel::setComposing(bool active)
+     m_handler.interface()->setComposing(m_phoneNumberList.toString(), active);
+ }
+ 
++QVariantMap MessageModel::botInfo() const
++{
++    return m_botInfo;
++}
++
++void MessageModel::sendSuggestion(const QString &id, const QVariantMap &suggestion)
++{
++    const QJsonObject raw = QJsonObject::fromVariantMap(suggestion);
++    QString replyId;
++    if (RichMessage::isReply(raw)) {
++        // shown at once, as sendMessage does; the daemon stores it under this id
++        Message message;
++        message.id = Database::generateRandomId();
++        message.phoneNumberList = m_phoneNumberList;
++        message.text = RichMessage::displayText(raw);
++        message.sentByMe = true;
++        message.deliveryStatus = MessageState::Pending;
++        message.transport = SL("rcs");
++        message.datetime = QDateTime::currentDateTime();
++        replyId = message.id;
++
++        beginInsertRows({}, m_messages.size(), m_messages.size());
++        m_messages.insert(m_messages.begin(), message);
++        endInsertRows();
++    }
++    m_handler.interface()->sendSuggestionResponse(m_phoneNumberList.toString(),
++                                                  replyId,
++                                                  id,
++                                                  QString::fromUtf8(QJsonDocument(raw).toJson(QJsonDocument::Compact)));
++    if (!replyId.isEmpty()) {
++        Q_EMIT m_handler.messagesChanged(m_phoneNumberList);
++    }
++}
++
++QString MessageModel::calendarFile(const QVariantMap &event) const
++{
++    // RFC 5545; the times come as ISO 8601 (RCC.07)
++    auto stamp = [](const QString &iso) {
++        const QDateTime t = QDateTime::fromString(iso, Qt::ISODateWithMs);
++        return t.isValid() ? t.toUTC().toString(SL("yyyyMMdd'T'HHmmss'Z'")) : QString();
++    };
++    auto escaped = [](QString text) {
++        text.replace(u'\\', SL("\\\\"));
++        text.replace(u';', SL("\\;"));
++        text.replace(u',', SL("\\,"));
++        text.replace(u'\n', SL("\\n"));
++        return text;
++    };
++    const QString start = stamp(event.value(SL("startTime")).toString());
++    const QString end = stamp(event.value(SL("endTime")).toString());
++    if (start.isEmpty() || end.isEmpty()) {
++        return {};
++    }
++    const QString uid = Database::generateRandomId();
++    QStringList lines{SL("BEGIN:VCALENDAR"),
++                      SL("VERSION:2.0"),
++                      SL("PRODID:-//KDE//Spacebar//EN"),
++                      SL("BEGIN:VEVENT"),
++                      SL("UID:") + uid + SL("@spacebar"),
++                      SL("DTSTAMP:") + QDateTime::currentDateTimeUtc().toString(SL("yyyyMMdd'T'HHmmss'Z'")),
++                      SL("DTSTART:") + start,
++                      SL("DTEND:") + end,
++                      SL("SUMMARY:") + escaped(event.value(SL("title")).toString())};
++    const QString description = event.value(SL("description")).toString();
++    if (!description.isEmpty()) {
++        lines.append(SL("DESCRIPTION:") + escaped(description));
++    }
++    lines << SL("END:VEVENT") << SL("END:VCALENDAR");
++
++    const QString folder = attachmentsFolder() + SL("/rbm");
++    QDir().mkpath(folder);
++    QFile file(folder + SL("/") + uid + SL(".ics"));
++    if (!file.open(QIODevice::WriteOnly)) {
++        return {};
++    }
++    file.write((lines.join(SL("\r\n")) + SL("\r\n")).toUtf8());
++    return QUrl::fromLocalFile(file.fileName()).toString();
++}
++
+ void MessageModel::sendMessage(const QString &text, const QStringList &files, const qint64 &totalSize)
+ {
+     m_composingIdle.stop();
+diff --git a/src/messagemodel.h b/src/messagemodel.h
+index 31ff03f..b59ba25 100644
+--- a/src/messagemodel.h
++++ b/src/messagemodel.h
+@@ -37,6 +37,9 @@ class MessageModel : public QAbstractListModel
+     Q_PROPERTY(QString attachmentsFolder READ attachmentsFolder CONSTANT)
+     // RCS: the other side is typing (isComposing through IMSroha).
+     Q_PROPERTY(bool remoteComposing READ remoteComposing NOTIFY remoteComposingChanged)
++    // RCS chatbots: the conversation's chatbot information, normalised
++    // (name, icon, description, phoneNumber, inputDisabled...), {} for others.
++    Q_PROPERTY(QVariantMap botInfo READ botInfo NOTIFY botInfoChanged)
+ 
+ public:
+     enum Role {
+@@ -59,7 +62,8 @@ public:
+         ExpiresDateTimeRole,
+         SizeRole,
+         TapbacksRole,
+-        TransportRole
++        TransportRole,
++        RichRole
+     };
+     Q_ENUM(Role)
+ 
+@@ -141,6 +145,19 @@ public:
+      */
+     Q_INVOKABLE void setComposing(bool active);
+ 
++    QVariantMap botInfo() const;
++    /**
++     * @brief the user tapped a chatbot suggestion of the message with this id.
++     * A suggested reply shows as a sent message; the bot gets the RCC.07
++     * response when there is one to send.
++     */
++    Q_INVOKABLE void sendSuggestion(const QString &id, const QVariantMap &suggestion);
++    /**
++     * @brief an iCalendar file for a chatbot's createCalendarEvent, to open
++     * with the calendar; "" when it could not be written.
++     */
++    Q_INVOKABLE QString calendarFile(const QVariantMap &event) const;
++
+ private:
+     QPair<Message *, int> getMessageIndex(const QString &id);
+     void updateMessageState(const QString &id, MessageState state, const bool temp = false);
+@@ -157,6 +174,9 @@ private:
+     QTimer m_composingIdle;   // our own: idle after 15 s without an edit
+     QTimer m_remoteExpiry;    // theirs: RFC 3994's refresh (60 s) without news
+ 
++    QVariantMap m_botInfo;
++    mutable QHash<QString, QVariantMap> m_rich; // parsed chatbot messages, by id
++
+ private Q_SLOTS:
+     void fetchMessages(const QString &id, const int limit = 0);
+     void fetchUpdatedMessage(const QString &id);
+@@ -165,6 +185,7 @@ private Q_SLOTS:
+ 
+ Q_SIGNALS:
+     void remoteComposingChanged();
++    void botInfoChanged();
+     void phoneNumberListChanged();
+     void peopleChanged();
+     void messagesFetched();
+diff --git a/src/resources.qrc b/src/resources.qrc
+index 0e9efe8..5464dfd 100644
+--- a/src/resources.qrc
++++ b/src/resources.qrc
+@@ -11,6 +11,11 @@
+         <file alias="NewConversationPage.qml">contents/ui/NewConversationPage.qml</file>
+         <file alias="PhoneNumberDialog.qml">contents/ui/PhoneNumberDialog.qml</file>
+         <file alias="PreviewPage.qml">contents/ui/PreviewPage.qml</file>
++        <file alias="RichMessage.qml">contents/ui/RichMessage.qml</file>
++        <file alias="RichCard.qml">contents/ui/RichCard.qml</file>
++        <file alias="RichImage.qml">contents/ui/RichImage.qml</file>
++        <file alias="RichSuggestion.qml">contents/ui/RichSuggestion.qml</file>
++        <file alias="OpenRichNode.qml">contents/ui/OpenRichNode.qml</file>
+         <file alias="settings/SettingsPage.qml">contents/ui/settings/SettingsPage.qml</file>
+         <file alias="settings/MMSSettingsPage.qml">contents/ui/settings/MMSSettingsPage.qml</file>
+     </qresource>
+diff --git a/src/richmedia.cpp b/src/richmedia.cpp
+new file mode 100644
+index 0000000..890065c
+--- /dev/null
++++ b/src/richmedia.cpp
+@@ -0,0 +1,94 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#include "richmedia.h"
++
++#include <QCryptographicHash>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QNetworkAccessManager>
++#include <QNetworkReply>
++#include <QNetworkRequest>
++#include <QRegularExpression>
++#include <QUrl>
++
++#include <global.h>
++
++// Pictures only: a card's video is opened, not fetched.
++constexpr qint64 MAX_SIZE = 10 * 1024 * 1024;
++
++RichMedia::RichMedia(QNetworkAccessManager *network, QObject *parent)
++    : QObject(parent)
++    , m_network(network)
++{
++}
++
++QString RichMedia::pathFor(const QString &url, const QString &folder)
++{
++    // the URL's suffix when it looks like one, for the image reader
++    QString suffix = QFileInfo(QUrl(url).path()).suffix().toLower();
++    static const QRegularExpression plain(SL("^[a-z0-9]{1,5}$"));
++    if (!plain.match(suffix).hasMatch()) {
++        suffix.clear();
++    }
++    const QString name = QString::fromLatin1(QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Sha1).toHex());
++    return folder + SL("/rbm/") + name + (suffix.isEmpty() ? QString() : SL(".") + suffix);
++}
++
++QString RichMedia::localFile(const QString &url, const QString &folder)
++{
++    const QUrl remote(url);
++    if (folder.isEmpty() || !remote.isValid() || (remote.scheme() != u"https" && remote.scheme() != u"http") || remote.host().isEmpty()) {
++        return {};
++    }
++    const QString path = pathFor(url, folder);
++    if (QFileInfo::exists(path)) {
++        return QUrl::fromLocalFile(path).toString();
++    }
++    if (m_pending.contains(path) || m_failed.contains(path)) {
++        return {};
++    }
++    m_pending.insert(path);
++
++    QNetworkRequest request(remote);
++    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
++    request.setTransferTimeout(30000);
++    QNetworkReply *reply = m_network->get(request);
++    connect(reply, &QNetworkReply::downloadProgress, reply, [reply](qint64 received, qint64 total) {
++        if (received > MAX_SIZE || total > MAX_SIZE) {
++            reply->abort();
++        }
++    });
++    connect(reply, &QNetworkReply::finished, this, [this, reply, url, path] {
++        finished(reply, url, path);
++    });
++    return {};
++}
++
++void RichMedia::finished(QNetworkReply *reply, const QString &url, const QString &path)
++{
++    reply->deleteLater();
++    m_pending.remove(path);
++    const QByteArray data = reply->error() == QNetworkReply::NoError ? reply->readAll() : QByteArray();
++    if (data.isEmpty()) {
++        qDebug() << "RCS chatbot media" << url << "not fetched:" << reply->errorString();
++        m_failed.insert(path);
++        return;
++    }
++    QDir().mkpath(QFileInfo(path).absolutePath());
++    QFile file(path + SL(".part"));
++    if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) {
++        m_failed.insert(path);
++        return;
++    }
++    file.close();
++    QFile::remove(path);
++    if (!QFile::rename(file.fileName(), path)) {
++        QFile::remove(file.fileName());
++        m_failed.insert(path);
++        return;
++    }
++    Q_EMIT fetched(url, QUrl::fromLocalFile(path).toString());
++}
+diff --git a/src/richmedia.h b/src/richmedia.h
+new file mode 100644
+index 0000000..a49ced9
+--- /dev/null
++++ b/src/richmedia.h
+@@ -0,0 +1,43 @@
++// SPDX-FileCopyrightText: 2026 Noa Himesaka <himesaka@noa.codes>
++//
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++#pragma once
++
++#include <QHash>
++#include <QObject>
++#include <QSet>
++
++class QNetworkAccessManager;
++class QNetworkReply;
++
++/*
++ * Pictures of RCS chatbot messages (rich card media and thumbnails, open
++ * rich card images, chatbot icons), fetched over HTTP(S) once and kept in
++ * the conversation's attachment folder under rbm/, named by the URL's hash.
++ */
++class RichMedia : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit RichMedia(QNetworkAccessManager *network, QObject *parent = nullptr);
++
++    /*
++     * The local file:// URL of url when it is here already. Otherwise ""
++     * and the download starts; fetched() follows when it is done.
++     * folder is the conversation's attachment folder.
++     */
++    Q_INVOKABLE QString localFile(const QString &url, const QString &folder);
++
++Q_SIGNALS:
++    void fetched(const QString &url, const QString &localUrl);
++
++private:
++    static QString pathFor(const QString &url, const QString &folder);
++    void finished(QNetworkReply *reply, const QString &url, const QString &path);
++
++    QNetworkAccessManager *m_network;
++    QSet<QString> m_pending; // paths being fetched
++    QSet<QString> m_failed; // and those that failed this run, not asked again
++};
+-- 
+2.56.0
+
