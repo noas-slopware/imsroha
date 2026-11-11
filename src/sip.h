@@ -13,12 +13,15 @@
 #include "config.h"
 #include "ipsec.h"
 
-/* sec-agree state: not configured, offered in REGISTER, SAs up, or given up. */
+/*
+ * sec-agree state: off (the carrier's IPsec_enabled is false), offered in
+ * REGISTER, or SAs up. There is no falling back from IPsec once it is on:
+ * TTAK.KO-06.0357/R6 deleted that.
+ */
 enum imsd_sec_state {
 	IMSD_SEC_OFF = 0,
 	IMSD_SEC_OFFERED = 1,
 	IMSD_SEC_PROTECTED = 2,
-	IMSD_SEC_FALLBACK = -1,
 };
 
 /* At most this many P-CSCFs are tried, in order (PCO first, then the carrier's). */

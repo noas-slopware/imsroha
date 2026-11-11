@@ -18,11 +18,11 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 | SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
 
-SKT and KT get sec-agree with IPsec ESP (TS 33.203), the reg event subscription and
-`+sip.instance`, as TTAK.KO-06.0357 (the Korean VoLTE terminal standard) asks.
-LG U+ registers without any of them, and keeps doing so. When IPsec negotiation
-fails, imsroha registers without it, as the TTA standard says. `docs/korea-tta.md`
-goes through the standard and where imsroha stands.
+SKT and KT get what TTAK.KO-06.0357/R6 (the Korean VoLTE terminal standard) asks
+for: sec-agree with IPsec ESP (TS 33.203) with no way around it, the reg event
+subscription, `+sip.instance`, and its SDP offer. LG U+ registers without any of
+them, and keeps doing so. `docs/korea-tta.md` goes through R6 and where imsroha
+stands.
 
 Hardware it has run on: the Galaxy Z Flip3 (SM8350, IPA, QRTR) in
 [linux-zflip3](https://github.com/noas-slopware/linux-zflip3). Nothing in the code

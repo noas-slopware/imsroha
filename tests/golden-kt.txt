@@ -7,8 +7,8 @@ To: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
 Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 1 REGISTER
 Contact: <sip:450081234567890@[::1]:5080>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
-Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response="", algorithm=AKAv1-MD5
-Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084
+Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response=""
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084
 Require: sec-agree
 Proxy-Require: sec-agree
 Max-Forwards: 70
@@ -37,7 +37,7 @@ Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
 CSeq: 2 REGISTER
 Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
 Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response="233395195145334bf9b721930bd60bc9", algorithm=AKAv1-MD5
-Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5082;port-s=5084
 Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=4444;spi-s=5555;port-c=6101;port-s=6100
 Require: sec-agree
 Proxy-Require: sec-agree
@@ -108,24 +108,31 @@ Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
 Supported: 100rel, timer
 Session-Expires: 360
 Content-Type: application/sdp
-Content-Length: 378
+Content-Length: 538
 
 v=0
-o=- <sess> <ver> IN IP6 ::1
+o=01000000000 <sess> <ver> IN IP6 ::1
 s=-
 c=IN IP6 ::1
 t=0 0
-m=audio 40000 RTP/AVP 98 101 99 102
+m=audio 40000 RTP/AVP 98 97 101 100 99 102
 b=AS:41
+b=RS:0
+b=RR:2500
 a=rtpmap:98 AMR-WB/16000/1
 a=fmtp:98 octet-align=1;mode-set=0,1,2
+a=rtpmap:97 AMR-WB/16000/1
+a=fmtp:97 mode-set=0,1,2
 a=rtpmap:101 AMR/8000/1
 a=fmtp:101 octet-align=1;mode-set=0,2,4,7
+a=rtpmap:100 AMR/8000/1
+a=fmtp:100 mode-set=0,2,4,7
 a=rtpmap:99 telephone-event/16000
 a=fmtp:99 0-15
 a=rtpmap:102 telephone-event/8000
 a=fmtp:102 0-15
 a=ptime:20
+a=maxptime:120
 a=sendrecv
 
 ===== step 6: after 180
@@ -204,15 +211,17 @@ CSeq: 1 INVITE
 Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
 Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
 Content-Type: application/sdp
-Content-Length: 353
+Content-Length: 398
 
 v=0
-o=- <sess> <ver> IN IP6 ::1
+o=01000000000 <sess> <ver> IN IP6 ::1
 s=-
 c=IN IP6 ::1
 t=0 0
 m=audio 40000 RTP/AVP 100 96 101 102
 b=AS:41
+b=RS:0
+b=RR:2500
 a=rtpmap:100 AMR-WB/16000/1
 a=fmtp:100 mode-set=0,1,2
 a=rtpmap:96 AMR/8000/1
@@ -222,6 +231,7 @@ a=fmtp:101 0-15
 a=rtpmap:102 telephone-event/8000
 a=fmtp:102 0-15
 a=ptime:20
+a=maxptime:120
 a=sendrecv
 
 ===== step 11: MT BYE answer

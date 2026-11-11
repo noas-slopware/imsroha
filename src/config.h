@@ -59,6 +59,8 @@ struct imsroha_carrier {
 	char alg[48];               /* offered integrity: hmac-sha-1-96, hmac-md5-96 */
 	int pt_amrwb, pt_amr, pt_dtmf_wb, pt_dtmf; /* payload types we offer */
 	uint16_t rtp_port;
+	int pt_amrwb_be, pt_amr_be;  /* bandwidth-efficient PTs we also offer, 0 = none */
+	int sdp_tta;                 /* TTAK.KO-06.0357/R6 Table 5-4: maxptime, b=RS/RR, o=<CTN> */
 	unsigned session_expires;
 	/* Home country code: +<cc> numbers are dialled and texted in national form (0...). */
 	char country_code[8];

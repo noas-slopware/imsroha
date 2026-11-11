@@ -451,60 +451,89 @@ static void sdp_new_session(struct imsd_sip_ctx *ctx)
  *
  * Returns the body length, or -ENOTSUP if the offer has no AMR at all.
  */
+/*
+ * Our SDP. An offer lists AMR-WB and AMR octet-aligned, and with sdp-tta
+ * (TTAK.KO-06.0357/R6 5.4.2, Table 5-4) also bandwidth-efficient PTs,
+ * maxptime:120, b=RS:0, b=RR:2500 and the phone number as o= username.
+ * An answer takes the PTs (and their payload format) chosen from the offer.
+ */
 static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int answer)
 {
-	int amrwb = ctx->cfg.car.pt_amrwb, amr = ctx->cfg.car.pt_amr;
-	int dtmf_wb = ctx->cfg.car.pt_dtmf_wb, dtmf_nb = ctx->cfg.car.pt_dtmf;
+	const struct imsroha_carrier *car = &ctx->cfg.car;
+	int amrwb = car->pt_amrwb, amr = car->pt_amr;
+	int amrwb_be = car->pt_amrwb_be, amr_be = car->pt_amr_be;
+	int dtmf_wb = car->pt_dtmf_wb, dtmf_nb = car->pt_dtmf;
+	int wb_oa = 1, nb_oa = 1;
 
 	if (answer) {
 		amrwb = ctx->call_has_wb ? ctx->call_pt_amrwb : 0;
 		amr = ctx->call_has_nb ? ctx->call_pt_amr : 0;
+		wb_oa = ctx->call_wb_octet;
+		nb_oa = ctx->call_nb_octet;
+		amrwb_be = amr_be = 0;
 		dtmf_wb = ctx->call_has_dtmf_wb ? ctx->call_pt_dtmf_wb : 0;
 		dtmf_nb = ctx->call_has_dtmf_nb ? ctx->call_pt_dtmf_nb : 0;
 		if (!amrwb && !amr)
 			return -ENOTSUP;
 	}
 
-	char pts[64] = "";
+	char pts[96] = "";
 	size_t pts_len = 0;
-	const int list[] = { amrwb, amr, dtmf_wb, dtmf_nb };
+	const int list[] = { amrwb, amrwb_be, amr, amr_be, dtmf_wb, dtmf_nb };
 	for (size_t i = 0; i < sizeof(list) / sizeof(list[0]); i++)
-		if (list[i])
+		if (list[i] > 0)
 			pts_len += snprintf(pts + pts_len, sizeof(pts) - pts_len, " %d", list[i]);
+
+	/* Table 5-4 note 1: the originator's username is its phone number. */
+	char user[64] = "-";
+	if (car->sdp_tta) {
+		const char *u = !strncmp(ctx->impu, "sip:", 4) ? ctx->impu + 4 :
+				!strncmp(ctx->impu, "tel:", 4) ? ctx->impu + 4 : ctx->impu;
+		size_t n = strcspn(u, "@;>");
+		if (n && n < sizeof(user))
+			snprintf(user, sizeof(user), "%.*s", (int)n, u);
+	}
 
 	unsigned long long ver = (unsigned long long)ctx->sdp_sess_ver++;
 	size_t len = (size_t)snprintf(sdp, size,
 		"v=0\r\n"
-		"o=- %llu %llu IN IP6 %s\r\n"
+		"o=%s %llu %llu IN IP6 %s\r\n"
 		"s=-\r\n"
 		"c=IN IP6 %s\r\n"
 		"t=0 0\r\n"
 		"m=audio %u RTP/AVP%s\r\n"
-		"b=AS:41\r\n",
-		(unsigned long long)ctx->sdp_sess_id, ver, ctx->local_ip, ctx->local_ip,
-		(unsigned)ctx->cfg.car.rtp_port, pts);
-	if (amrwb && len < size)
+		"b=AS:41\r\n"
+		"%s",
+		user, (unsigned long long)ctx->sdp_sess_id, ver, ctx->local_ip, ctx->local_ip,
+		(unsigned)car->rtp_port, pts, car->sdp_tta ? "b=RS:0\r\nb=RR:2500\r\n" : "");
+	if (amrwb > 0 && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d AMR-WB/16000/1\r\n"
-			"a=fmtp:%d %smode-set=0,1,2\r\n", amrwb, amrwb,
-			answer && !ctx->call_wb_octet ? "" : "octet-align=1;");
-	if (amr && len < size)
+			"a=fmtp:%d %smode-set=0,1,2\r\n", amrwb, amrwb, wb_oa ? "octet-align=1;" : "");
+	if (amrwb_be > 0 && len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=rtpmap:%d AMR-WB/16000/1\r\n"
+			"a=fmtp:%d mode-set=0,1,2\r\n", amrwb_be, amrwb_be);
+	if (amr > 0 && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d AMR/8000/1\r\n"
-			"a=fmtp:%d %smode-set=0,2,4,7\r\n", amr, amr,
-			answer && !ctx->call_nb_octet ? "" : "octet-align=1;");
-	if (dtmf_wb && len < size)
+			"a=fmtp:%d %smode-set=0,2,4,7\r\n", amr, amr, nb_oa ? "octet-align=1;" : "");
+	if (amr_be > 0 && len < size)
+		len += (size_t)snprintf(sdp + len, size - len,
+			"a=rtpmap:%d AMR/8000/1\r\n"
+			"a=fmtp:%d mode-set=0,2,4,7\r\n", amr_be, amr_be);
+	if (dtmf_wb > 0 && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d telephone-event/16000\r\n"
 			"a=fmtp:%d 0-15\r\n", dtmf_wb, dtmf_wb);
-	if (dtmf_nb && len < size)
+	if (dtmf_nb > 0 && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d telephone-event/8000\r\n"
 			"a=fmtp:%d 0-15\r\n", dtmf_nb, dtmf_nb);
 	if (len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
-			"a=ptime:20\r\n"
-			"a=sendrecv\r\n");
+			"a=ptime:20\r\n%s"
+			"a=sendrecv\r\n", car->sdp_tta ? "a=maxptime:120\r\n" : "");
 	if (len >= size)
 		return -ENOSPC;
 	return (int)len;
@@ -602,12 +631,25 @@ static uint32_t reg_req_expires(const struct imsd_sip_ctx *ctx)
 	return ctx->reg_min_expires > IMSD_REG_EXPIRES ? ctx->reg_min_expires : IMSD_REG_EXPIRES;
 }
 
-/* sec-agree failed: drop the SAs and register the plain way from now on. */
-static void sec_give_up(struct imsd_sip_ctx *ctx)
+static void arm_reg_retry(struct imsd_sip_ctx *ctx, uint64_t delay_sec);
+
+/*
+ * sec-agree did not come up: drop the SAs and start over with a fresh
+ * initial REGISTER that offers it again, after a back-off. Never without
+ * IPsec: TTAK.KO-06.0357/R6 deleted the R5 fallback ("IPSec off 기능 삭제").
+ */
+static void sec_restart(struct imsd_sip_ctx *ctx, const char *why)
 {
+	uint64_t delay = 30ULL << (ctx->reg_retry_count < 5 ? ctx->reg_retry_count : 5);
+	if (delay > 900)
+		delay = 900;
 	imsroha_ipsec_remove(&ctx->sec);
-	ctx->sec_state = IMSD_SEC_FALLBACK;
+	ctx->sec_state = IMSD_SEC_OFFERED;
 	ctx->ua_port = ctx->sip_port;
+	ctx->reg_state = IMSD_REGISTERING;
+	fprintf(stderr, "imsroha: sec-agree failed (%s), registering again with IPsec in %" PRIu64 " s\n",
+		why, delay);
+	arm_reg_retry(ctx, delay);
 }
 
 /*
@@ -651,8 +693,8 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED)
 		imsroha_ipsec_new_spis(&ctx->sec);
 	sec_lines(ctx, sec, sizeof(sec));
-	/* TTAK.KO-06.0357 5.2.2: the unprotected REGISTER names AKAv1-MD5. */
-	const char *alg = ctx->sec_state == IMSD_SEC_OFFERED ? ", algorithm=AKAv1-MD5" : "";
+	/* R5 5.2.2 wanted algorithm=AKAv1-MD5 here; R6 dropped that, so: as LG U+ has it. */
+	const char *alg = "";
 
 	char req[3072];
 	int len = snprintf(req, sizeof(req),
@@ -726,8 +768,8 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 	/*
 	 * sec-agree: take the P-CSCF's Security-Server and bring the SAs up with
 	 * this challenge's IK and CK; the answer goes out over them. Without a
-	 * usable Security-Server, or when the SAs cannot be installed, register
-	 * without sec-agree (TTAK.KO-06.0357 5.2.2).
+	 * usable Security-Server, or when the SAs cannot be installed, there is
+	 * no answer at all: TTAK.KO-06.0357/R6 5.2.2 has no unprotected way.
 	 */
 	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED) {
 		char ss[1024] = "";
@@ -737,11 +779,12 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 			/* No keys from a sync failure: answer with AUTS over what is there. */
 		} else if (find_header(msg, "Security-Server", ss, sizeof(ss)) < 0 ||
 			   imsroha_ipsec_parse_server(&ctx->sec, ss) < 0) {
-			fprintf(stderr, "imsroha: the 401 has no usable Security-Server, registering without sec-agree\n");
-			sec_give_up(ctx);
+			sec_restart(ctx, "the 401 has no Security-Server matching our offer");
+			return -EPROTO;
 		} else if (imsroha_ipsec_install(&ctx->sec, ctx->local_ip, pcscf, res.ik, res.ck) < 0) {
-			fprintf(stderr, "imsroha: cannot install the IPsec SAs, registering without sec-agree\n");
-			sec_give_up(ctx);
+			/* Most likely a kernel without XFRM_USER or INET6_ESP. */
+			sec_restart(ctx, "ip xfrm could not install the SAs (kernel without XFRM_USER/INET6_ESP?)");
+			return -EIO;
 		} else {
 			ctx->sec_state = IMSD_SEC_PROTECTED;
 			ctx->ua_port = ctx->sec.port_us;
@@ -839,12 +882,14 @@ static int on_reg_retry_timer(sd_event_source *s, uint64_t usec, void *userdata)
 	ctx->reg_retry_count++;
 	/*
 	 * No answer over the SAs: the authenticated REGISTER that should have
-	 * completed sec-agree, or two refreshes in a row. TTAK.KO-06.0357 5.2.2:
-	 * when IPsec negotiation fails, register without it.
+	 * completed sec-agree, or two refreshes in a row. Start over with new
+	 * SAs (an initial REGISTER offering sec-agree again).
 	 */
 	if (ctx->sec_state == IMSD_SEC_PROTECTED && (ctx->reg_state != IMSD_UP || ctx->reg_retry_count >= 2)) {
-		fprintf(stderr, "imsroha: no answer over IPsec, registering without sec-agree\n");
-		sec_give_up(ctx);
+		fprintf(stderr, "imsroha: no answer over IPsec, starting sec-agree over\n");
+		imsroha_ipsec_remove(&ctx->sec);
+		ctx->sec_state = IMSD_SEC_OFFERED;
+		ctx->ua_port = ctx->sip_port;
 	}
 	/* TS 24.229 5.1.1.2.1: a P-CSCF that stays silent is replaced by the next one. */
 	if (ctx->pcscf_n > 1 && ctx->reg_retry_count % 2 == 0) {
@@ -891,7 +936,7 @@ static void schedule_reg_retry(struct imsd_sip_ctx *ctx)
  */
 static void handle_register_rejected(struct imsd_sip_ctx *ctx, const char *msg, int status_code)
 {
-	if (status_code == 494 && ctx->cfg.car.ipsec && ctx->sec_state != IMSD_SEC_OFFERED) {
+	if (status_code == 494 && ctx->cfg.car.ipsec && ctx->sec_state == IMSD_SEC_PROTECTED) {
 		/* RFC 3329 2.3.1: Security Agreement Required. Offer it again. */
 		fprintf(stderr, "imsroha: REGISTER 494, offering sec-agree again\n");
 		imsroha_ipsec_remove(&ctx->sec);
@@ -1307,13 +1352,16 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		 * comfort noise) is not speech for the AMR decoders.
 		 */
 		int pt_rx = buf[1] & 0x7f;
-		int is_wb = pt_rx == ctx->call_pt_amrwb || pt_rx == ctx->cfg.car.pt_amrwb;
-		int is_nb = pt_rx == ctx->call_pt_amr || pt_rx == ctx->cfg.car.pt_amr;
+		int is_wb = pt_rx == ctx->call_pt_amrwb || pt_rx == ctx->cfg.car.pt_amrwb ||
+			    (ctx->cfg.car.pt_amrwb_be > 0 && pt_rx == ctx->cfg.car.pt_amrwb_be);
+		int is_nb = pt_rx == ctx->call_pt_amr || pt_rx == ctx->cfg.car.pt_amr ||
+			    (ctx->cfg.car.pt_amr_be > 0 && pt_rx == ctx->cfg.car.pt_amr_be);
 		if (ctx->codec_open && n > 13 && (is_wb || is_nb)) {
 			uint32_t ts = (uint32_t)buf[4] << 24 | (uint32_t)buf[5] << 16 |
 				      (uint32_t)buf[6] << 8 | buf[7];
 			int octet = pt_rx == ctx->call_pt_amrwb ? ctx->call_wb_octet :
-				    pt_rx == ctx->call_pt_amr ? ctx->call_nb_octet : 1;
+				    pt_rx == ctx->call_pt_amr ? ctx->call_nb_octet :
+				    pt_rx == ctx->cfg.car.pt_amrwb_be || pt_rx == ctx->cfg.car.pt_amr_be ? 0 : 1;
 			if (octet) {
 				playout_put(ctx, ts, is_wb, buf + 13, (size_t)(n - 13));
 			} else {
@@ -3085,9 +3133,9 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	if (ctx->sec_state == IMSD_SEC_OFFERED) {
 		if ((r = sip_socket(ctx, ctx->sec.port_uc, &ctx->fd_c)) < 0 ||
 		    (r = sip_socket(ctx, ctx->sec.port_us, &ctx->fd_s)) < 0) {
-			fprintf(stderr, "imsroha: no sockets for the protected ports (%s), registering without sec-agree\n",
-				strerror(-r));
-			ctx->sec_state = IMSD_SEC_FALLBACK;
+			fprintf(stderr, "imsroha: no sockets for the protected ports %u/%u: %s\n",
+				ctx->sec.port_uc, ctx->sec.port_us, strerror(-r));
+			return r;
 		}
 	}
 	return imsd_sip_register(ctx);

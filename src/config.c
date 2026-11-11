@@ -176,7 +176,7 @@ static void carrier_defaults(struct imsroha_carrier *car)
 	snprintf(car->user_agent, sizeof(car->user_agent), "[PRODUCT_MODEL]/[BUILD_VERSION]");
 	car->sms_over_ip = 1;
 	car->ipsec = 1;
-	snprintf(car->ealg, sizeof(car->ealg), "null,aes-cbc");
+	snprintf(car->ealg, sizeof(car->ealg), "aes-cbc,null");
 	snprintf(car->alg, sizeof(car->alg), "hmac-sha-1-96");
 	car->pt_amrwb = 106;
 	car->pt_amr = 104;
@@ -215,6 +215,9 @@ static void carrier_from(GKeyFile *kf, const char *g, struct imsroha_carrier *ca
 	get_int(kf, g, "pt-dtmf", &car->pt_dtmf);
 	get_uint(kf, g, "session-expires", &car->session_expires);
 	get_u16(kf, g, "rtp-port", &car->rtp_port);
+	get_int(kf, g, "pt-amr-wb-be", &car->pt_amrwb_be);
+	get_int(kf, g, "pt-amr-be", &car->pt_amr_be);
+	get_bool(kf, g, "sdp-tta", &car->sdp_tta);
 	get_str(kf, g, "country-code", car->country_code, sizeof(car->country_code));
 	get_str(kf, g, "smsc", car->smsc, sizeof(car->smsc));
 	get_str(kf, g, "sms-psi", car->sms_psi, sizeof(car->sms_psi));
