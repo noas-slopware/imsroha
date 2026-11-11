@@ -33,6 +33,7 @@ struct acs_state {
 	int disable_sent;      /* rcs_state=-4 went out after the last enable */
 	int trial;             /* unanswered runs in a row (R9 6.3.1.2.3) */
 	int rcscfg_force;      /* the next run sends vers=0 (R9 6.3.1.1.2.2) */
+	int64_t last_run;      /* unix time the last run first contacted the ACS */
 };
 
 enum acs_leg {
@@ -103,6 +104,13 @@ typedef int (*acs_otp_fn)(void *userdata, char *otp, size_t size, unsigned timeo
 enum acs_outcome acs_run(const struct rcs_config *cfg, const struct rcs_identity *id,
 			 struct acs_state *st, int disable, acs_otp_fn otp_fn, void *otp_ud,
 			 GCancellable *cancel);
+
+/*
+ * However a run is asked for (restart, 403, an unreachable P-CSCF, a crash
+ * loop under Restart=), two runs are at least this far apart: the first step
+ * of R9 6.3.1.2.3's ladder. Scheduled runs (validity) are never this close.
+ */
+#define ACS_MIN_INTERVAL 1200
 
 /* Seconds before the trial'th retry after an unanswered run, -1 = the next start. */
 int acs_retry_delay(int trial);

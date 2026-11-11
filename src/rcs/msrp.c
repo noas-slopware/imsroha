@@ -351,7 +351,7 @@ static void on_connected(GObject *src, GAsyncResult *res, gpointer ud)
 	}
 	m->conn = s;
 	read_more(m);
-	/* The binding SEND (RFC 4975 7.1.1); up once it is answered. */
+	/* The binding SEND (RFC 4975 5.4: the active end sends one at once, a body is optional); up once it is answered. */
 	send_frame(m, NULL, NULL, 0, 1, m->bind_tid, NULL);
 }
 

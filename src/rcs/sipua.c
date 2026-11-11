@@ -72,6 +72,14 @@ struct sipua {
 	guint reg_timer, retry_timer;
 	int retry_n;
 	int stopped;
+	int dispatching;    /* inside a callback from on_read */
+	int presence;       /* PUBLISH our capabilities, anonymous fetch for others' */
+	struct sipdlg pub;
+	char etag[128];
+	guint pub_timer;
+	int pub_retry;
+	unsigned granted;   /* the registration's expiry, the PUBLISH's too (R9 6.5.1) */
+	int dead;           /* stopped while dispatching: on_read frees it */
 
 	GList *txs;
 };
@@ -81,6 +89,7 @@ const char *sipua_impu(const struct sipua *ua) { return ua->impu; }
 const char *sipua_local_ip(const struct sipua *ua) { return ua->local_ip; }
 int sipua_local_v6(const struct sipua *ua) { return ua->v6; }
 int sipua_msrp_tls(const struct sipua *ua) { return ua->msrp_tls; }
+int sipua_presence(const struct sipua *ua) { return ua->presence; }
 unsigned sipua_timer_idle(const struct sipua *ua) { return ua->timer_idle; }
 
 int sipua_e164(const struct sipua *ua, const char *number, char *out, size_t size)
@@ -210,7 +219,10 @@ static void contact(struct sipua *ua, GString *m)
 			       ua->tls ? "tls" : "tcp");
 	if (ua->instance[0])
 		g_string_append_printf(m, ";+sip.instance=\"%s\"", ua->instance);
-	g_string_append(m, ";+g.3gpp.icsi-ref=\"" RCS_ICSI_CHAT "\"\r\n");
+	g_string_append(m, ";+g.3gpp.icsi-ref=\"" RCS_ICSI_CHAT "\"");
+	if (ua->presence)
+		g_string_append(m, ";+g.3gpp.iari-ref=\"" RCS_IARI_DP "\"");
+	g_string_append(m, "\r\n");
 }
 
 int sipua_send(struct sipua *ua, struct sipdlg *dlg, const char *method, const char *ruri,
@@ -240,7 +252,10 @@ int sipua_send(struct sipua *ua, struct sipdlg *dlg, const char *method, const c
 	const char *route = dlg->route[0] ? dlg->route : ua->service_route;
 	if (route[0] && strcmp(method, "REGISTER"))
 		g_string_append_printf(m, "Route: %s\r\n", route);
-	g_string_append_printf(m, "From: <%s>;tag=%s\r\n", ua->impu, dlg->local_tag);
+	if (dlg->anonymous)
+		g_string_append_printf(m, "From: \"Anonymous\"<sip:anonymous@anonymous.invalid>;tag=%s\r\n", dlg->local_tag);
+	else
+		g_string_append_printf(m, "From: <%s>;tag=%s\r\n", ua->impu, dlg->local_tag);
 	g_string_append_printf(m, "To: %s%s%s\r\n", dlg->remote_uri, dlg->remote_tag[0] ? ";tag=" : "",
 			       dlg->remote_tag);
 	g_string_append_printf(m, "Call-ID: %s\r\n", dlg->call_id);
@@ -253,7 +268,7 @@ int sipua_send(struct sipua *ua, struct sipdlg *dlg, const char *method, const c
 		char uri[160];
 		snprintf(uri, sizeof(uri), "sip:%s", ua->domain);
 		auth_header(ua, m, method, uri);
-	} else if (!ack && strcmp(method, "BYE")) {
+	} else if (!ack && strcmp(method, "BYE") && !dlg->anonymous) {
 		g_string_append_printf(m, "P-Preferred-Identity: <%s>\r\n", ua->impu);
 	}
 	if (!ack)
@@ -329,6 +344,7 @@ void sipua_respond(struct sipua *ua, const struct sipmsg *req, int code, const c
 
 static void reg_send(struct sipua *ua);
 static void connect_start(struct sipua *ua);
+static void publish(struct sipua *ua, unsigned expires);
 static void conn_lost(struct sipua *ua, const char *why);
 
 static gboolean on_retry(gpointer p)
@@ -375,6 +391,9 @@ static void set_unregistered(struct sipua *ua)
 	if (ua->reg_timer)
 		g_source_remove(ua->reg_timer);
 	ua->reg_timer = 0;
+	if (ua->pub_timer)
+		g_source_remove(ua->pub_timer);
+	ua->pub_timer = 0;
 }
 
 static unsigned granted_expires(struct sipua *ua, const struct sipmsg *m)
@@ -403,8 +422,10 @@ static void on_reg_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 	if (!m) {
 		set_unregistered(ua);
 		rcsd_set_state(r, RCSD_REGISTERING);
-		/* R9 A.5 c: every P-CSCF timing out sends us back to the ACS, after a wait. */
-		if (ua->retry_n >= 3) {
+		/* R9 A.5 c: every P-CSCF timing out sends us back to the ACS, after a
+		 * wait; once per configuration, then only the back-off. */
+		if (ua->retry_n >= 3 && !r->pcscf_reconfigured) {
+			r->pcscf_reconfigured = 1;
 			fprintf(stderr, "imsroha-rcs: the P-CSCF does not answer; asking the ACS again\n");
 			rcsd_ua_stop(r);
 			rcsd_reconfigure(r);
@@ -449,6 +470,7 @@ static void on_reg_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 		if (ua->expires == 0)
 			return; /* our de-registration */
 		unsigned e = granted_expires(ua, m);
+		ua->granted = e;
 		char **sr = sipmsg_header_all(m, "Service-Route");
 		GString *s = g_string_new(NULL);
 		for (int i = 0; sr[i]; i++)
@@ -466,6 +488,7 @@ static void on_reg_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 			ua->nc = 0;
 		}
 		r->forbidden = 0;
+		r->pcscf_reconfigured = 0;
 		ua->retry_n = 0;
 		unsigned refresh = e > 1200 ? e - 600 : e / 2;
 		if (ua->reg_timer)
@@ -475,8 +498,13 @@ static void on_reg_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 		int was = ua->registered;
 		ua->registered = 1;
 		rcsd_set_state(r, RCSD_REGISTERED);
-		if (!was)
+		if (!was) {
 			chat_on_registered(r);
+			if (ua->presence) {
+				ua->etag[0] = '\0';
+				publish(ua, e);
+			}
+		}
 		return;
 	}
 	set_unregistered(ua);
@@ -516,6 +544,94 @@ static void reg_send(struct sipua *ua)
 		conn_lost(ua, "cannot send REGISTER");
 }
 
+
+/* ---- presence: our capabilities (R9 6.5.1) -------------------------------- */
+
+static void publish(struct sipua *ua, unsigned expires);
+
+static gboolean on_pub_timer(gpointer p)
+{
+	struct sipua *ua = p;
+	ua->pub_timer = 0;
+	if (ua->registered)
+		publish(ua, ua->granted);
+	return G_SOURCE_REMOVE;
+}
+
+static void pub_later(struct sipua *ua, unsigned s)
+{
+	if (ua->pub_timer)
+		g_source_remove(ua->pub_timer);
+	ua->pub_timer = g_timeout_add_seconds(s ? s : 1, on_pub_timer, ua);
+}
+
+static void on_pub_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
+{
+	(void)ud;
+	if (!ua->registered)
+		return;
+	int code = m ? m->code : 708;
+	if (code >= 200 && code < 300) {
+		const char *et = sipmsg_header(m, "SIP-ETag");
+		if (et)
+			snprintf(ua->etag, sizeof(ua->etag), "%s", et);
+		const char *ex = sipmsg_header(m, "Expires");
+		unsigned e = ex ? (unsigned)strtoul(ex, NULL, 10) : ua->expires;
+		ua->pub_retry = 0;
+		fprintf(stderr, "imsroha-rcs: capabilities published for %u s\n", e);
+		pub_later(ua, e > 1200 ? e - 600 : e / 2);
+		return;
+	}
+	fprintf(stderr, "imsroha-rcs: PUBLISH: %d %s\n", code, m ? m->reason : "timed out");
+	if (code == 412)
+		ua->etag[0] = '\0';
+	if (code == 423 && m && sipmsg_header(m, "Min-Expires")) {
+		publish(ua, (unsigned)strtoul(sipmsg_header(m, "Min-Expires"), NULL, 10));
+		return;
+	}
+	/* R9 table 6-3: case B retries once at once, then like A; A every 1200 s;
+	 * C after Retry-After or 120, 240, 480, 960, 3600 s. */
+	int b = code == 400 || code == 403 || code == 412 || code == 423 || code == 489;
+	int c = code == 408 || code == 500 || code == 503;
+	unsigned after = 1200;
+	if (b && ua->pub_retry == 0) {
+		after = 1;
+	} else if (c) {
+		const char *ra = m ? sipmsg_header(m, "Retry-After") : NULL;
+		static const unsigned ladder[] = { 120, 240, 480, 960, 3600 };
+		after = ra ? (unsigned)strtoul(ra, NULL, 10)
+			   : ladder[MIN(ua->pub_retry, (int)G_N_ELEMENTS(ladder) - 1)];
+	}
+	ua->pub_retry++;
+	pub_later(ua, after);
+}
+
+static void publish(struct sipua *ua, unsigned expires)
+{
+	char id1[11], id2[11];
+	sip_random(id1, 10);
+	sip_random(id2, 10);
+	char *body = expires ? g_strdup_printf(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+		"<presence xmlns=\"urn:ietf:params:xml:ns:pidf\" xmlns:op=\"urn:oma:xml:prs:pidf:oma-pres\" entity=\"%s\">\r\n"
+		" <tuple id=\"SessionModeMessaging%s\"><status><basic>open</basic></status>\r\n"
+		"  <op:service-description><op:service-id>org.openmobilealliance:ChatSession</op:service-id>"
+		"<op:version>2.0</op:version><op:description>Session Mode Messaging</op:description></op:service-description>\r\n"
+		"  <contact>%s</contact></tuple>\r\n"
+		" <tuple id=\"DiscoveryPresence%s\"><status><basic>open</basic></status>\r\n"
+		"  <op:service-description><op:service-id>org.3gpp.urn:urn-7:3gpp-application.ims.iari.rcse.dp</op:service-id>"
+		"<op:version>1.0</op:version><op:description>DiscoveryPresence</op:description></op:service-description>\r\n"
+		"  <contact>%s</contact></tuple>\r\n"
+		"</presence>\r\n", ua->impu, id1, ua->impu, id2, ua->impu) : NULL;
+	char extra[256];
+	snprintf(extra, sizeof(extra), "Event: presence\r\nExpires: %u\r\n%s%s%s", expires,
+		 ua->etag[0] ? "SIP-If-Match: " : "", ua->etag, ua->etag[0] ? "\r\n" : "");
+	snprintf(ua->pub.remote_uri, sizeof(ua->pub.remote_uri), "<%s>", ua->impu);
+	sipua_send(ua, &ua->pub, "PUBLISH", ua->impu, extra, body ? "application/pidf+xml" : NULL, body,
+		   body ? strlen(body) : 0, expires ? on_pub_resp : NULL, NULL);
+	g_free(body);
+}
+
 /* ---- incoming ------------------------------------------------------------ */
 
 static void on_request(struct sipua *ua, const struct sipmsg *m)
@@ -525,7 +641,8 @@ static void on_request(struct sipua *ua, const struct sipmsg *m)
 		sipua_respond(ua, m, 200, "OK", "opt", "Accept: application/sdp\r\nAllow: " RCS_ALLOW "\r\n",
 			      NULL, NULL);
 	} else if (!strcmp(m->method, "NOTIFY")) {
-		sipua_respond(ua, m, 200, "OK", NULL, NULL, NULL, NULL);
+		if (chat_on_notify(ua->r, ua, m) < 0)
+			sipua_respond(ua, m, 200, "OK", NULL, NULL, NULL, NULL);
 	} else if (!strcmp(m->method, "INVITE") || !strcmp(m->method, "ACK") || !strcmp(m->method, "BYE") ||
 		   !strcmp(m->method, "CANCEL") || !strcmp(m->method, "MESSAGE") || !strcmp(m->method, "UPDATE")) {
 		chat_on_request(ua->r, ua, m);
@@ -557,6 +674,7 @@ static void on_response(struct sipua *ua, const struct sipmsg *m)
 }
 
 static void read_more(struct sipua *ua);
+static void ua_free(struct sipua *ua);
 
 static void on_read(GObject *src, GAsyncResult *res, gpointer p)
 {
@@ -585,11 +703,17 @@ static void on_read(GObject *src, GAsyncResult *res, gpointer p)
 		g_byte_array_remove_range(ua->rx, 0, (guint)used);
 		if (!m)
 			continue;
+		ua->dispatching++;
 		if (m->request)
 			on_request(ua, m);
 		else
 			on_response(ua, m);
+		ua->dispatching--;
 		sipmsg_free(m);
+		if (ua->dead) {
+			ua_free(ua);
+			return;
+		}
 		if (!ua->conn)
 			return;
 	}
@@ -782,10 +906,12 @@ static void on_connected(GObject *src, GAsyncResult *res, gpointer p)
 		fprintf(stderr, "imsroha-rcs: P-CSCF: %s\n", e->message);
 		g_error_free(e);
 		rcsd_set_state(ua->r, RCSD_REGISTERING);
-		if (ua->retry_n >= 3) {
+		if (ua->retry_n >= 3 && !ua->r->pcscf_reconfigured) {
+			struct rcsd *r = ua->r; /* ua is freed by the stop */
+			r->pcscf_reconfigured = 1;
 			fprintf(stderr, "imsroha-rcs: the P-CSCF is unreachable; asking the ACS again\n");
-			rcsd_ua_stop(ua->r);
-			rcsd_reconfigure(ua->r);
+			rcsd_ua_stop(r);
+			rcsd_reconfigure(r);
 			return;
 		}
 		schedule_retry(ua, 0);
@@ -859,6 +985,7 @@ static struct sipua *ua_new(struct rcsd *r)
 	if (ua->retry_max < ua->retry_base)
 		ua->retry_max = ua->retry_base;
 	ua->expires = r->cfg.reg_expires;
+	ua->presence = strtoul(xml(x, "CAPDISCOVERY/defaultDisc", "0"), NULL, 10) == 1;
 
 	/* LBO_P-CSCF_Address: "name", "name:port", "[v6]:port", an IPv4 address. */
 	const char *a = xml(x, "LBO_P-CSCF_Address/NODE/Address", xml(x, "LBO_P-CSCF_Address/Address", ""));
@@ -924,6 +1051,8 @@ void rcsd_ua_stop(struct rcsd *r)
 	if (!ua)
 		return;
 	ua->stopped = 1;
+	if (ua->registered && ua->conn && ua->presence && ua->etag[0])
+		publish(ua, 0); /* the published capabilities go too */
 	if (ua->registered && ua->conn) {
 		/* De-register (R9 A.4); nobody waits for the answer. */
 		char ruri[160];
@@ -934,10 +1063,20 @@ void rcsd_ua_stop(struct rcsd *r)
 	set_unregistered(ua);
 	if (ua->retry_timer)
 		g_source_remove(ua->retry_timer);
+	ua->retry_timer = 0;
 	for (GList *l = ua->txs; l; l = l->next)
 		((struct sipua_tx *)l->data)->cb = NULL;
+	r->ua = NULL;
+	/* From inside on_read's dispatch, on_read frees it when the callback returns. */
+	if (ua->dispatching)
+		ua->dead = 1;
+	else
+		ua_free(ua);
+}
+
+static void ua_free(struct sipua *ua)
+{
 	drop_conn(ua);
 	g_byte_array_free(ua->rx, TRUE);
-	r->ua = NULL;
 	g_free(ua);
 }

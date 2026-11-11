@@ -214,9 +214,15 @@ RCS runs on the internet PDN or Wi-Fi (stock `rcs_network_type` "internet,wifi";
 | version -2 | RCS disabled by the carrier: remove the XML, no registration, retry on the next start |
 | version -3 | dormant: keep the XML, do not register |
 | 403 | remove the XML, version 0, retry on the next start |
-| 500, other errors, unreachable | keep what we have, retry 20 min, 1, 2, 4, 8 h (R9 6.3.1.2.3), then on the next start |
+| unreachable, or no OTP SMS | keep what we have, retry 20 min, 1, 2, 4, 8 h (R9 6.3.1.2.3), then on the next start |
+| 500 (twice), other errors | keep what we have, retry on the next start (table 6-2) |
 | 503 + Retry-After | retry after Retry-After |
 | 511 on the HTTPS GET | drop the token, start over once with MSISDN and the OTP flow |
+
+Whatever asks for a run (a restart, a crash loop under `Restart=`, a 403 to REGISTER, a
+P-CSCF that does not answer), two runs are at least 1200 s apart, the first step of
+R9's ladder: the time of the last run is in the state before the first byte goes out.
+The non-PS request (after a 511) is not sent without an MSISDN.
 
 A network-initiated SMS to the port whose text is `<IMSI>-rcscfg` or `<IMPI>-rcscfg`
 (R9 6.3.1.1.2) starts a run (the second with version 0).
@@ -252,7 +258,13 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
 - Contact: the feature tags of what is implemented, nothing else: ICSI
   `urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session` (chat) and `+sip.instance`.
   File transfer, geolocation, chatbot and presence tags are added with those features.
-- Digest (MD5, qop=auth) with the ACS credentials, or AKA through the ISIM.
+- Digest (MD5, qop=auth) with the ACS credentials. AKA is not implemented (R9's sample
+  configuration says Digest).
+- Capability discovery as the configuration's `CAPDISCOVERY/defaultDisc` says: 1 is
+  presence (R9 6.5: PUBLISH our capabilities, an anonymous-fetch SUBSCRIBE for a peer's,
+  and the IARI `rcse.dp` in Contact), 0 is OPTIONS. IR.92 table C.3.1 cites RCC.07 A.2.5
+  for the parameter and gives 2 as off; 0 and 1 are from memory of RCC.07. PUBLISH
+  errors are retried as R9 table 6-3 says.
 - 403: rerun autoconfig once; a second 403 stops RCS until restart (A.5 b).
 - Re-REGISTER at 600 s before expiry or half of short expiries. The TLS connection
   stays open with kernel TCP keepalive; nothing runs on a timer while idle.
@@ -271,7 +283,7 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
   `imdn.Disposition-Notification: positive-delivery, display`.
 - Received messages: a delivered IMDN at once; displayed when the app says the user
   saw it (`MarkDisplayed`). IMDNs go in the session when one is up, else in a SIP
-  MESSAGE (RCC.07 3.2.4).
+  MESSAGE (RCC.07; the cpm.msg ICSI on that MESSAGE is unverified).
 - isComposing (RFC 3994) in the session, not CPIM-wrapped (R9 7.2.3), unless the
   carrier says `rcs-iscomposing-cpim=true`.
 - Idle sessions end after `TimerIdle`; the next message opens a new one.
@@ -291,6 +303,7 @@ method    SendMessage(s number, s text) -> (s message_id)
 method    SetComposing(s number, b active)
 method    MarkDisplayed(s number, s message_id)
 method    GetCapabilities(s number) -> (a{sv} caps)   "chat": b, "ft-http": b, "known": b
+                            (anonymous fetch or OPTIONS, as the configuration says)
 signal    MessageReceived(s number, s message_id, s text, x timestamp_ms)
 signal    MessageStatusChanged(s message_id, s status)   "sent" | "delivered" | "displayed" | "failed"
 signal    ComposingChanged(s number, b active)

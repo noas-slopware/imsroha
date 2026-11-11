@@ -14,6 +14,7 @@ ap.add_argument('--key', required=True)
 ap.add_argument('--xml', required=True)
 ap.add_argument('--scenario', required=True)
 ap.add_argument('--log', required=True)
+ap.add_argument('--events', help='a FIFO that gets "otp-cookie" when the OTP SMS is due')
 a = ap.parse_args()
 
 FULL = open(a.xml, 'rb').read()
@@ -60,7 +61,12 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.reply(403)
         if s == 'otp':
             if q.get('msisdn') == ['+821099999999'] and q.get('SMS_port') == ['37273']:
-                return self.reply(200, headers=[('Set-Cookie', 'up10=otpcookie')])
+                self.reply(200, headers=[('Set-Cookie', 'up10=otpcookie')])
+                # The test sends the OTP SMS now.
+                if a.events:
+                    with open(a.events, 'w') as ev:
+                        ev.write('otp-cookie\n')
+                return
             return self.reply(403)
         if cookie != 'up10=netauth':
             return self.reply(403)

@@ -75,7 +75,10 @@ def respond(conn, first, hdrs, code, reason, extra='', body='', ctype=None, tota
     if ctype:
         out.append(f'Content-Type: {ctype}')
     out.append(f'Content-Length: {len(body.encode())}')
-    conn.sendall(('\r\n'.join(out) + '\r\n\r\n' + body).encode())
+    try:
+        conn.sendall(('\r\n'.join(out) + '\r\n\r\n' + body).encode())
+    except OSError:
+        pass  # imsroha-rcs went away first (its de-registration at SIGTERM)
 
 def sdp(path):
     return ('v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n'
@@ -150,6 +153,30 @@ def sip_conn(conn):
                         f'Contact: <sip:peer1@localhost:{a.sip_port};transport=tls>\r\n'
                         f'Record-Route: <sip:rr@localhost:{a.sip_port};transport=tls;lr>\r\n',
                         sdp(f'msrps://localhost:{a.msrp_port}/srv1;tcp'), 'application/sdp')
+            elif meth == 'PUBLISH':
+                ok = 'org.openmobilealliance:ChatSession' in body or h(hdrs, 'Expires') == '0'
+                respond(conn, first, hdrs, 200 if ok else 400, 'OK' if ok else 'Bad Request',
+                        f'SIP-ETag: etag1\r\nExpires: {h(hdrs, "Expires")}\r\n')
+                L('event publish', h(hdrs, 'Expires'), 'chat' if ok else 'no-chat')
+            elif meth == 'SUBSCRIBE':
+                respond(conn, first, hdrs, 200, 'OK', 'Expires: 0\r\n')
+                if 'anonymous@anonymous.invalid' in (h(hdrs, 'From') or '') and h(hdrs, 'Privacy') == 'id':
+                    L('event anonymous-fetch')
+                pidf = ('<?xml version="1.0" encoding="UTF-8"?>\r\n<presence xmlns="urn:ietf:params:xml:ns:pidf" '
+                        'xmlns:op="urn:oma:xml:prs:pidf:oma-pres" entity="tel:+821000000001">\r\n'
+                        '<tuple id="a"><status><basic>open</basic></status><op:service-description>'
+                        '<op:service-id>org.openmobilealliance:ChatSession</op:service-id><op:version>2.0</op:version>'
+                        '</op:service-description><contact>tel:+821000000001</contact></tuple>\r\n</presence>\r\n')
+                ftag = re.search(r'tag=([^;]+)', h(hdrs, 'From')).group(1)
+                n = (f'NOTIFY {state["contact"]} SIP/2.0\r\n'
+                     f'Via: SIP/2.0/TLS 127.0.0.1:{a.sip_port};branch=z9hG4bKnt1\r\n'
+                     'Max-Forwards: 69\r\nFrom: <tel:+821000000001>;tag=nt1\r\n'
+                     f'To: "Anonymous" <sip:anonymous@anonymous.invalid>;tag={ftag}\r\n'
+                     f'Call-ID: {h(hdrs, "Call-ID")}\r\nCSeq: 1 NOTIFY\r\nEvent: presence\r\n'
+                     'Subscription-State: terminated;reason=timeout\r\n'
+                     'Content-Type: application/pidf+xml\r\n'
+                     f'Content-Length: {len(pidf)}\r\n\r\n{pidf}')
+                conn.sendall(n.encode())
             elif meth == 'OPTIONS':
                 respond(conn, first, hdrs, 200, 'OK',
                         f'Contact: <sip:peer1@localhost:{a.sip_port}>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"\r\n')

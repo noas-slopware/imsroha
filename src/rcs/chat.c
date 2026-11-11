@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 /*
- * 1-to-1 chat (TTAK.KO-06.0410/R9 7.2, GSMA RCC.07 3.3, OMA CPM): one CPM
+ * 1-to-1 chat (TTAK.KO-06.0410/R9 7.2, GSMA RCC.07, OMA CPM): one CPM
  * session per peer, MSRP for the messages, CPIM around them, IMDN for
  * delivered/displayed, isComposing. Pager-mode MESSAGEs are taken when they
  * come (and used for IMDNs outside a session); they are sent only where the
@@ -165,7 +165,7 @@ static void local_path(struct chat *c)
 	struct sipua *ua = c->r->ua;
 	char id[17];
 	sip_random(id, 16);
-	/* We are active and never listen: port 9 (RFC 6135). */
+	/* We are active and never listen: port 9, the discard port (RFC 4145 4.1). */
 	snprintf(c->local_path, sizeof(c->local_path), "%s://%s%s%s:9/%s;tcp", sipua_msrp_tls(ua) ? "msrps" : "msrp",
 		 sipua_local_v6(ua) ? "[" : "", sipua_local_ip(ua), sipua_local_v6(ua) ? "]" : "", id);
 }
@@ -379,6 +379,7 @@ static struct chat *invite(struct rcsd *r, const char *number)
 	snprintf(extra, sizeof(extra),
 		 "Accept-Contact: *;+g.3gpp.icsi-ref=\"%s\"\r\n"
 		 "P-Preferred-Service: %s\r\n"
+		 "Accept: application/sdp\r\n"
 		 "Conversation-ID: %s\r\nContribution-ID: %s\r\n",
 		 RCS_ICSI_CHAT, RCS_ICSI_CHAT_RAW, c->conv_id, c->contrib_id);
 	char ruri[64];
@@ -570,9 +571,11 @@ void chat_on_registered(struct rcsd *r)
 	}
 }
 
+static void caps_drop_all(struct rcsd *r);
+
 void chat_on_unregistered(struct rcsd *r)
 {
-	(void)r;
+	caps_drop_all(r);
 	while (chats)
 		close_chat(chats->data, 0);
 }
@@ -651,20 +654,79 @@ gboolean rcsd_chat_displayed(struct rcsd *r, const char *number, const char *id,
 	return TRUE;
 }
 
-/* ---- capabilities: OPTIONS ----------------------------------------------- */
+/* ---- capabilities: presence anonymous fetch (R9 6.5), or OPTIONS ----------- */
 
 struct capq {
 	struct rcsd *r;
 	GDBusMethodInvocation *inv;
 	struct sipdlg dlg;
+	guint timer;
+	int replied, tx_done;
 };
+
+static GList *capqs;
+
+static void cap_reply(struct capq *q, int known, int chat, int ft, int code)
+{
+	if (q->replied)
+		return;
+	q->replied = 1;
+	if (q->timer)
+		g_source_remove(q->timer);
+	q->timer = 0;
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+	g_variant_builder_add(&b, "{sv}", "known", g_variant_new_boolean(known));
+	g_variant_builder_add(&b, "{sv}", "chat", g_variant_new_boolean(chat));
+	g_variant_builder_add(&b, "{sv}", "ft-http", g_variant_new_boolean(ft));
+	if (code)
+		g_variant_builder_add(&b, "{sv}", "sip-status", g_variant_new_int32(code));
+	g_dbus_method_invocation_return_value(q->inv, g_variant_new("(a{sv})", &b));
+}
+
+static void cap_maybe_free(struct capq *q)
+{
+	if (!q->replied || !q->tx_done)
+		return;
+	capqs = g_list_remove(capqs, q);
+	g_free(q);
+}
+
+/* A tuple with this service-id whose basic status is open. */
+static int pidf_has(const char *body, const char *service)
+{
+	const char *p = body;
+	while (p && (p = strstr(p, service))) {
+		const char *t = g_strrstr_len(body, p - body, "<tuple");
+		const char *e = strstr(p, "</tuple>");
+		if (t && e) {
+			char *tuple = g_strndup(t, (gsize)(e - t));
+			int open = strstr(tuple, "<basic>open</basic>") != NULL;
+			g_free(tuple);
+			if (open)
+				return 1;
+		}
+		p += strlen(service);
+	}
+	return 0;
+}
+
+static gboolean on_cap_timeout(gpointer p)
+{
+	struct capq *q = p;
+	q->timer = 0;
+	cap_reply(q, 0, 0, 0, 0);
+	cap_maybe_free(q);
+	return G_SOURCE_REMOVE;
+}
 
 static void on_options(struct sipua *ua, const struct sipmsg *m, void *ud)
 {
 	(void)ua;
 	struct capq *q = ud;
-	GVariantBuilder b;
-	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+	if (m && m->code < 200)
+		return;
+	q->tx_done = 1;
 	int chat = 0, ft = 0;
 	if (m && m->code >= 200 && m->code < 300) {
 		char **cs = sipmsg_header_all(m, "Contact");
@@ -673,16 +735,61 @@ static void on_options(struct sipua *ua, const struct sipmsg *m, void *ud)
 			ft |= strstr(cs[i], "rcs.fthttp") != NULL;
 		}
 		g_strfreev(cs);
-		const char *ac = sipmsg_header(m, "Accept-Contact");
-		(void)ac;
 	}
-	g_variant_builder_add(&b, "{sv}", "known", g_variant_new_boolean(m != NULL));
-	g_variant_builder_add(&b, "{sv}", "chat", g_variant_new_boolean(chat));
-	g_variant_builder_add(&b, "{sv}", "ft-http", g_variant_new_boolean(ft));
-	if (m)
-		g_variant_builder_add(&b, "{sv}", "sip-status", g_variant_new_int32(m->code));
-	g_dbus_method_invocation_return_value(q->inv, g_variant_new("(a{sv})", &b));
-	g_free(q);
+	cap_reply(q, m != NULL, chat, ft, m ? m->code : 0);
+	cap_maybe_free(q);
+}
+
+static void on_subscribe(struct sipua *ua, const struct sipmsg *m, void *ud)
+{
+	(void)ua;
+	struct capq *q = ud;
+	if (m && m->code < 200)
+		return;
+	q->tx_done = 1;
+	if (!m) {
+		cap_reply(q, 0, 0, 0, 0);
+	} else if (m->code < 300) {
+		/* The answer is the NOTIFY that follows. */
+		if (!q->replied && !q->timer)
+			q->timer = g_timeout_add_seconds(32, on_cap_timeout, q);
+	} else {
+		/* No such RCS user (404, 410, 480, 603, 604), or we do not know. */
+		int no = m->code == 404 || m->code == 410 || m->code == 480 || m->code == 603 || m->code == 604;
+		cap_reply(q, no, 0, 0, m->code);
+	}
+	cap_maybe_free(q);
+}
+
+int chat_on_notify(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
+{
+	(void)r;
+	const char *cid = sipmsg_header(m, "Call-ID");
+	struct capq *q = NULL;
+	for (GList *l = capqs; cid && l; l = l->next)
+		if (!strcmp(((struct capq *)l->data)->dlg.call_id, cid))
+			q = l->data;
+	if (!q)
+		return -1;
+	sipua_respond(ua, m, 200, "OK", NULL, NULL, NULL, NULL);
+	const char *body = m->body ? m->body : "";
+	int chat = pidf_has(body, "org.openmobilealliance:ChatSession");
+	int ft = pidf_has(body, "org.openmobilealliance:File-Transfer-HTTP");
+	cap_reply(q, 1, chat, ft, 0);
+	cap_maybe_free(q);
+	return 0;
+}
+
+static void caps_drop_all(struct rcsd *r)
+{
+	while (capqs) {
+		struct capq *q = capqs->data;
+		if (r->ua)
+			sipua_forget(r->ua, q);
+		q->tx_done = 1;
+		cap_reply(q, 0, 0, 0, 0);
+		cap_maybe_free(q);
+	}
 }
 
 void rcsd_capabilities(struct rcsd *r, const char *number, GDBusMethodInvocation *inv)
@@ -704,8 +811,22 @@ void rcsd_capabilities(struct rcsd *r, const char *number, GDBusMethodInvocation
 	char ruri[64];
 	snprintf(ruri, sizeof(ruri), "tel:%s", e164);
 	snprintf(q->dlg.remote_uri, sizeof(q->dlg.remote_uri), "<%s>", ruri);
-	if (sipua_send(r->ua, &q->dlg, "OPTIONS", ruri, "Accept: application/sdp\r\n", NULL, NULL, 0, on_options, q) < 0) {
-		g_dbus_method_invocation_return_dbus_error(inv, RCSD_ERROR_FAILED, "cannot send OPTIONS");
-		g_free(q);
+	int err;
+	if (sipua_presence(r->ua)) {
+		/* R9 6.5.1's anonymous fetch: one NOTIFY with the peer's PIDF. */
+		q->dlg.anonymous = 1;
+		err = sipua_send(r->ua, &q->dlg, "SUBSCRIBE", ruri,
+				 "Expires: 0\r\nAccept: application/pidf+xml, multipart/related\r\nEvent: presence\r\n"
+				 "Accept-Contact: *;+g.oma.sip-im;explicit;require\r\nPrivacy: id\r\n",
+				 NULL, NULL, 0, on_subscribe, q);
+	} else {
+		err = sipua_send(r->ua, &q->dlg, "OPTIONS", ruri, "Accept: application/sdp\r\n", NULL, NULL, 0,
+				 on_options, q);
 	}
+	if (err < 0) {
+		g_dbus_method_invocation_return_dbus_error(inv, RCSD_ERROR_FAILED, "cannot ask");
+		g_free(q);
+		return;
+	}
+	capqs = g_list_append(capqs, q);
 }

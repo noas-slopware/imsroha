@@ -57,6 +57,14 @@ void rcsd_set_state(struct rcsd *r, enum rcsd_state s)
 
 /* ---- OTP and network-initiated requests from imsroha's MT-SMS path ----- */
 
+static gboolean show_waiting(gpointer ud)
+{
+	struct rcsd *r = ud;
+	rcsd_set_state(r, g_atomic_int_get(&r->waiting_otp) ? RCSD_WAITING_OTP : RCSD_CONFIGURING);
+	return G_SOURCE_REMOVE;
+}
+
+/* Runs in the ACS thread; the state is shown from the main loop. */
 static int otp_wait(void *ud, char *otp, size_t size, unsigned timeout_s)
 {
 	struct rcsd *r = ud;
@@ -65,8 +73,10 @@ static int otp_wait(void *ud, char *otp, size_t size, unsigned timeout_s)
 	while ((old = g_async_queue_try_pop(r->otp_q)))
 		g_free(old);
 	g_atomic_int_set(&r->waiting_otp, 1);
+	g_idle_add(show_waiting, r);
 	char *v = g_async_queue_timeout_pop(r->otp_q, (guint64)timeout_s * G_USEC_PER_SEC);
 	g_atomic_int_set(&r->waiting_otp, 0);
+	g_idle_add(show_waiting, r);
 	if (!v)
 		return -ETIMEDOUT;
 	snprintf(otp, size, "%s", v);
@@ -233,6 +243,19 @@ static void acs_start(struct rcsd *r, int disable)
 {
 	if (r->acs_running)
 		return;
+	int64_t now = (int64_t)time(NULL);
+	if (!disable && r->st.last_run && now >= r->st.last_run && now - r->st.last_run < ACS_MIN_INTERVAL) {
+		/* Too soon after the last run: wait, and use what we have meanwhile. */
+		r->st.next_run = r->st.last_run + ACS_MIN_INTERVAL;
+		fprintf(stderr, "imsroha-rcs: the ACS was asked %lld s ago; not asking it again before %lld s\n",
+			(long long)(now - r->st.last_run), (long long)ACS_MIN_INTERVAL);
+		if (!r->ua && r->st.version > 0 && !r->st.disable_sent && load_xml(r) == 0)
+			rcsd_ua_start(r);
+		else if (!r->ua)
+			rcsd_set_state(r, RCSD_UNREGISTERED);
+		arm_acs_timer(r);
+		return;
+	}
 	r->acs_running = 1;
 	if (!disable)
 		rcsd_set_state(r, RCSD_CONFIGURING);

@@ -22,6 +22,11 @@ int main(int argc, char **argv)
 	struct rcs_config cfg;
 	if (argc < 2 || rcs_config_load(&cfg, "450", "06") < 0)
 		return 2;
+	/* A test tool: it talks to tests/rcs/fake-acs.py on loopback and nothing else. */
+	if (strncmp(cfg.acs_url, "http://localhost:", 17) || strncmp(cfg.acs_https_url, "https://localhost:", 18)) {
+		fprintf(stderr, "acs-flow: refusing an ACS that is not on localhost\n");
+		return 2;
+	}
 	struct rcs_identity id = { .imsi = "450069999999999", .imei = "359999999999999",
 				   .msisdn = "+821099999999", .mcc = "450", .mnc = "06" };
 	struct acs_state st;

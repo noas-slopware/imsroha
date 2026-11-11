@@ -31,6 +31,7 @@ struct rcsd {
 	enum rcsd_state state;
 	struct sipua *ua;
 	int forbidden;            /* 403s to REGISTER this run (R9 A.5 b) */
+	int pcscf_reconfigured;   /* the P-CSCF failed and the ACS was asked once already */
 };
 
 const char *rcsd_state_name(enum rcsd_state s);

@@ -376,6 +376,7 @@ int acs_state_load(const struct rcs_config *cfg, const char *imsi, struct acs_st
 	st->disable_sent = g_key_file_get_boolean(kf, "acs", "disable-sent", NULL);
 	st->trial = g_key_file_get_integer(kf, "acs", "trial", NULL);
 	st->rcscfg_force = g_key_file_get_boolean(kf, "acs", "force", NULL);
+	st->last_run = g_key_file_get_int64(kf, "acs", "last-run", NULL);
 	g_key_file_free(kf);
 	return 0;
 }
@@ -393,6 +394,7 @@ int acs_state_save(const struct rcs_config *cfg, const char *imsi, const struct 
 	g_key_file_set_boolean(kf, "acs", "disable-sent", st->disable_sent);
 	g_key_file_set_integer(kf, "acs", "trial", st->trial);
 	g_key_file_set_boolean(kf, "acs", "force", st->rcscfg_force);
+	g_key_file_set_int64(kf, "acs", "last-run", st->last_run);
 	gsize len;
 	char *data = g_key_file_to_data(kf, &len, NULL);
 	g_key_file_free(kf);
@@ -654,6 +656,10 @@ enum acs_outcome acs_run(const struct rcs_config *cfg, const struct rcs_identity
 		goto done;
 	}
 
+	/* Written before the first byte goes out, so a crash cannot hide a run. */
+	st->last_run = now_s();
+	acs_state_save(cfg, id->imsi, st);
+
 	/* 1. HTTP: on the carrier's own network, network-based authentication. */
 	if (!non_ps) {
 		acs_build_request(cfg, id, st, ACS_LEG_HTTP, 0, NULL, NULL, NULL, &rq);
@@ -682,9 +688,12 @@ enum acs_outcome acs_run(const struct rcs_config *cfg, const struct rcs_identity
 	}
 
 https:
-	/* 2. HTTPS with the parameters. */
-	if (non_ps && !id->msisdn[0])
-		fprintf(stderr, "imsroha-rcs: ACS: no MSISDN for the non-PS flow; set [rcs] msisdn=\n");
+	/* 2. HTTPS with the parameters. The non-PS flow names the line: without
+	 * an MSISDN it is not sent at all (stock would ask the user for one). */
+	if (non_ps && !id->msisdn[0]) {
+		out = next_start(st, "the ACS wants the MSISDN (non-PS flow) and none is known; set [rcs] msisdn=");
+		goto done;
+	}
 	{
 		char *cookie = jar_header(jar, order);
 		acs_build_request(cfg, id, st, ACS_LEG_HTTPS, non_ps, cookie, NULL, state, &rq);

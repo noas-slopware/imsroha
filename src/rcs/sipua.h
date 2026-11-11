@@ -13,6 +13,7 @@ struct sipua;
 #define RCS_ICSI_CHAT_RAW "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session"
 #define RCS_ICSI_MSG "urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg"
 #define RCS_IARI_FTHTTP "urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp"
+#define RCS_IARI_DP "urn%3Aurn-7%3A3gpp-application.ims.iari.rcse.dp"
 #define RCS_ALLOW "INVITE, ACK, CANCEL, BYE, MESSAGE, OPTIONS, NOTIFY, UPDATE"
 
 /* A dialog as the chat code keeps it. */
@@ -25,6 +26,7 @@ struct sipdlg {
 	char route[1024];        /* Route set, comma separated <...>, "" = the service route */
 	uint32_t cseq;
 	int uas;                 /* we answered the INVITE */
+	int anonymous;           /* From: anonymous (presence anonymous fetch, R9 6.5) */
 };
 
 /* resp is NULL when the request timed out or the connection went away. */
@@ -36,6 +38,8 @@ const char *sipua_local_ip(const struct sipua *ua);
 int sipua_local_v6(const struct sipua *ua);
 int sipua_msrp_tls(const struct sipua *ua);
 unsigned sipua_timer_idle(const struct sipua *ua);
+/* Capability discovery by presence (CAPDISCOVERY defaultDisc 1), else OPTIONS. */
+int sipua_presence(const struct sipua *ua);
 /* "010-1234-5678", "+82 10 1234 5678" -> "+821012345678". 0 or -EINVAL. */
 int sipua_e164(const struct sipua *ua, const char *number, char *out, size_t size);
 
@@ -57,3 +61,5 @@ void sipua_forget(struct sipua *ua, void *ud);
 void chat_on_request(struct rcsd *r, struct sipua *ua, const struct sipmsg *m);
 void chat_on_registered(struct rcsd *r);
 void chat_on_unregistered(struct rcsd *r);
+/* A presence NOTIFY: 0 when it answered one of our anonymous fetches. */
+int chat_on_notify(struct rcsd *r, struct sipua *ua, const struct sipmsg *m);

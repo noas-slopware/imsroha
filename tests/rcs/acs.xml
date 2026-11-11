@@ -15,6 +15,8 @@
             <parm name="Timer_T1" value="2000"/>
             <parm name="Private_User_Identity" value="+821099999999@rcs.test"/>
             <parm name="Home_network_domain_name" value="rcs.test"/>
+            <parm name="RegRetryBaseTime" value="1"/>
+            <parm name="RegRetryMaxTime" value="2"/>
             <characteristic type="Public_User_Identity_List">
                 <characteristic type="NODE">
                     <parm name="Public_User_Identity" value="sip:+821099999999@rcs.test"/>
@@ -64,6 +66,10 @@
             <characteristic type="FileTransfer">
                 <parm name="ftHTTPCSURI" value="https://localhost/content/"/>
             </characteristic>
+        </characteristic>
+        <characteristic type="CAPDISCOVERY">
+            <parm name="capInfoExpiry" value="86400"/>
+            <parm name="defaultDisc" value="1"/>
         </characteristic>
     </characteristic>
 </wap-provisioningdoc>

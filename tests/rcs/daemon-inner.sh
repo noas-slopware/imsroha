@@ -67,7 +67,7 @@ cat "$t/client.out"
 cat "$t/net.result"
 grep -q "network: done" "$t/net.result" || bad "the network did not get both IMDNs"
 reg=$(grep -A14 '^sip-in REGISTER' "$t/net.log" | head -30)
-for want in "Contact: <sip:+821099999999@127.0.0.1:" ';transport=tls>;+sip.instance="<urn:gsma:imei:35999999-999999-0>";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"' \
+for want in "Contact: <sip:+821099999999@127.0.0.1:" ';transport=tls>;+sip.instance="<urn:gsma:imei:35999999-999999-0>";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcse.dp"' \
 	"User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU" \
 	'Authorization: Digest username="+821099999999@rcs.test",realm="rcs.test",uri="sip:rcs.test",nonce="",response=""' \
 	"Expires: 600000" "From: <sip:+821099999999@rcs.test>"; do
@@ -80,10 +80,47 @@ grep -q '^sip-in ACK sip:peer1@localhost:15061;transport=tls' "$t/net.log" || ba
 grep -q 'event composing active bare' "$t/net.log" || bad "no bare isComposing (R9 7.2.3)"
 grep -q 'event imdn mt1 delivered' "$t/net.log" || bad "no delivered IMDN"
 grep -q 'event imdn mt1 displayed' "$t/net.log" || bad "no displayed IMDN"
-grep -q '^sip-in OPTIONS tel:+821000000001' "$t/net.log" || bad "no OPTIONS"
+grep -q '^sip-in SUBSCRIBE tel:+821000000001' "$t/net.log" || bad "no anonymous fetch SUBSCRIBE"
+grep -q 'event anonymous-fetch' "$t/net.log" || bad "the SUBSCRIBE is not anonymous (R9 6.5.1)"
+grep -q 'event publish 600 chat' "$t/net.log" || bad "no PUBLISH of the chat capability"
+grep -q 'event publish 0' "$t/net.log" || bad "no PUBLISH Expires 0 at SIGTERM"
 grep -q 'Expires: 0' "$t/net.log" || bad "no de-registration at SIGTERM"
 grep -q '^state registered' "$t/client.out" || grep -q 'registered as' "$t/rcs.err" || bad "never registered"
 [ -s "$t/state/450069999999999/config.xml" ] || bad "no stored configuration"
+
+# --- first activation with the OTP SMS, then a P-CSCF that refuses connections:
+# the ACS is asked once and not again within ACS_MIN_INTERVAL ---
+sed 's/@SIP_PORT@/15062/' "$src/tests/rcs/acs.xml" > "$t/acs2.xml"
+mkfifo "$t/acs2.in" "$t/acs2.out" "$t/rcs2.pipe" "$t/acs2.ev"
+exec 6<>"$t/acs2.in"
+python3 -I "$src/tests/rcs/fake-acs.py" --http-port 18081 --https-port 18444 --cert "$t/server.pem" \
+	--key "$t/server.key" --xml "$t/acs2.xml" --scenario otp --log "$t/acs2.log" --events "$t/acs2.ev" <&6 > "$t/acs2.out" &
+pids="$pids $!"
+exec 7<"$t/acs2.out"
+read -r _ <&7
+conf '[rcs]' 'enable=true' "ca-file=$t/ca.pem" 'msisdn=+821099999999'
+sed -i 's|18080|18081|; s|18443|18444|' "$t/imsroha.conf"
+# "654321", UCS-2, application port 37273 (R9 6.3.1.1.2), as imsroha's PduReceived carries it.
+otp=0040048121430008521111310000001306050491990000003600350034003300320031
+IMSROHA_RCS_STATE="$t/state2" dbus-run-session -- sh -c '
+	# Held open read-write so the daemon can open its end at once.
+	exec 8<>"$2/rcs2.pipe"
+	"$1" 2> "$2/rcs2.pipe" & d=$!
+	if timeout 20 sh -c "read -r l < \"\$0\" && [ \"\$l\" = otp-cookie ]" "$2/acs2.ev"; then
+		gdbus emit --session --object-path /codes/noa/IMSroha --signal codes.noa.IMSroha.PduReceived \
+			"\"sms1\"" "\"$3\"" > /dev/null || echo "gdbus emit failed" >&2
+	fi
+	timeout 30 sh -c "while IFS= read -r l; do printf \"%s\n\" \"\$l\" >> \"\$0\"; case \$l in *\"not asking it again\"*) exit 0;; esac; done; exit 1" \
+		"$2/rcs2.err" < "$2/rcs2.pipe"; rc=$?
+	kill -TERM $d 2>/dev/null; wait $d 2>/dev/null
+	exit $rc' sh "$rcs" "$t" "$otp" || bad "OTP/unreachable P-CSCF: no back-off in time"
+grep -q '^https /?OTP=654321' "$t/acs2.log" || bad "the OTP from the SMS did not reach the ACS"
+grep -q 'msisdn=%2B821099999999&SMS_port=37273&token=' "$t/acs2.log" || bad "no non-PS request after the 511"
+grep -q 'waiting-otp' "$t/rcs2.err" || bad "the state never said waiting-otp"
+n2=$(grep -c '^connect' "$t/acs2.log" || true)
+[ "$n2" = 3 ] || bad "the ACS was contacted $n2 times, not 3 (HTTP, HTTPS, OTP)"
+grep -q 'P-CSCF is unreachable; asking the ACS again' "$t/rcs2.err" || bad "no return to the ACS after the P-CSCF failed"
+echo "OTP flow: SMS -> OTP -> configuration; unreachable P-CSCF: the ACS asked $n2 times in all"
 
 # --- off after on: one rcs_state=-4, then nothing ---
 conf '[rcs]' 'enable=false' "ca-file=$t/ca.pem" 'msisdn=+821099999999'
@@ -100,6 +137,7 @@ if [ $fail != 0 ]; then
 	echo "--- imsroha-rcs"; cat "$t/rcs.err"
 	echo "--- network"; cat "$t/net.log"
 	echo "--- off2"; cat "$t/off2.err"
+	echo "--- otp run"; cat "$t/rcs2.err" 2>/dev/null; cat "$t/acs2.log" 2>/dev/null
 	exit 1
 fi
 echo "rcs-daemon: passed"
