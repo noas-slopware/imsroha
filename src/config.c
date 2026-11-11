@@ -134,6 +134,7 @@ static void device_defaults(struct imsroha_device *dev)
 	dev->route_table = 1042;
 	dev->route_priority = 1042;
 	snprintf(dev->model, sizeof(dev->model), "imsroha");
+	snprintf(dev->operator_, sizeof(dev->operator_), "OMD");
 	snprintf(dev->build, sizeof(dev->build), "imsroha-%s", IMSROHA_VERSION);
 }
 
@@ -152,6 +153,7 @@ static void device_from(GKeyFile *kf, struct imsroha_device *dev)
 	get_int(kf, g, "route-table", &dev->route_table);
 	get_int(kf, g, "route-priority", &dev->route_priority);
 	get_str(kf, g, "model", dev->model, sizeof(dev->model));
+	get_str(kf, g, "operator", dev->operator_, sizeof(dev->operator_));
 	get_str(kf, g, "build", dev->build, sizeof(dev->build));
 }
 
@@ -217,7 +219,7 @@ static void carrier_from(GKeyFile *kf, const char *g, struct imsroha_carrier *ca
 	get_u16(kf, g, "rtp-port", &car->rtp_port);
 	get_int(kf, g, "pt-amr-wb-be", &car->pt_amrwb_be);
 	get_int(kf, g, "pt-amr-be", &car->pt_amr_be);
-	get_bool(kf, g, "sdp-tta", &car->sdp_tta);
+	get_bool(kf, g, "tta", &car->tta);
 	get_str(kf, g, "country-code", car->country_code, sizeof(car->country_code));
 	get_str(kf, g, "smsc", car->smsc, sizeof(car->smsc));
 	get_str(kf, g, "sms-psi", car->sms_psi, sizeof(car->sms_psi));
@@ -292,6 +294,7 @@ void imsroha_config_user_agent(const struct imsroha_config *cfg, char *out, size
 	replace_all(out, size, "[PRODUCT_MODEL]", cfg->dev.model);
 	replace_all(out, size, "[BUILD_VERSION]", cfg->dev.build);
 	replace_all(out, size, "[OMCCODE]", cfg->car.operator_code);
+	replace_all(out, size, "[OPERATOR]", cfg->dev.operator_);
 }
 
 void imsroha_derived_domain(const char *mcc, const char *mnc, char *out, size_t size)

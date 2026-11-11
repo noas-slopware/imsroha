@@ -1,0 +1,233 @@
+===== step 1: initial REGISTER
+----- <len>
+REGISTER sip:lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 1 REGISTER
+Contact: <sip:01000000000@[::1]:5060>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450061234567890@lte-lguplus.co.kr", realm="lte-lguplus.co.kr", nonce="", uri="sip:lte-lguplus.co.kr", response=""
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5062;port-s=5064, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5062;port-s=5064
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 600000
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LGU
+Content-Length: 0
+
+
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 5062 dport 6100 dir out tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 6100 dport 5062 dir in tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 6101 dport 5064 dir in tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 5064 dport 6101 dir out tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
+===== step 2: authenticated REGISTER
+----- <len> (to port-s)
+REGISTER sip:lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 2 REGISTER
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450061234567890@lte-lguplus.co.kr", realm="lte-lguplus.co.kr", nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", uri="sip:lte-lguplus.co.kr", response="50e7e1090e34791216b2c2680a4d35f1", algorithm=AKAv1-MD5
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5062;port-s=5064, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5062;port-s=5064
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=4444;spi-s=5555;port-c=6101;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 600000
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LGU
+Content-Length: 0
+
+
+===== step 3: after 200 OK to REGISTER
+----- <len> (to port-s)
+SUBSCRIBE sip:01000000000@lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+Route: <sip:scscf.lte-lguplus.co.kr;lr>
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 1 SUBSCRIBE
+Contact: <sip:01000000000@[::1]:5064>
+Event: reg
+Accept: application/reginfo+xml
+Expires: 600000
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+P-Preferred-Identity: <sip:01000000000@lte-lguplus.co.kr>
+User-Agent: TTA-VoLTE/4.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LGU
+Content-Length: 0
+
+
+===== step 4: MO-SMS MESSAGE
+----- <len> (to port-s)
+MESSAGE sip:01012345678@lte-lguplus.co.kr;user=phone SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01012345678@lte-lguplus.co.kr;user=phone>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 1 MESSAGE
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+P-Preferred-Identity: <sip:01000000000@lte-lguplus.co.kr>
+P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel.smsip
+User-Agent: TTA-VoLTE/4.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LGU
+Accept-Contact: *;+g.3gpp.smsip;require;explicit
+Content-Type: application/vnd.3gpp.sms
+Content-Length: 29
+
+\x00\x01\x00\x07\x91(\x01\x02)\x81r\x11\x01\x01\x0b\x81\x10\x102Tv\xf8\x00\x08\x04\x00h\x00i
+===== step 5: MO INVITE
+----- <len> (to port-s)
+INVITE tel:01012345678;phone-context=lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+Route: <sip:scscf.lte-lguplus.co.kr;lr>
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <tel:01012345678;phone-context=lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 1 INVITE
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+P-Preferred-Identity: <sip:01000000000@lte-lguplus.co.kr>
+P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
+User-Agent: TTA-VoLTE/4.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LGU
+P-Early-Media: supported
+Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";require;explicit
+Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
+Supported: 100rel, timer
+Session-Expires: 1800;refresher=uac
+Content-Type: application/sdp
+Content-Length: 547
+
+v=0
+o=01000000000 <sess> <ver> IN IP6 ::1
+s=-
+c=IN IP6 ::1
+t=0 0
+m=audio 40000 RTP/AVP 106 105 104 103 107 101
+b=AS:41
+b=RS:0
+b=RR:2500
+a=rtpmap:106 AMR-WB/16000/1
+a=fmtp:106 octet-align=1;mode-set=0,1,2
+a=rtpmap:105 AMR-WB/16000/1
+a=fmtp:105 mode-set=0,1,2
+a=rtpmap:104 AMR/8000/1
+a=fmtp:104 octet-align=1;mode-set=0,2,4,7
+a=rtpmap:103 AMR/8000/1
+a=fmtp:103 mode-set=0,2,4,7
+a=rtpmap:107 telephone-event/16000
+a=fmtp:107 0-15
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:20
+a=maxptime:120
+a=sendrecv
+
+===== step 6: after 180
+===== step 7: CANCEL
+----- <len> (to port-s)
+CANCEL tel:01012345678;phone-context=lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <tel:01012345678;phone-context=lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 1 CANCEL
+Max-Forwards: 70
+Content-Length: 0
+
+
+===== step 8: MT-SMS answers
+----- <len> (to port-c)
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmt1
+From: <tel:+821020921827>;tag=smsc1
+To: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+Call-ID: mt-sms-1@lte-lguplus.co.kr
+CSeq: 1 MESSAGE
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+Content-Type: application/vnd.3gpp.sms
+Content-Length: 2
+
+\x02\x05
+===== step 9: MT INVITE provisional
+----- <len> (to port-c)
+SIP/2.0 100 Trying
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmtcall1
+From: <tel:01012345678;phone-context=lte-lguplus.co.kr>;tag=far2
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: mt-call-1@lte-lguplus.co.kr
+CSeq: 1 INVITE
+Content-Length: 0
+
+
+----- <len> (to port-c)
+SIP/2.0 180 Ringing
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmtcall1
+From: <tel:01012345678;phone-context=lte-lguplus.co.kr>;tag=far2
+To: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+Call-ID: mt-call-1@lte-lguplus.co.kr
+CSeq: 1 INVITE
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
+Content-Length: 0
+
+
+===== step 10: MT answer
+----- <len> (to port-c)
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmtcall1
+From: <tel:01012345678;phone-context=lte-lguplus.co.kr>;tag=far2
+To: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+Call-ID: mt-call-1@lte-lguplus.co.kr
+CSeq: 1 INVITE
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS, INFO
+Session-Expires: 1800;refresher=uac
+Require: timer
+Content-Type: application/sdp
+Content-Length: 426
+
+v=0
+o=01000000000 <sess> <ver> IN IP6 ::1
+s=-
+c=IN IP6 ::1
+t=0 0
+m=audio 40000 RTP/AVP 100 96 101 102
+b=AS:41
+b=RS:0
+b=RR:2500
+a=rtpmap:100 AMR-WB/16000/1
+a=fmtp:100 octet-align=1;mode-set=0,1,2
+a=rtpmap:96 AMR/8000/1
+a=fmtp:96 octet-align=1;mode-set=0,2,4,7
+a=rtpmap:101 telephone-event/16000
+a=fmtp:101 0-15
+a=rtpmap:102 telephone-event/8000
+a=fmtp:102 0-15
+a=ptime:20
+a=maxptime:120
+a=sendrecv
+
+===== step 11: MT BYE answer
+----- <len> (to port-c)
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bK<rand>ye1
+From: <tel:01012345678;phone-context=lte-lguplus.co.kr>;tag=far2
+To: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+Call-ID: mt-call-1@lte-lguplus.co.kr
+CSeq: 2 BYE
+Content-Length: 0
+
+

@@ -452,7 +452,7 @@ static void sdp_new_session(struct imsd_sip_ctx *ctx)
  * Returns the body length, or -ENOTSUP if the offer has no AMR at all.
  */
 /*
- * Our SDP. An offer lists AMR-WB and AMR octet-aligned, and with sdp-tta
+ * Our SDP. An offer lists AMR-WB and AMR octet-aligned, and with tta
  * (TTAK.KO-06.0357/R6 5.4.2, Table 5-4) also bandwidth-efficient PTs,
  * maxptime:120, b=RS:0, b=RR:2500 and the phone number as o= username.
  * An answer takes the PTs (and their payload format) chosen from the offer.
@@ -486,7 +486,7 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 
 	/* Table 5-4 note 1: the originator's username is its phone number. */
 	char user[64] = "-";
-	if (car->sdp_tta) {
+	if (car->tta) {
 		const char *u = !strncmp(ctx->impu, "sip:", 4) ? ctx->impu + 4 :
 				!strncmp(ctx->impu, "tel:", 4) ? ctx->impu + 4 : ctx->impu;
 		size_t n = strcspn(u, "@;>");
@@ -505,7 +505,7 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 		"b=AS:41\r\n"
 		"%s",
 		user, (unsigned long long)ctx->sdp_sess_id, ver, ctx->local_ip, ctx->local_ip,
-		(unsigned)car->rtp_port, pts, car->sdp_tta ? "b=RS:0\r\nb=RR:2500\r\n" : "");
+		(unsigned)car->rtp_port, pts, car->tta ? "b=RS:0\r\nb=RR:2500\r\n" : "");
 	if (amrwb > 0 && len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=rtpmap:%d AMR-WB/16000/1\r\n"
@@ -533,7 +533,7 @@ static int build_local_sdp(struct imsd_sip_ctx *ctx, char *sdp, size_t size, int
 	if (len < size)
 		len += (size_t)snprintf(sdp + len, size - len,
 			"a=ptime:20\r\n%s"
-			"a=sendrecv\r\n", car->sdp_tta ? "a=maxptime:120\r\n" : "");
+			"a=sendrecv\r\n", car->tta ? "a=maxptime:120\r\n" : "");
 	if (len >= size)
 		return -ENOSPC;
 	return (int)len;
@@ -1429,6 +1429,10 @@ static void imsd_rtp_start(struct imsd_sip_ctx *ctx)
 
 static void imsd_rtp_stop(struct imsd_sip_ctx *ctx)
 {
+	if (ctx->se_timer) {
+		sd_event_source_unref(ctx->se_timer);
+		ctx->se_timer = NULL;
+	}
 	imsd_audio_stop(ctx);
 	if (ctx->rtp_tx_timer) {
 		sd_event_source_unref(ctx->rtp_tx_timer);
@@ -1573,7 +1577,8 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 				 ctx->call_is_incoming ? ctx->call_to_tag : ctx->call_from_tag);
 		char se_hdr[128] = "", se_val[64] = "";
 		if (find_header(msg, "Session-Expires", se_val, sizeof(se_val)) == 0 && se_val[0])
-			snprintf(se_hdr, sizeof(se_hdr), "Session-Expires: %s\r\nSupported: timer\r\n", se_val);
+			snprintf(se_hdr, sizeof(se_hdr), "Session-Expires: %s%s\r\nSupported: timer\r\n", se_val,
+				 ctx->cfg.car.tta && !strcasestr(se_val, "refresher") ? ";refresher=uac" : "");
 		char resp[3072];
 		int len = snprintf(resp, sizeof(resp),
 			"SIP/2.0 200 OK\r\n"
@@ -1625,6 +1630,14 @@ static int handle_incoming_invite(struct imsd_sip_ctx *ctx, const char *msg, siz
 	snprintf(ctx->inc_call_id, sizeof(ctx->inc_call_id), "%s", call_id);
 	snprintf(ctx->inc_cseq, sizeof(ctx->inc_cseq), "%s", cseq);
 	snprintf(ctx->inc_contact, sizeof(ctx->inc_contact), "%s", contact);
+	/* Its session timer, for our 2xx (TTAK.KO-06.0357/R6 5.2.7). */
+	{
+		char sup[256] = "";
+		ctx->inc_se[0] = '\0';
+		find_header(msg, "Session-Expires", ctx->inc_se, sizeof(ctx->inc_se));
+		find_header(msg, "Supported", sup, sizeof(sup));
+		ctx->inc_timer = strcasestr(sup, "timer") != NULL || ctx->inc_se[0];
+	}
 
 	/* Parse remote SDP. Without one, our 200 OK offers and the ACK answers. */
 	const char *body = strstr(msg, "\r\n\r\n");
@@ -2009,6 +2022,9 @@ static int handle_incoming_message(struct imsd_sip_ctx *ctx, const char *msg, si
 	return 0;
 }
 
+static void se_from_response(struct imsd_sip_ctx *ctx, const char *msg);
+static int retry_422(struct imsd_sip_ctx *ctx, const char *msg);
+
 /*
  * The reg event package (TS 24.229 5.1.1.3, RFC 3680): one subscription for
  * the life of the registration, refreshed with it, in one dialog. A 489
@@ -2177,6 +2193,9 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				snprintf(ctx->sub_to_tag, sizeof(ctx->sub_to_tag), "%s", tag);
 				ctx->sub_state = 1;
 				fprintf(stderr, "imsroha: reg event subscription active\n");
+			} else if (strstr(cseq, "UPDATE")) {
+				/* Our session refresh went through. */
+				se_from_response(ctx, buf);
 			} else if (strstr(cseq, "PRACK")) {
 				fprintf(stderr, "imsroha: PRACK acknowledged (200 OK)\n");
 			} else if (strstr(cseq, "INVITE")) {
@@ -2224,6 +2243,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				fprintf(stderr, "imsroha: sent ACK:\n%.*s\n", ack_len, ack);
 				ctx->call_state = IMSD_CALL_ACTIVE;
 				imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 4, 0);
+				se_from_response(ctx, buf);
 			}
 		} else if (status_code == 183 || status_code == 180) {
 			/* Session Progress / Ringing */
@@ -2300,6 +2320,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			}
 			if (strstr(cseq, "INVITE")) {
 				/* Non-2xx final response to INVITE -> send transaction ACK */
+				int retried = 0;
 				const char *ruri = ctx->call_remote_uri;
 				char to_hdr[256] = "";
 				find_header(buf, "To", to_hdr, sizeof(to_hdr));
@@ -2315,9 +2336,13 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 					"Content-Length: 0\r\n\r\n",
 		ruri, ctx->local_ip, ctx->ua_port, ctx->call_branch, ctx->impu, ctx->call_from_tag, to_hdr, ctx->call_id, ctx->call_invite_cseq);
 				send_sip_msg(ctx, ack, ack_len);
-				ctx->call_state = IMSD_CALL_TERMINATED;
-				imsd_rtp_stop(ctx);
-				imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 6, 0);
+				if (status_code == 422 && !ctx->call_is_incoming)
+					retried = retry_422(ctx, buf);
+				if (!retried) {
+					ctx->call_state = IMSD_CALL_TERMINATED;
+					imsd_rtp_stop(ctx);
+					imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 6, 0);
+				}
 			}
 			if (strstr(cseq, "SUBSCRIBE")) {
 				/* 489 Bad Event: the network has no reg event package. */
@@ -2441,7 +2466,8 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 
 		char se_hdr[128] = "", se_val[64] = "";
 		if (find_header(buf, "Session-Expires", se_val, sizeof(se_val)) == 0 && se_val[0])
-			snprintf(se_hdr, sizeof(se_hdr), "Session-Expires: %s\r\nSupported: timer\r\n", se_val);
+			snprintf(se_hdr, sizeof(se_hdr), "Session-Expires: %s%s\r\nSupported: timer\r\n", se_val,
+				 ctx->cfg.car.tta && !strcasestr(se_val, "refresher") ? ";refresher=uac" : "");
 
 		const char *body = strstr(buf, "\r\n\r\n");
 		if (strncmp(buf, "UPDATE ", 7) == 0 && body && body[4]) {
@@ -2623,6 +2649,142 @@ int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const c
 	return 0;
 }
 
+/*
+ * The MO INVITE from what place_call() set up in ctx: sent once, and again
+ * after a 422 with the larger Session-Expires (RFC 4028 7.4). TTAK.KO-06.0357/R6
+ * 5.2.7: the UE asks to be the refresher (refresher=uac).
+ */
+static int send_mo_invite(struct imsd_sip_ctx *ctx)
+{
+	char sdp[1024];
+	int sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), 0);
+	if (sdp_len < 0)
+		return sdp_len;
+
+	char route_hdr[300] = "";
+	if (ctx->reg_service_route[0])
+		snprintf(route_hdr, sizeof(route_hdr), "Route: %s\r\n", ctx->reg_service_route);
+
+	char req[3072];
+	int req_len = snprintf(req, sizeof(req),
+		"INVITE %s SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP [%s]:%u;branch=%s;rport\r\n"
+		"%s"
+		"From: <%s>;tag=%s\r\n"
+		"To: %s\r\n"
+		"Call-ID: %s\r\n"
+		"CSeq: %u INVITE\r\n"
+		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
+		"Max-Forwards: 70\r\n"
+		"P-Access-Network-Info: %s\r\n"
+		"P-Preferred-Identity: <%s>\r\n"
+		"P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel\r\n"
+		"User-Agent: %s\r\n"
+		"P-Early-Media: supported\r\n"
+		"Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";require;explicit\r\n"
+		"Allow: " IMSD_ALLOW "\r\n"
+		"Supported: 100rel, timer\r\n"
+		"Session-Expires: %u%s\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: %d\r\n\r\n"
+		"%s",
+		ctx->call_remote_uri, ctx->local_ip, ctx->ua_port, ctx->call_branch, route_hdr, ctx->impu,
+		ctx->call_from_tag, ctx->call_remote, ctx->call_id, ctx->call_cseq, ctx->impu_user, ctx->local_ip,
+		ctx->ua_port, ctx->pani, ctx->impu, ctx->user_agent,
+		ctx->call_se, ctx->cfg.car.tta ? ";refresher=uac" : "", sdp_len, sdp);
+
+	fprintf(stderr, "imsroha: placing VoLTE call to %s with INVITE:\n%s\n", ctx->call_dest, req);
+	return send_sip_msg(ctx, req, req_len);
+}
+
+/* Our session refresh (RFC 4028 7.4 / 10): an UPDATE without SDP at half the interval. */
+static void se_arm(struct imsd_sip_ctx *ctx, unsigned delta);
+
+static int on_se_timer(sd_event_source *s, uint64_t usec, void *userdata)
+{
+	struct imsd_sip_ctx *ctx = userdata;
+	(void)s; (void)usec;
+	if (ctx->call_state != IMSD_CALL_ACTIVE || ctx->call_is_incoming)
+		return 0;
+	char branch[32];
+	rand_hex(branch, 8);
+	const char *ruri = ctx->call_remote_contact[0] ? ctx->call_remote_contact : ctx->call_remote_uri;
+	char req[1536];
+	int len = snprintf(req, sizeof(req),
+		"UPDATE %s SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
+		"From: <%s>;tag=%s\r\n"
+		"To: %s;tag=%s\r\n"
+		"Call-ID: %s\r\n"
+		"CSeq: %u UPDATE\r\n"
+		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
+		"Max-Forwards: 70\r\n"
+		"Supported: timer\r\n"
+		"Session-Expires: %u;refresher=uac\r\n"
+		"User-Agent: %s\r\n"
+		"Content-Length: 0\r\n\r\n",
+		ruri, ctx->local_ip, ctx->ua_port, branch, ctx->impu, ctx->call_from_tag,
+		ctx->call_remote, ctx->call_to_tag, ctx->call_id, ++ctx->call_cseq,
+		ctx->impu_user, ctx->local_ip, ctx->ua_port, ctx->call_se, ctx->user_agent);
+	if (len > 0 && (size_t)len < sizeof(req)) {
+		fprintf(stderr, "imsroha: refreshing the session (UPDATE, Session-Expires %u)\n", ctx->call_se);
+		send_sip_msg(ctx, req, (size_t)len);
+	}
+	/* If the 200 does not come, the network ends the call at expiry anyway. */
+	se_arm(ctx, ctx->call_se);
+	return 0;
+}
+
+static void se_arm(struct imsd_sip_ctx *ctx, unsigned delta)
+{
+	uint64_t now = 0;
+	if (delta < 90)
+		delta = 90; /* RFC 4028 Min-SE floor */
+	sd_event_now(ctx->event, CLOCK_BOOTTIME, &now);
+	uint64_t at = now + (uint64_t)delta * 1000000ULL / 2;
+	if (ctx->se_timer) {
+		sd_event_source_set_time(ctx->se_timer, at);
+		sd_event_source_set_enabled(ctx->se_timer, SD_EVENT_ONESHOT);
+	} else {
+		sd_event_add_time(ctx->event, &ctx->se_timer, CLOCK_BOOTTIME, at, 1000000ULL, on_se_timer, ctx);
+	}
+}
+
+/*
+ * A 2xx to our INVITE or UPDATE: Session-Expires "delta;refresher=uac" makes
+ * us the refresher; refresh at half of it.
+ */
+static void se_from_response(struct imsd_sip_ctx *ctx, const char *msg)
+{
+	char se[64] = "", who[16] = "";
+	if (find_header(msg, "Session-Expires", se, sizeof(se)) < 0 || !se[0])
+		return;
+	unsigned delta = (unsigned)strtoul(se, NULL, 10);
+	find_param(se, "refresher", who, sizeof(who));
+	if (delta)
+		ctx->call_se = delta;
+	if (!strcasecmp(who, "uac") && ctx->event)
+		se_arm(ctx, ctx->call_se);
+}
+
+/* A 422 to our INVITE: ask again with the registrar's Min-SE. 1 when resent. */
+static int retry_422(struct imsd_sip_ctx *ctx, const char *msg)
+{
+	char min_se[32] = "";
+	if (find_header(msg, "Min-SE", min_se, sizeof(min_se)) < 0)
+		return 0;
+	unsigned v = (unsigned)strtoul(min_se, NULL, 10);
+	if (!v || v <= ctx->call_se)
+		return 0;
+	ctx->call_se = v;
+	ctx->call_invite_cseq = ++ctx->call_cseq;
+	char branch[32];
+	rand_hex(branch, 8);
+	snprintf(ctx->call_branch, sizeof(ctx->call_branch), "z9hG4bK%s", branch);
+	fprintf(stderr, "imsroha: INVITE 422, asking again with Session-Expires %u\n", v);
+	return send_mo_invite(ctx) == 0;
+}
+
 int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint32_t *out_call_id)
 {
 	if (!dest_number || ctx->reg_state != IMSD_UP)
@@ -2654,9 +2816,6 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 	/* No DTMF until the answer says which telephone-event clocks it kept. */
 	ctx->call_has_dtmf_wb = ctx->call_has_dtmf_nb = 0;
 	sdp_new_session(ctx);
-
-	char sdp[1024];
-	int sdp_len = build_local_sdp(ctx, sdp, sizeof(sdp), 0);
 
 	char clean_dest[64];
 	size_t c_idx = 0;
@@ -2709,42 +2868,13 @@ int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint3
 
 	snprintf(ctx->call_remote_uri, sizeof(ctx->call_remote_uri), "%s", target_ruri);
 
-	char route_hdr[300] = "";
-	if (ctx->reg_service_route[0]) {
-		snprintf(route_hdr, sizeof(route_hdr), "Route: %s\r\n", ctx->reg_service_route);
-	}
-
-	char req[3072];
-	int req_len = snprintf(req, sizeof(req),
-		"INVITE %s SIP/2.0\r\n"
-		"Via: SIP/2.0/UDP [%s]:%u;branch=z9hG4bK%s;rport\r\n"
-		"%s"
-		"From: <%s>;tag=%s\r\n"
-		"To: %s\r\n"
-		"Call-ID: %s\r\n"
-		"CSeq: %u INVITE\r\n"
-		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
-		"Max-Forwards: 70\r\n"
-		"P-Access-Network-Info: %s\r\n"
-		"P-Preferred-Identity: <%s>\r\n"
-		"P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel\r\n"
-		"User-Agent: %s\r\n"
-		"P-Early-Media: supported\r\n"
-		"Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\";require;explicit\r\n"
-		"Allow: " IMSD_ALLOW "\r\n"
-		"Supported: 100rel, timer\r\n"
-		"Session-Expires: %u\r\n"
-		"Content-Type: application/sdp\r\n"
-		"Content-Length: %d\r\n\r\n"
-		"%s",
-		target_ruri, ctx->local_ip, ctx->ua_port, branch, route_hdr, ctx->impu, ctx->call_from_tag, target_to, ctx->call_id, ctx->call_cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port, ctx->pani, ctx->impu, ctx->user_agent,
-		ctx->cfg.car.session_expires, sdp_len, sdp);
-
-	fprintf(stderr, "imsroha: placing VoLTE call to %s with INVITE:\n%s\n", dest_number, req);
+	snprintf(ctx->call_dest, sizeof(ctx->call_dest), "%s", dest_number);
+	ctx->call_se = ctx->cfg.car.session_expires;
+	int r = send_mo_invite(ctx);
 	imsd_rtp_start(ctx);
 	imsd_emit_call_added(ctx->bus, ctx->active_call_id, dest_number, 2);
 	imsd_emit_call_state_changed(ctx->bus, ctx->active_call_id, 2, 0);
-	return send_sip_msg(ctx, req, req_len);
+	return r;
 }
 
 int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
@@ -2759,6 +2889,20 @@ int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
 	if (sdp_len < 0)
 		return sdp_len;
 
+	/*
+	 * TTAK.KO-06.0357/R6 5.2.7: when the INVITE supports "timer", the 2xx
+	 * names the caller (uac) as refresher, with the INVITE's interval or ours.
+	 */
+	char se[160] = "";
+	if (ctx->cfg.car.tta && ctx->inc_timer) {
+		char who[16] = "";
+		unsigned delta = ctx->inc_se[0] ? (unsigned)strtoul(ctx->inc_se, NULL, 10) : 0;
+		if (ctx->inc_se[0])
+			find_param(ctx->inc_se, "refresher", who, sizeof(who));
+		snprintf(se, sizeof(se), "Session-Expires: %u;refresher=%s\r\nRequire: timer\r\n",
+			 delta ? delta : ctx->cfg.car.session_expires, who[0] ? who : "uac");
+	}
+
 	char resp[3072];
 	int len = snprintf(resp, sizeof(resp),
 		"SIP/2.0 200 OK\r\n"
@@ -2769,10 +2913,11 @@ int imsd_sip_answer_call(struct imsd_sip_ctx *ctx)
 		"CSeq: %s\r\n"
 		"Contact: <sip:%s@[%s]:%u>;+g.3gpp.icsi-ref=\"urn%%3Aurn-7%%3A3gpp-service.ims.icsi.mmtel\"\r\n"
 		"Allow: " IMSD_ALLOW "\r\n"
+		"%s"
 		"Content-Type: application/sdp\r\n"
 		"Content-Length: %d\r\n\r\n"
 		"%s",
-		ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag, ctx->inc_call_id, ctx->inc_cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port, sdp_len, sdp);
+		ctx->inc_via, ctx->inc_from, ctx->inc_to, ctx->call_to_tag, ctx->inc_call_id, ctx->inc_cseq, ctx->impu_user, ctx->local_ip, ctx->ua_port, se, sdp_len, sdp);
 
 	imsd_rtp_start(ctx);
 	send_sip_msg(ctx, resp, len);

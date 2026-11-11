@@ -13,16 +13,15 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 
 | carrier | PLMN | state |
 |---|---|---|
-| LG U+ | 450 06 | registers, SMS both ways, VoLTE in and out, DTMF on the Galaxy Z Flip3 since 2026-11, as `b2q-imsd` 0.1.0-20. IMSroha sends the same SIP bytes (golden test), but the new bearer, SIM reads, routing and units have not run on the phone yet |
+| LG U+ | 450 06 | registers, SMS both ways, VoLTE in and out, DTMF on the Galaxy Z Flip3 since 2026-11, as `b2q-imsd` 0.1.0-20, without IPsec or TTA's additions. IMSroha now follows TTAK.KO-06.0357/R6 there too, untried; `tests/lguplus-recorded.conf` reproduces the old behaviour byte for byte |
 | KT | 450 08 | profile from the stock Samsung firmware; has never registered |
 | SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
 
-SKT and KT get what TTAK.KO-06.0357/R6 (the Korean VoLTE terminal standard) asks
-for: sec-agree with IPsec ESP (TS 33.203) with no way around it, the reg event
-subscription, `+sip.instance`, and its SDP offer. LG U+ registers without any of
-them, and keeps doing so. `docs/korea-tta.md` goes through R6 and where imsroha
-stands.
+All three Korean carriers get what TTAK.KO-06.0357/R6 (the Korean VoLTE terminal
+standard) asks for: sec-agree with IPsec ESP (TS 33.203) with no way around it, the
+reg event subscription, `+sip.instance`, its SDP offer, its session timer and its
+User-Agent. `docs/korea-tta.md` goes through R6 and where imsroha stands.
 
 Hardware it has run on: the Galaxy Z Flip3 (SM8350, IPA, QRTR) in
 [linux-zflip3](https://github.com/noas-slopware/linux-zflip3). Nothing in the code
@@ -79,8 +78,9 @@ and vo-amrwbenc. `packaging/PKGBUILD` builds the Arch package from this checkout
 the AKA 401, MO and MT SMS, a cancelled MO call and an answered MT call. With the
 random fields masked, the output must match:
 
-- `tests/golden-lguplus.txt`: an LG U+ card with an ISIM. Byte for byte what the code
-  sent before it left linux-zflip3.
+- `tests/golden-lguplus.txt`: an LG U+ card with an ISIM and `tests/lguplus-recorded.conf`.
+  Byte for byte what the code sent before it left linux-zflip3.
+- `tests/golden-lguplus-tta.txt`: the same card with the shipped LG U+ profile (R6).
 - `tests/golden-kt.txt`: a KT card without an ISIM, with sec-agree and the reg event.
 - `esp-loopback`: the KT run again with the real `ip xfrm`, in a user and network
   namespace. The fake P-CSCF answers through the SAs, and every SA has to carry

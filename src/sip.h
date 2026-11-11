@@ -109,6 +109,13 @@ struct imsd_sip_ctx {
 	char call_remote_contact[128];
 	uint32_t call_cseq;
 	uint32_t call_invite_cseq;
+	char call_dest[64];       /* the dial string, for logs and the 422 retry */
+
+	/* Session timer (RFC 4028, TTAK.KO-06.0357/R6 5.2.7). */
+	unsigned call_se;         /* Session-Expires we ask for */
+	sd_event_source *se_timer;/* our refresh, when we are the refresher */
+	char inc_se[64];          /* the incoming INVITE's Session-Expires, "" if none */
+	int inc_timer;            /* the incoming INVITE supports "timer" */
 
 	/* Incoming call state */
 	int call_is_incoming;

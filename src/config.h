@@ -40,6 +40,7 @@ struct imsroha_device {
 
 	/* User-Agent placeholders that describe this device. */
 	char model[64];             /* [PRODUCT_MODEL] */
+	char operator_[16];         /* [OPERATOR]: the carrier that first sold the device (TTA: SKT, KT, LGU, OMD) */
 	char build[64];             /* [BUILD_VERSION] */
 };
 
@@ -60,7 +61,7 @@ struct imsroha_carrier {
 	int pt_amrwb, pt_amr, pt_dtmf_wb, pt_dtmf; /* payload types we offer */
 	uint16_t rtp_port;
 	int pt_amrwb_be, pt_amr_be;  /* bandwidth-efficient PTs we also offer, 0 = none */
-	int sdp_tta;                 /* TTAK.KO-06.0357/R6 Table 5-4: maxptime, b=RS/RR, o=<CTN> */
+	int tta;                     /* TTAK.KO-06.0357/R6: Table 5-4 offers, session timer refresher=uac */
 	unsigned session_expires;
 	/* Home country code: +<cc> numbers are dialled and texted in national form (0...). */
 	char country_code[8];

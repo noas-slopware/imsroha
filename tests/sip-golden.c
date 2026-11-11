@@ -303,6 +303,7 @@ int main(void)
 		"Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmtcall1\r\n"
 		"From: <tel:01012345678;phone-context=%s>;tag=far2\r\nTo: <sip:01000000000@%s>\r\n"
 		"Call-ID: mt-call-1@%s\r\nCSeq: 1 INVITE\r\nContact: <sip:far@[::1]:5060>\r\n"
+		"Supported: 100rel, timer\r\nSession-Expires: 1800\r\n"
 		"Content-Type: application/sdp\r\nContent-Length: %zu\r\n\r\n%s",
 		ctx.domain, ctx.domain, ctx.domain, strlen(sdp), sdp);
 	to_ue_str(&ctx, resp);

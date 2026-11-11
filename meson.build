@@ -67,16 +67,23 @@ golden = executable('sip-golden', 'tests/sip-golden.c', 'src/sms.c', 'src/dns.c'
   dependencies: [glib, gio, qmi, qrtr, systemd],
   build_by_default: false)
 test('amr-be', executable('amr-be', 'tests/amr-be.c', 'src/amr_be.c', build_by_default: false))
-test('sip-golden', find_program('tests/run-golden.sh'),
+# LG U+ with tests/lguplus-recorded.conf: byte for byte what b2q-imsd sent.
+test('sip-golden-lguplus-recorded', find_program('tests/run-golden.sh'),
   args: [golden.full_path(), meson.project_source_root() / 'tests/golden-lguplus.txt',
          meson.project_source_root() / 'tests/normalize.sh'],
-  depends: golden)
+  env: ['GOLDEN_CONF=' + meson.project_source_root() / 'tests/lguplus-recorded.conf'],
+  depends: golden, is_parallel: false)
+# LG U+ as configured: TTAK.KO-06.0357/R6 with sec-agree.
+test('sip-golden-lguplus', find_program('tests/run-golden.sh'),
+  args: [golden.full_path(), meson.project_source_root() / 'tests/golden-lguplus-tta.txt',
+         meson.project_source_root() / 'tests/normalize.sh'],
+  depends: golden, is_parallel: false)
 test('sip-golden-kt', find_program('tests/run-golden.sh'),
   args: [golden.full_path(), meson.project_source_root() / 'tests/golden-kt.txt',
          meson.project_source_root() / 'tests/normalize.sh'],
   env: ['GOLDEN_CARRIER=KT'],
-  depends: golden)
+  depends: golden, is_parallel: false)
 test('esp-loopback', find_program('tests/esp-loopback.sh'),
   args: [golden.full_path(), meson.project_source_root() / 'tests/golden-kt.txt',
          meson.project_source_root() / 'tests/normalize.sh'],
-  depends: golden)
+  depends: golden, is_parallel: false)

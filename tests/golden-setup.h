@@ -4,7 +4,8 @@
  * start, from data/carriers.conf and tests/imsroha-flip3.conf, with the
  * P-CSCF on loopback. GOLDEN_CARRIER picks the SIM:
  *
- *   LGU (default)  an LG U+ card with an ISIM, the recorded PDN
+ *   LGU (default)  an LG U+ card with an ISIM, the recorded PDN (with
+ *                  GOLDEN_CONF=tests/lguplus-recorded.conf: as b2q-imsd sent it)
  *   KT             a KT card without an ISIM: identity from the IMSI,
  *                  sec-agree with IPsec, the RP-ACK in its own MESSAGE
  */
@@ -28,7 +29,9 @@ static void golden_setup(struct imsd_sip_ctx *ctx, sd_event *event, int ue_fd,
 	ctx->call_state = IMSD_CALL_IDLE;
 
 	setenv("IMSROHA_CARRIERS", GOLDEN_SRCDIR "/data/carriers.conf", 1);
-	setenv("IMSROHA_CONF", GOLDEN_SRCDIR "/tests/imsroha-flip3.conf", 1);
+	/* GOLDEN_CONF: another imsroha.conf (tests/lguplus-recorded.conf). */
+	setenv("IMSROHA_CONF", getenv("GOLDEN_CONF") ? getenv("GOLDEN_CONF") :
+	       GOLDEN_SRCDIR "/tests/imsroha-flip3.conf", 1);
 	/*
 	 * sec-agree installs SAs through "ip": the test logs the calls instead,
 	 * unless GOLDEN_REAL_IP is set (tests/esp-loopback.sh, in a namespace).
