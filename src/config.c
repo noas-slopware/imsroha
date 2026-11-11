@@ -136,7 +136,7 @@ static void device_defaults(struct imsroha_device *dev)
 	snprintf(dev->model, sizeof(dev->model), "imsroha");
 	snprintf(dev->operator_, sizeof(dev->operator_), "OMD");
 	snprintf(dev->build, sizeof(dev->build), "IMSroha-%s", IMSROHA_VERSION);
-	snprintf(dev->device_type, sizeof(dev->device_type), "Android_Phone");
+	snprintf(dev->device_type, sizeof(dev->device_type), "Linux_Phone");
 }
 
 static void device_from(GKeyFile *kf, struct imsroha_device *dev)
