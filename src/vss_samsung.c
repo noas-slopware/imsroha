@@ -15,7 +15,9 @@
 #include <libqmi-glib.h>
 #include "config.h"
 #include "qmidev.h"
+#if QMI_QRTR_SUPPORTED
 #include <libqrtr-glib.h>
+#endif
 
 static GMainLoop *loop;
 static QmiDevice *g_dev;
@@ -185,7 +187,7 @@ static void client_ready(QmiDevice *device, GAsyncResult *res, gpointer user_dat
     g_timeout_add_seconds(3, send_step3, NULL);
 }
 
-static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data) {
+G_GNUC_UNUSED static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data) {
     (void)res; (void)user_data;
     g_dev = device;
     g_signal_connect(g_dev, "indication", G_CALLBACK(on_indication), NULL);
@@ -194,6 +196,7 @@ static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data)
     qmi_device_allocate_client(device, (QmiService)227, QMI_CID_NONE, 10, NULL, (GAsyncReadyCallback)client_ready, NULL);
 }
 
+#if QMI_QRTR_SUPPORTED
 static void on_vss_service(GObject *src, GAsyncResult *res, gpointer user_data) {
     QmiDevice *dev = user_data;
     if (!qrtr_node_wait_for_services_finish(QRTR_NODE(src), res, NULL)) {
@@ -204,6 +207,7 @@ static void on_vss_service(GObject *src, GAsyncResult *res, gpointer user_data) 
     }
     open_ready(dev, NULL, NULL);
 }
+#endif
 
 static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
     GError *error = NULL;
@@ -215,13 +219,19 @@ static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
         quit_fail("no QMI device");
         return;
     }
+#if QMI_QRTR_SUPPORTED
     QrtrNode *node = qmi_device_peek_node(dev);
+#else
+    void *node = NULL;
+#endif
     if (!node) {
+        /* Samsung's VSS service is on its SoC modems, reached over QRTR. */
         g_print("imsroha-vss-samsung: not a QRTR modem, nothing to do\n");
         g_object_unref(dev);
         g_main_loop_quit(loop);
         return;
     }
+#if QMI_QRTR_SUPPORTED
     /*
      * The modem registers its services one by one while it boots (and it
      * may boot twice), so 227 may come after the node: wait for
@@ -233,6 +243,7 @@ static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
     g_array_append_val(svc, vss);
     qrtr_node_wait_for_services(node, svc, 30000, NULL, on_vss_service, dev);
     g_array_unref(svc);
+#endif
 }
 
 int main(void) {

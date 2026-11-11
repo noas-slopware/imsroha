@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "qmidev.h"
 
+/* SoC modems are reached over QRTR when libqmi was built with it; USB and
+ * PCIe modems (qmi-device=) never need it. */
+#if QMI_QRTR_SUPPORTED
 #include <libqrtr-glib.h>
+#endif
 
 struct open_ctx {
 	QmiDeviceOpenFlags flags;
+#if QMI_QRTR_SUPPORTED
 	QrtrBus *bus;
+#else
+	GObject *bus; /* always NULL */
+#endif
 	guint node;
 };
 
@@ -38,9 +46,11 @@ static void on_device(GObject *src, GAsyncResult *res, gpointer user_data)
 	QmiDevice *qmi;
 
 	(void)src;
+#if QMI_QRTR_SUPPORTED
 	if (c->bus)
 		qmi = qmi_device_new_from_node_finish(res, &error);
 	else
+#endif
 		qmi = qmi_device_new_finish(res, &error);
 	if (!qmi) {
 		g_task_return_error(task, error);
@@ -53,6 +63,7 @@ static void on_device(GObject *src, GAsyncResult *res, gpointer user_data)
 	qmi_device_open(qmi, c->flags, 10, g_task_get_cancellable(task), on_opened, task);
 }
 
+#if QMI_QRTR_SUPPORTED
 static void on_node(GObject *src, GAsyncResult *res, gpointer user_data)
 {
 	GTask *task = user_data;
@@ -83,6 +94,7 @@ static void on_bus(GObject *src, GAsyncResult *res, gpointer user_data)
 	}
 	qrtr_bus_wait_for_node(c->bus, c->node, 10000, g_task_get_cancellable(task), on_node, task);
 }
+#endif
 
 void imsroha_qmi_open(const struct imsroha_device *dev, QmiDeviceOpenFlags flags,
 		      GCancellable *cancellable, GAsyncReadyCallback cb, gpointer user_data)
@@ -102,7 +114,13 @@ void imsroha_qmi_open(const struct imsroha_device *dev, QmiDeviceOpenFlags flags
 		g_object_unref(file);
 		return;
 	}
+#if QMI_QRTR_SUPPORTED
 	qrtr_bus_new(3000, cancellable, on_bus, task);
+#else
+	g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+				"this libqmi has no QRTR support: set qmi-device= in [device]");
+	g_object_unref(task);
+#endif
 }
 
 QmiDevice *imsroha_qmi_open_finish(GAsyncResult *res, GError **error)
@@ -112,8 +130,13 @@ QmiDevice *imsroha_qmi_open_finish(GAsyncResult *res, GError **error)
 
 int imsroha_qmi_has_service(QmiDevice *qmi, QmiService service)
 {
+#if QMI_QRTR_SUPPORTED
 	QrtrNode *node = qmi_device_peek_node(qmi);
 	if (!node)
 		return -1;
 	return qrtr_node_lookup_port(node, service) >= 0 ? 1 : 0;
+#else
+	(void)qmi; (void)service;
+	return -1;
+#endif
 }
