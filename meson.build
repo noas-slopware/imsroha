@@ -19,7 +19,7 @@ amrnb = cc.find_library('opencore-amrnb')
 amrwbenc = cc.find_library('vo-amrwbenc')
 
 common = static_library('imsroha-common',
-  'src/config.c', 'src/qmidev.c',
+  'src/config.c', 'src/qmidev.c', 'src/rmnet_links.c',
   dependencies: [glib, gio, qmi, qrtr])
 
 executable('imsroha',
@@ -66,6 +66,10 @@ golden = executable('sip-golden', 'tests/sip-golden.c', 'src/sms.c', 'src/dns.c'
   include_directories: include_directories('src'),
   dependencies: [glib, gio, qmi, qrtr, systemd],
   build_by_default: false)
+rmnet_clear = executable('rmnet-clear', 'tests/rmnet-clear.c', link_with: common,
+  dependencies: [glib], build_by_default: false)
+test('rmnet-clear', find_program('tests/rmnet-clear.sh'), args: [rmnet_clear.full_path()],
+  depends: rmnet_clear)
 test('amr-be', executable('amr-be', 'tests/amr-be.c', 'src/amr_be.c', build_by_default: false))
 # LG U+ with tests/lguplus-recorded.conf: byte for byte what b2q-imsd sent.
 test('sip-golden-lguplus-recorded', find_program('tests/run-golden.sh'),

@@ -23,7 +23,7 @@ data/carriers.conf takes the SKT and KT values R6 does not fix.
 |---|---|---|
 | 5.2.1 | ICSI `urn:urn-7:3gpp-service.ims.icsi.mmtel` in Contact; `+g.3gpp.smsip` when the UE does SMS over IP | yes; smsip per carrier (`sms-over-ip`) |
 | 5.2.1 | `User-Agent: TTA-VoLTE/4.0 <model>/<sw> Device_Type/<type> <operator>`, operator = the carrier that first sold the device: `SKT` / `KT` / `LGU` / `OMD` (open market) / token. 5.2.2 still says `TTA-VoLTE/3.0` | `TTA-VoLTE/4.0`, the ABNF's; operator from `[device] operator=` (OMD when unset). Stock Samsung sends 3.0 with the SIM network's OMC code (SKC/KTC/LUC); LG U+ has accepted `TTA-VoLTE/1.0 ... LUC` |
-| 5.2.1 | SUBSCRIBE to the reg event package (TS 24.229 5.1.1.3); stop after 489 | `reg-event`, on for all three; one dialog, refreshed with each registration; a NOTIFY that terminates our contact re-registers |
+| 5.2.1 | SUBSCRIBE to the reg event package (TS 24.229 5.1.1.3); stop after 489 | `reg-event`, on for all three (LG U+ answers 489 "REG EVENT OFF" and imsroha stops); one dialog, refreshed with each registration; a NOTIFY that terminates our contact re-registers |
 | 5.2.1 | Contact `+sip.instance` with the IMEI URN (TS 23.003 13.8) | `sip-instance`, on for all three; the IMEI from QMI DMS |
 | 5.2.1 | ISIM IMPU: one record = normal and emergency; two = first emergency, second normal. No ISIM: temporary IMPU from the IMSI | yes (the record on the home domain; without an ISIM the temporary IMPU registers and everything else uses the first P-Associated-URI) |
 | 5.2.1 | 305 on re-registration: another P-CSCF; 503 without Retry-After = 500; try every P-CSCF from DM/PCO, then a new IMS PDN | P-CSCF list with failover on timeouts |

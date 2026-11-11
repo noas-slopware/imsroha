@@ -42,6 +42,7 @@
 
 #include "config.h"
 #include "qmidev.h"
+#include "rmnet_links.h"
 
 /*
  * Used only when the modem reports no MTU for the PDN. 1428 is what the stock
@@ -250,6 +251,8 @@ static int configure_network(const char *addr, guint8 prefix_len, guint32 mtu)
 	const char *const del[] = { "ip", "link", "del", ifn, NULL };
 	if (if_nametoindex(ifn))
 		run(del);
+	/* And whatever else still holds our mux id, under any name. */
+	imsroha_rmnet_clear_mux(dev.data_netdev, dev.mux_id);
 
 	/* Checksum offload as negotiated: QMAPv5 has its own header format. */
 	const char *ingress_ck = NULL, *egress_ck = NULL;

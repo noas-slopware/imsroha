@@ -13,7 +13,7 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 
 | carrier | PLMN | state |
 |---|---|---|
-| LG U+ | 450 06 | registers, SMS both ways, VoLTE in and out, DTMF on the Galaxy Z Flip3 since 2026-11, as `b2q-imsd` 0.1.0-20, without IPsec or TTA's additions. IMSroha now follows TTAK.KO-06.0357/R6 there too, untried; `tests/lguplus-recorded.conf` reproduces the old behaviour byte for byte |
+| LG U+ | 450 06 | IMSroha on the Galaxy Z Flip3 since 2026-11-11: registers with TTAK.KO-06.0357/R6 sec-agree (IPsec), SMS and VoLTE both ways. The reg event is refused (489 "REG EVENT OFF"); the PCO carries no P-CSCF, the profile's is used. Before, as `b2q-imsd`, without IPsec: `tests/lguplus-recorded.conf` reproduces that byte for byte |
 | KT | 450 08 | profile from the stock Samsung firmware; has never registered |
 | SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |
