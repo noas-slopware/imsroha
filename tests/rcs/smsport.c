@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/* The OTP SMS of TTAK.KO-06.0410/R9 6.3.1.1.2: UCS-2, port 37273 (0x9199). */
+#include <stdio.h>
+#include <string.h>
+#include "smsport.h"
+
+static int fails;
+
+static void expect(const char *what, int ok)
+{
+	printf("%s %s\n", ok ? "ok  " : "FAIL", what);
+	fails += !ok;
+}
+
+int main(void)
+{
+	struct sms_deliver d;
+	/* 00 no SMSC | 40 DELIVER+UDHI | OA 4 digits 1234 | PID 00 | DCS 08 |
+	 * SCTS | UDL 19 | UDH 06 05 04 9199 0000 | "123456" in UCS-2 */
+	const char *otp = "00" "40" "04" "81" "2143" "00" "08" "52111131000000" "13"
+			  "06050491990000" "003100320033003400350036";
+	expect("parses", sms_parse_deliver_hex(otp, &d) == 0);
+	expect("destination port 37273", d.dest_port == 37273);
+	expect("source port 0", d.src_port == 0);
+	expect("text 123456", !strcmp(d.text, "123456"));
+	expect("sender 1234", !strcmp(d.sender, "1234"));
+
+	/* "450069999999999-rcscfg" in UCS-2, the network-initiated request. */
+	char hex[400] = "00400481214300085211113100000034" "06050491990000";
+	const char *t = "450069999999999-rcscfg";
+	for (const char *c = t; *c; c++)
+		snprintf(hex + strlen(hex), sizeof(hex) - strlen(hex), "00%02x", *c);
+	expect("rcscfg parses", sms_parse_deliver_hex(hex, &d) == 0);
+	expect("rcscfg text", !strcmp(d.text, t));
+
+	/* A plain 7-bit SMS "hello" from +8210 without a UDH. */
+	const char *plain = "00" "04" "0591" "2801f0" "00" "00" "52111131000000" "05" "e8329bfd06";
+	expect("7-bit parses", sms_parse_deliver_hex(plain, &d) == 0);
+	expect("7-bit no port", d.dest_port == -1);
+	expect("7-bit text hello", !strcmp(d.text, "hello"));
+	expect("7-bit sender +82100", !strcmp(d.sender, "+82100"));
+	return fails ? 1 : 0;
+}

@@ -1,0 +1,24 @@
+[Unit]
+Description=IMSroha RCS (GSMA Universal Profile chat on the internet PDN), off unless [rcs] enable=true
+Documentation=https://github.com/noas-slopware/imsroha/blob/senpai/docs/rcs.md
+# RCS is a registration of its own on the internet PDN or Wi-Fi; it does not
+# need imsroha or the IMS bearer, and they do not need it. With [rcs] off it
+# exits at once (0), so Restart= never brings it back.
+After=network-online.target ModemManager.service dbus.socket
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/imsroha-rcs
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=10
+# /var/lib/imsroha/rcs/<IMSI>: the ACS state and configuration (token,
+# credentials), 0700/0600.
+StateDirectory=imsroha
+StateDirectoryMode=0700
+# Reads the SIM and the IMEI over QMI and binds sockets to a netdev
+# ([rcs] interface=), so it runs as root like imsroha.
+
+[Install]
+WantedBy=multi-user.target

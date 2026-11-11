@@ -11,13 +11,15 @@
 
 pkgname=imsroha
 pkgver=0.2.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Userspace IMS: VoLTE calls and SMS over IMS on Qualcomm QMI modems, behind ModemManager"
 arch=('aarch64' 'x86_64')
 url="https://github.com/noas-slopware/imsroha"
 license=('GPL-3.0-only')
-depends=('glib2' 'libqmi' 'libqrtr-glib' 'systemd-libs' 'alsa-lib' 'opencore-amr' 'vo-amrwbenc' 'iproute2')
+depends=('glib2' 'glib-networking' 'libqmi' 'libqrtr-glib' 'systemd-libs' 'alsa-lib' 'opencore-amr' 'vo-amrwbenc' 'iproute2')
 makedepends=('meson' 'gcc' 'pkgconf')
+# The tests need python, openssl, util-linux (unshare) and dbus (dbus-run-session).
+checkdepends=('python' 'openssl' 'util-linux' 'dbus')
 optdepends=('modemmanager: with the IMSroha backend from modemmanager/, for dialers and SMS apps'
             'pipewire-alsa: call audio in the user session')
 # The daemon was b2q-imsd in linux-zflip3; this package takes its place.
@@ -45,4 +47,5 @@ package() {
 	install -Dm644 "$_src/data/imsroha.conf" "$pkgdir/etc/imsroha/imsroha.conf"
 	install -Dm644 "$_src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 	install -Dm644 "$_src/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 "$_src/docs/rcs.md" "$pkgdir/usr/share/doc/$pkgname/rcs.md"
 }

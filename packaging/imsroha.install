@@ -1,4 +1,5 @@
 post_install() {
 	echo ":: enable the IMS PDN bearer: systemctl enable --now imsroha-bearer.service"
 	echo ":: set [device] model= in /etc/imsroha/imsroha.conf (Korean carriers check it)"
+	echo ":: RCS (imsroha-rcs) is off; [rcs] in imsroha.conf and /usr/share/doc/imsroha/rcs.md say how to turn it on"
 }

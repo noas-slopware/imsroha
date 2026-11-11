@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+<wap-provisioningdoc version="1.1">
+    <characteristic type="VERS">
+        <parm name="version" value="12"/>
+        <parm name="validity" value="2592000"/>
+    </characteristic>
+    <characteristic type="TOKEN">
+        <parm name="token" value="testToken"/>
+    </characteristic>
+    <characteristic type="APPLICATION">
+        <parm name="AppID" value="urn:oma:mo:ext-3gpp-ims:1.0"/>
+        <characteristic type="3GPP_IMS">
+            <parm name="AppID" value="ap2001"/>
+            <parm name="Name" value="IMS Settings"/>
+            <parm name="Timer_T1" value="2000"/>
+            <parm name="Private_User_Identity" value="+821099999999@rcs.test"/>
+            <parm name="Home_network_domain_name" value="rcs.test"/>
+            <characteristic type="Public_User_Identity_List">
+                <characteristic type="NODE">
+                    <parm name="Public_User_Identity" value="sip:+821099999999@rcs.test"/>
+                </characteristic>
+            </characteristic>
+        </characteristic>
+        <characteristic type="LBO_P-CSCF_Address">
+            <characteristic type="NODE">
+                <parm name="Address" value="localhost:@SIP_PORT@"/>
+                <parm name="AddressType" value="FQDN"/>
+            </characteristic>
+        </characteristic>
+        <characteristic type="Ext">
+            <characteristic type="GSMA">
+                <parm name="AppRef" value="DEFAULT"/>
+                <parm name="AuthType" value="Digest"/>
+                <parm name="Realm" value="rcs.test"/>
+                <parm name="UserName" value="+821099999999@rcs.test"/>
+                <parm name="UserPwd" value="testPassword"/>
+                <characteristic type="transportProto">
+                    <parm name="psSignalling" value="SIPoTLS"/>
+                    <parm name="psMedia" value="MSRPoTLS"/>
+                    <parm name="wifiSignalling" value="SIPoTLS"/>
+                    <parm name="wifiMedia" value="MSRPoTLS"/>
+                </characteristic>
+            </characteristic>
+        </characteristic>
+    </characteristic>
+    <characteristic type="APPLICATION">
+        <parm name="AppID" value="ap2002"/>
+        <parm name="Name" value="RCS settings"/>
+        <characteristic type="SERVICES">
+            <parm name="SupportedRCSProfileVersions" value="UP_2.4"/>
+            <parm name="ChatAuth" value="1"/>
+            <parm name="GroupChatAuth" value="1"/>
+            <parm name="ftAuth" value="1"/>
+            <parm name="standaloneMsgAuth" value="2"/>
+        </characteristic>
+        <characteristic type="MESSAGING">
+            <characteristic type="Chat">
+                <parm name="max_adhoc_group_size" value="100"/>
+                <parm name="conf-fcty-uri" value="sip:Conference-Factory@rcs.test"/>
+                <parm name="AutAccept" value="1"/>
+                <parm name="TimerIdle" value="330"/>
+                <parm name="MaxSize" value="8192"/>
+            </characteristic>
+            <characteristic type="FileTransfer">
+                <parm name="ftHTTPCSURI" value="https://localhost/content/"/>
+            </characteristic>
+        </characteristic>
+    </characteristic>
+</wap-provisioningdoc>

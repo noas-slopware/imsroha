@@ -1,0 +1,68 @@
+=== 1. first run, HTTP over the LG U+ PDN: TCP config.rcs.mnc006.mcc450.pub.connectrcs.com:80
+GET / HTTP/1.1\r
+Host: config.rcs.mnc006.mcc450.pub.connectrcs.com\r
+Accept-Encoding: gzip\r
+Accept-Language: ko-KR\r
+User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU\r
+Cache-Control: max-age=0\r
+Connection: close\r
+\r
+=== end
+
+=== 2a. HTTPS after the HTTP leg answered 200 with a cookie: TLS config.rcs.mnc006.mcc450.pub.connectrcs.com:443
+GET /?vers=0&rcs_state=0&IMSI=450069999999999&IMEI=359999999999999&terminal_model=SM-F711N&terminal_vendor=SEC&terminal_sw_version=b2q-imsd-0.1&client_vendor=IMSR&client_version=RCSLinux-0.2&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0&default_sms_app=1 HTTP/1.1\r
+Host: config.rcs.mnc006.mcc450.pub.connectrcs.com\r
+Accept-Encoding: gzip\r
+Accept-Language: ko-KR\r
+User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU\r
+Cookie: COOKIE=placeholder\r
+Cache-Control: max-age=0\r
+Connection: close\r
+\r
+=== end
+
+=== 2b. HTTPS after the HTTP leg answered 511 (non-PS: msisdn, SMS_port, empty token): TLS config.rcs.mnc006.mcc450.pub.connectrcs.com:443
+GET /?vers=0&rcs_state=0&IMSI=450069999999999&IMEI=359999999999999&terminal_model=SM-F711N&terminal_vendor=SEC&terminal_sw_version=b2q-imsd-0.1&client_vendor=IMSR&client_version=RCSLinux-0.2&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0&default_sms_app=1&msisdn=%2B821099999999&SMS_port=37273&token= HTTP/1.1\r
+Host: config.rcs.mnc006.mcc450.pub.connectrcs.com\r
+Accept-Encoding: gzip\r
+Accept-Language: ko-KR\r
+User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU\r
+Cache-Control: max-age=0\r
+Connection: close\r
+\r
+=== end
+
+=== 3. the OTP from the SMS, with the cookie of the 200 that announced it: TLS config.rcs.mnc006.mcc450.pub.connectrcs.com:443
+GET /?OTP=123456 HTTP/1.1\r
+Host: config.rcs.mnc006.mcc450.pub.connectrcs.com\r
+Accept-Encoding: gzip\r
+Accept-Language: ko-KR\r
+User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU\r
+Cookie: COOKIE=placeholder\r
+Cache-Control: max-age=0\r
+Connection: close\r
+\r
+=== end
+
+=== 4. refresh after validity, configured with version 12: TLS config.rcs.mnc006.mcc450.pub.connectrcs.com:443
+GET /?vers=12&rcs_state=12&IMSI=450069999999999&IMEI=359999999999999&terminal_model=SM-F711N&terminal_vendor=SEC&terminal_sw_version=b2q-imsd-0.1&client_vendor=IMSR&client_version=RCSLinux-0.2&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0&default_sms_app=1 HTTP/1.1\r
+Host: config.rcs.mnc006.mcc450.pub.connectrcs.com\r
+Accept-Encoding: gzip\r
+Accept-Language: ko-KR\r
+User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU\r
+Cache-Control: max-age=0\r
+Connection: close\r
+\r
+=== end
+
+=== 5. after [rcs] enable=false: rcs_state=-4 (disabled by the user): TLS config.rcs.mnc006.mcc450.pub.connectrcs.com:443
+GET /?vers=12&rcs_state=-4&IMSI=450069999999999&IMEI=359999999999999&terminal_model=SM-F711N&terminal_vendor=SEC&terminal_sw_version=b2q-imsd-0.1&client_vendor=IMSR&client_version=RCSLinux-0.2&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0&default_sms_app=1 HTTP/1.1\r
+Host: config.rcs.mnc006.mcc450.pub.connectrcs.com\r
+Accept-Encoding: gzip\r
+Accept-Language: ko-KR\r
+User-Agent: TTA-RCS/2.4 SM-F711N/b2q-imsd-0.1 Device_Type/RCS_Android_Phone LGU\r
+Cache-Control: max-age=0\r
+Connection: close\r
+\r
+=== end
+
