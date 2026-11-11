@@ -13,7 +13,7 @@ so plasma-dialer, spacebar, GNOME Calls and Chatty keep talking to ModemManager 
 
 | carrier | PLMN | state |
 |---|---|---|
-| LG U+ | 450 06 | registers, SMS both ways, VoLTE in and out, DTMF (Galaxy Z Flip3, since 2026-11) |
+| LG U+ | 450 06 | registers, SMS both ways, VoLTE in and out, DTMF on the Galaxy Z Flip3 since 2026-11, as `b2q-imsd` 0.1.0-20. IMSroha sends the same SIP bytes (golden test), but the new bearer, SIM reads, routing and units have not run on the phone yet |
 | KT | 450 08 | profile from the stock Samsung firmware; has never registered |
 | SKT | 450 05, 450 03 | profile from the stock Samsung firmware; has never registered; SMS stays with the modem |
 | anything else | | plain 3GPP: P-CSCF from the PCO, identity from the ISIM or derived from the IMSI |

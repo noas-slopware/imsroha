@@ -6,6 +6,11 @@
 # golden file apart from the ip lines the fake ip(8) prints there.
 set -eu
 bin=$1 ref=$2 norm=$3
+# Needs user and network namespaces and XFRM in the kernel; skip (77) without.
+if ! unshare -rn sh -c 'ip link set lo up && ip -6 xfrm state list' >/dev/null 2>&1; then
+	echo "esp-loopback: no user/network namespaces or XFRM here, skipped"
+	exit 77
+fi
 out=$(mktemp) err=$(mktemp)
 trap 'rm -f "$out" "$err"' EXIT
 GOLDEN_CARRIER=KT GOLDEN_REAL_IP=1 unshare -rn sh -c 'ip link set lo up && exec "$0"' "$bin" 2>"$err" | "$norm" > "$out"

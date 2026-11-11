@@ -15,6 +15,7 @@
 #include <libqmi-glib.h>
 #include "config.h"
 #include "qmidev.h"
+#include <libqrtr-glib.h>
 
 static GMainLoop *loop;
 static QmiDevice *g_dev;
@@ -193,6 +194,17 @@ static void open_ready(QmiDevice *device, GAsyncResult *res, gpointer user_data)
     qmi_device_allocate_client(device, (QmiService)227, QMI_CID_NONE, 10, NULL, (GAsyncReadyCallback)client_ready, NULL);
 }
 
+static void on_vss_service(GObject *src, GAsyncResult *res, gpointer user_data) {
+    QmiDevice *dev = user_data;
+    if (!qrtr_node_wait_for_services_finish(QRTR_NODE(src), res, NULL)) {
+        g_print("imsroha-vss-samsung: the modem has no Samsung VSS service (227), nothing to do\n");
+        g_object_unref(dev);
+        g_main_loop_quit(loop);
+        return;
+    }
+    open_ready(dev, NULL, NULL);
+}
+
 static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
     GError *error = NULL;
     (void)src; (void)user_data;
@@ -203,13 +215,24 @@ static void on_open(GObject *src, GAsyncResult *res, gpointer user_data) {
         quit_fail("no QMI device");
         return;
     }
-    if (imsroha_qmi_has_service(dev, (QmiService)227) == 0) {
-        g_print("imsroha-vss-samsung: the modem has no Samsung VSS service, nothing to do\n");
+    QrtrNode *node = qmi_device_peek_node(dev);
+    if (!node) {
+        g_print("imsroha-vss-samsung: not a QRTR modem, nothing to do\n");
         g_object_unref(dev);
         g_main_loop_quit(loop);
         return;
     }
-    open_ready(dev, NULL, NULL);
+    /*
+     * The modem registers its services one by one while it boots (and it
+     * boots twice on the Flip3), so 227 may come after the node: wait for
+     * it rather than look once. A modem that has not shown it after 30 s
+     * is not a Samsung one.
+     */
+    GArray *svc = g_array_new(FALSE, FALSE, sizeof(guint32));
+    guint32 vss = 227;
+    g_array_append_val(svc, vss);
+    qrtr_node_wait_for_services(node, svc, 30000, NULL, on_vss_service, dev);
+    g_array_unref(svc);
 }
 
 int main(void) {

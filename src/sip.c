@@ -611,12 +611,12 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 	snprintf(branch, sizeof(branch), "z9hG4bK%08x", (unsigned)rand());
 
 	/*
-	 * A REGISTER that will be challenged offers fresh SPIs: the SAs the 401
-	 * leads to are new ones (TS 33.203 7.4). Over SAs that are up, the
-	 * Security-Client keeps announcing the ones in use until then.
+	 * Every REGISTER offers fresh SPIs (TS 24.229 5.1.1.4.1, TS 33.203 7.4):
+	 * if the network challenges it, the 401 leads to a new SA set on them;
+	 * if it does not, the SAs in use simply carry on.
 	 */
 	char sec[1200];
-	if (ctx->sec_state == IMSD_SEC_OFFERED)
+	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED)
 		imsroha_ipsec_new_spis(&ctx->sec);
 	sec_lines(ctx, sec, sizeof(sec));
 	/* TTAK.KO-06.0357 5.2.2: the unprotected REGISTER names AKAv1-MD5. */

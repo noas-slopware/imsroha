@@ -7,7 +7,7 @@
 #   cd packaging && makepkg -s
 #
 # vo-amrwbenc (the AMR-WB encoder) is needed at build and run time and is not
-# in the Arch repos; install it first (AUR: vo-amrwbenc).
+# in the Arch repos: build the AUR's vo-amrwbenc first (0.1.3-2 as of 2026-11).
 
 pkgname=imsroha
 pkgver=0.2.0
@@ -20,6 +20,10 @@ depends=('glib2' 'libqmi' 'libqrtr-glib' 'systemd-libs' 'alsa-lib' 'opencore-amr
 makedepends=('meson' 'gcc' 'pkgconf')
 optdepends=('modemmanager: with the IMSroha backend from modemmanager/, for dialers and SMS apps'
             'pipewire-alsa: call audio in the user session')
+# The daemon was b2q-imsd in linux-zflip3; this package takes its place.
+provides=('b2q-imsd')
+conflicts=('b2q-imsd')
+replaces=('b2q-imsd')
 backup=('etc/imsroha/imsroha.conf')
 install=imsroha.install
 source=()
