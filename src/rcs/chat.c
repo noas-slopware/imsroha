@@ -42,7 +42,55 @@ struct chat {
 };
 
 /* Received messages that asked for a displayed notification: id -> number. */
+/*
+ * Messages whose sender asked for a displayed notification, message-id ->
+ * number, until the app says they were read (MarkDisplayed). Kept in
+ * <state-dir>/<IMSI>/want-display ("id<TAB>number<TAB>unix time" lines),
+ * so a restart between receipt and reading does not lose the report.
+ * Entries older than WANT_DISPLAY_MAX_AGE are dropped when it is loaded.
+ */
 static GHashTable *want_display;
+static char *want_display_path;
+#define WANT_DISPLAY_MAX_AGE (30 * 24 * 3600)
+
+static void want_display_save(void)
+{
+	if (!want_display_path)
+		return;
+	GString *s = g_string_new(NULL);
+	GHashTableIter it;
+	gpointer k, v;
+	g_hash_table_iter_init(&it, want_display);
+	while (g_hash_table_iter_next(&it, &k, &v))
+		g_string_append_printf(s, "%s\t%s\n", (const char *)k, (const char *)v);
+	GError *e = NULL;
+	if (!g_file_set_contents_full(want_display_path, s->str, (gssize)s->len,
+				      G_FILE_SET_CONTENTS_CONSISTENT, 0600, &e)) {
+		fprintf(stderr, "imsroha-rcs: %s\n", e->message);
+		g_error_free(e);
+	}
+	g_string_free(s, TRUE);
+}
+
+/* value: "number\tunix-time" */
+static void want_display_load(struct rcsd *r)
+{
+	g_free(want_display_path);
+	want_display_path = g_build_filename(r->cfg.state_dir, r->id.imsi, "want-display", NULL);
+	char *data = NULL;
+	if (!g_file_get_contents(want_display_path, &data, NULL, NULL))
+		return;
+	gint64 now = g_get_real_time() / G_USEC_PER_SEC;
+	char **lines = g_strsplit(data, "\n", -1);
+	for (char **l = lines; *l; l++) {
+		char **f = g_strsplit(*l, "\t", 3);
+		if (f[0] && f[1] && f[2] && *f[0] && now - g_ascii_strtoll(f[2], NULL, 10) < WANT_DISPLAY_MAX_AGE)
+			g_hash_table_replace(want_display, g_strdup(f[0]), g_strdup_printf("%s\t%s", f[1], f[2]));
+		g_strfreev(f);
+	}
+	g_strfreev(lines);
+	g_free(data);
+}
 static GHashTable *conv_ids; /* number -> Conversation-ID (RCC.07: kept per peer) */
 static GList *chats;
 
@@ -223,7 +271,12 @@ static void on_text(struct chat *c, const struct cpim *m)
 		 * displayed when the app says so. */
 		if (m->msg_id && m->disposition) {
 			if (strstr(m->disposition, "display"))
-				g_hash_table_replace(want_display, g_strdup(m->msg_id), g_strdup(c->number));
+			{
+				g_hash_table_replace(want_display, g_strdup(m->msg_id),
+						     g_strdup_printf("%s\t%" G_GINT64_FORMAT, c->number,
+								     g_get_real_time() / G_USEC_PER_SEC));
+				want_display_save();
+			}
 			if (strstr(m->disposition, "positive-delivery"))
 				send_imdn(c->r, c->number, m->msg_id, "delivered");
 		}
@@ -562,10 +615,7 @@ static void on_message(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 
 void chat_on_request(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 {
-	if (!want_display) {
-		want_display = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-		conv_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-	}
+	chat_on_registered(r); /* the tables, loaded once */
 	const char *cid = sipmsg_header(m, "Call-ID");
 	struct chat *c = cid ? find_dlg(cid) : NULL;
 
@@ -597,10 +647,10 @@ void chat_on_request(struct rcsd *r, struct sipua *ua, const struct sipmsg *m)
 
 void chat_on_registered(struct rcsd *r)
 {
-	(void)r;
 	if (!want_display) {
 		want_display = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 		conv_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+		want_display_load(r);
 	}
 }
 
@@ -694,11 +744,15 @@ gboolean rcsd_chat_displayed(struct rcsd *r, const char *number, const char *id,
 	(void)number;
 	if (!ready(r, error))
 		return FALSE;
-	const char *from = want_display ? g_hash_table_lookup(want_display, id) : NULL;
-	if (!from)
-		return TRUE; /* no displayed notification was asked for */
-	char *n = g_strdup(from);
+	const char *v = want_display ? g_hash_table_lookup(want_display, id) : NULL;
+	if (!v) {
+		fprintf(stderr, "imsroha-rcs: %s read; no displayed notification was asked for\n", id);
+		return TRUE;
+	}
+	char *n = g_strndup(v, strcspn(v, "\t"));
 	g_hash_table_remove(want_display, id);
+	want_display_save();
+	fprintf(stderr, "imsroha-rcs: %s read; sending displayed\n", id);
 	send_imdn(r, n, id, "displayed");
 	g_free(n);
 	return TRUE;
