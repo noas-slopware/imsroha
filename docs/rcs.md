@@ -13,6 +13,39 @@ are not provisioned for Google's Jibe, so only Samsung Messages and, since iOS 2
 use it. Under the TTA profile it is Universal Profile, so a generic UP client is the base
 and the Korean parts are data plus the TTA additions.
 
+## TTAK.KO-06.0410/R9 (2025-11-21, 212 pages)
+
+Noa got the PDF; it lives at linux-zflip3 `scratch/tta/rcs/TTAK.KO-06.0410R9.pdf`
+(sha256 3c14a8a7…), with the text in `r9.txt`.
+
+- **Base and additions.** It builds on GSMA RCS 6.0 "Advanced Communications Services
+  and Client Specification" v7.0 (6.1). Chapter 8 adds the Korean features: reply
+  (8.2), reaction (8.3), cancel message (8.4), category, room title and icon, notices,
+  live alias, creator/inviter, Extended Messaging and caution alerts (8.5-8.11).
+- **Clients (6.2.1).** Embedded and downloadable clients are both allowed; secondary
+  devices are not. The client is named separately from the terminal (6.3.1.1.1):
+  `client_vendor` (at most 4 characters), `client_version` (`Platform-Major.Minor`, e.g.
+  `RCSAndr-6.0`), `terminal_vendor`, `terminal_model` (at most 10 characters) and
+  `terminal_sw_version`. So an independent client is anticipated by the spec, at least
+  on paper.
+- **SIP User-Agent (8.1).**
+  `TTA-RCS/1.0 <model>/<sw> Device_Type/<RCS_Android_Phone|RCS_iPhone|RCS_Android_PAD|RCS_iPad|RCS_Tablet_PC> <SKT|KT|LGU|OMD|token>`.
+  OMD is the open-market device. There is no device type for a Linux phone.
+- **First activation (figure 6-1).** HTTP GET, then 511, then HTTPS GET with MSISDN,
+  IMSI and IMEI, then 200 with a cookie. The server then sends an SMS with an OTP, the
+  client sends HTTPS GET with the OTP and the cookie, and the server answers 200 with the
+  XML profile (VERS version/validity, TOKEN, P-CSCF_Address, Content-serveruri). Later
+  runs use the token.
+- **Responses (table 6-2).**
+  - version and validity 0: temporarily not valid.
+  - version and validity -1: "customer or device not valid, permanently". The client
+    must not retry until the SIM changes or a factory reset.
+  - 403: bad request; the version goes back to 0.
+  
+  A refusal of an unknown client could therefore come back as -1, and whether the
+  server also records that against the line is not said. The first probe has to be
+  exactly right.
+
 ## What stock does (SM-F711N F711NKSSFKZH5, imsservice.apk)
 
 All three carriers have the same shape. From `res/raw/imsprofile.json`
