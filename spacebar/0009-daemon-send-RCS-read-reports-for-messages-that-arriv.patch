@@ -1,0 +1,40 @@
+From 8c769b15a757523045a48fa53f7fa96cbc215152 Mon Sep 17 00:00:00 2001
+From: Noa Himesaka <himesaka@noa.codes>
+Date: Wed, 11 Nov 2026 23:12:21 +0900
+Subject: [PATCH] daemon: send RCS read reports for messages that arrive in the
+ open chat
+
+A message that arrives in the conversation on screen is stored as read
+right away (it is shown), so markChatAsRead, where 0005 sends
+MarkDisplayed, never sees it, and a sender that asked to know never got
+a displayed notification. saveMessage now tells imsroha-rcs when it
+stores an incoming RCS message or file as read because its chat is open,
+unless the screen is locked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ daemon/channellogger.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/daemon/channellogger.cpp b/daemon/channellogger.cpp
+index faf90ca..16bf526 100644
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -521,6 +521,14 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+         co_await addMessage(message);
+     }
+ 
++    // RCS: a message stored as read because its chat is open on screen was
++    // displayed now; tell a sender that asked (IMDN "display"). Not while the
++    // screen is locked: then nobody has seen it.
++    if (message.read && message.transport == SL("rcs") && !message.messageId.isEmpty()
++        && message.phoneNumberList.size() == 1 && !isScreenSaverActive()) {
++        m_rcs.markDisplayed(message.phoneNumberList.first().toE164(), message.messageId);
++    }
++
+     // TODO add setting to turn off notifications for multiple chats in addition to current chat
+     if (message.phoneNumberList == m_disabledNotificationNumber) {
+         if (!isScreenSaverActive()) {
+-- 
+2.56.0
+
