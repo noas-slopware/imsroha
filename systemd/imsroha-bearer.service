@@ -2,7 +2,9 @@
 Description=IMSroha IMS PDN bearer
 Documentation=https://github.com/noas-slopware/imsroha
 # Samsung modems hold the IMS PDN back until their IMS registration is
-# ungated; the helper exits at once on any other modem.
+# ungated; the helper exits at once on any other modem. It exits once it has
+# sent the ungate, so every start of this unit (boot, restarts after a modem
+# reset or a lost PDN) runs it again.
 Wants=imsroha-vss-samsung.service
 After=imsroha-vss-samsung.service
 Before=imsroha.service

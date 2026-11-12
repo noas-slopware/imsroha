@@ -40,7 +40,7 @@ profile by its APN.
 | `imsroha` | `imsroha.service` | reads the SIM (ISIM, else USIM: IMSI, EF_AD, EF_SMSP), picks the carrier profile, registers (IMS AKA, sec-agree with IPsec through `ip xfrm`, reg event), and does SMS (TS 24.341) and VoLTE (INVITE, PRACK, UPDATE, AMR-WB/AMR over RTP, RFC 4733 DTMF). D-Bus `codes.noa.IMSroha` |
 | `imsroha-audio` | `imsroha-audio.service` (user, graphical session) | call PCM between `/run/imsroha/audio.sock` and PipeWire |
 | `imsroha-rcs` | `imsroha-rcs.service` | RCS (GSMA Universal Profile chat, Korea's Chatting+), **off unless `[rcs] enable=true`**: autoconfiguration, its own SIP registration over TLS on the internet PDN, 1-to-1 chat over MSRP with IMDN and isComposing, file transfer over HTTP, chatbots and A2P (RCS 비즈메시지: rich cards, suggestions, botinfo; `[rcs] chatbot=`). D-Bus `codes.noa.IMSroha.Rcs`; `docs/rcs.md` |
-| `imsroha-vss-samsung` | `imsroha-vss-samsung.service` | Samsung modems only: sends the IPC that ungates IMS registration (vendor QMI service 227). Exits at once on any other modem |
+| `imsroha-vss-samsung` | `imsroha-vss-samsung.service` | Samsung modems only: sends the IPC that ungates IMS registration (vendor QMI service 227), then releases its 227 client and exits; every start of `imsroha-bearer` runs it again. Exits at once on any other modem |
 
 The bearer upholds the daemon: every new PDN gets a fresh `imsroha` and a fresh
 REGISTER. The MT-SMS inbox (`/var/lib/imsroha/inbox`) holds a message from before the

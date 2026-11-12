@@ -5,8 +5,13 @@ Before=imsroha-bearer.service imsroha.service
 
 [Service]
 # Exits 0 at once when the modem has no Samsung VSS service (227). On a
-# Samsung modem it stays, logging what the modem answers, and is restarted
-# with it (it exits nonzero when the QMI device goes away).
+# Samsung modem it sends the ungate and the P-CSCF queries, releases its
+# 227 client once they are answered and exits 0: a client that stays gets
+# indications nobody reads in s2idle, and the modem crashes on the stalled
+# flow. It exits nonzero (and is restarted) when the QMI device goes away
+# before it is done. No RemainAfterExit=: imsroha-bearer exits on a modem
+# reset, and its restart pulls this in again (Wants=) only while it is
+# inactive, which is what sends the ungate to the new modem boot.
 Type=simple
 ExecStart=/usr/bin/imsroha-vss-samsung
 Restart=on-failure

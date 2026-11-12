@@ -4,8 +4,17 @@
  * until its own IMS stack (rild, over the vendor QMI service 227 "VSS",
  * which tunnels Samsung IPC) says it registered. With no Android, nothing
  * says so and the modem holds the IMS PDN back. This sends that IPC once
- * (IMS_REG_SET, VoLTE over LTE), then the two SDM P-CSCF queries, and stays
- * to log what the modem answers.
+ * (IMS_REG_SET, VoLTE over LTE), then the two SDM P-CSCF queries, logs the
+ * answers, releases its service 227 client and exits 0.
+ *
+ * It must not stay a client: the modem sends every 227 client an indication
+ * every couple of minutes, nobody reads them while the AP is in s2idle, QRTR
+ * flow control stalls, and Samsung's server ERR_FATALs the modem
+ * ("Never recovery from QMI_CSI_CONN_BUSY"). Releasing the client closes its
+ * QRTR socket, so the kernel tells the modem the client is gone.
+ *
+ * After a modem reset, imsroha-bearer exits and its restart starts this
+ * again (Wants=), so the ungate is sent to every new modem boot.
  *
  * On a modem without service 227 (anything not Samsung) it exits 0 at once.
  */
@@ -24,6 +33,11 @@ static QmiDevice *g_dev;
 static QmiClient *g_client;
 static guint8 g_cid;
 static int exit_code;
+
+/* The ungate and the two P-CSCF queries: release the client once all three
+ * are answered (or failed). */
+#define VSS_COMMANDS 3
+static guint n_answered;
 
 static void quit_fail(const char *why) {
     g_printerr("imsroha-vss-samsung: %s\n", why);
@@ -88,6 +102,36 @@ static void on_indication(QmiDevice *dev, QmiMessage *msg, gpointer user_data) {
     }
 }
 
+static void on_closed(GObject *src, GAsyncResult *res, gpointer user_data) {
+    (void)user_data;
+    qmi_device_close_finish(QMI_DEVICE(src), res, NULL);
+    if (loop)
+        g_main_loop_quit(loop);
+}
+
+static void on_released(GObject *src, GAsyncResult *res, gpointer user_data) {
+    GError *error = NULL;
+    (void)user_data;
+    if (!qmi_device_release_client_finish(QMI_DEVICE(src), res, &error)) {
+        /* The client is unregistered and its QRTR socket closed either way:
+         * the release only fails on a client that was already released. */
+        g_printerr("imsroha-vss-samsung: releasing the VSS client: %s\n", error->message);
+        g_error_free(error);
+    } else {
+        g_print("VSS client released, done\n");
+    }
+    g_clear_object(&g_client);
+    qmi_device_close_async(g_dev, 5, NULL, on_closed, NULL);
+}
+
+/* Every command is answered or has failed: stop being a 227 client. */
+static void command_answered(void) {
+    if (++n_answered < VSS_COMMANDS)
+        return;
+    qmi_device_release_client(g_dev, g_client, QMI_DEVICE_RELEASE_CLIENT_FLAGS_RELEASE_CID,
+                              5, NULL, on_released, NULL);
+}
+
 static void on_cmd_done(QmiDevice *dev, GAsyncResult *res, gpointer user_data) {
     const char *label = (const char *)user_data;
     GError *error = NULL;
@@ -95,6 +139,7 @@ static void on_cmd_done(QmiDevice *dev, GAsyncResult *res, gpointer user_data) {
     if (!resp) {
         g_print("[%s] CMD FAILED: %s\n", label, error ? error->message : "?");
         if (error) g_error_free(error);
+        command_answered();
         return;
     }
     gsize len = 0;
@@ -109,6 +154,7 @@ static void on_cmd_done(QmiDevice *dev, GAsyncResult *res, gpointer user_data) {
     }
     g_print("[%s] Result=%u Error=0x%04x (%u)\n", label, res_code, err_code, err_code);
     qmi_message_unref(resp);
+    command_answered();
 }
 
 static void send_ipc_async(const guint8 *ipc_data, gsize ipc_len, gboolean include_rild0, const char *label) {
