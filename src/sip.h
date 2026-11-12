@@ -64,6 +64,7 @@ struct imsd_sip_ctx {
 	struct imsroha_ipsec sec;
 	int fd_c, fd_s;
 	sd_event_source *src_c; /* fd_c's, so that it can move to another port */
+	uint32_t dereg_cseq;    /* the de-registration's CSeq once sent, else 0 */
 	char user_agent[256];
 	char pani[160];         /* P-Access-Network-Info value */
 	char instance[96];      /* ;+sip.instance="<urn:gsma:imei:...>" for Contact, or "" */
@@ -215,6 +216,8 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus);
 void imsd_sip_destroy(struct imsd_sip_ctx *ctx);
 
 int imsd_sip_register(struct imsd_sip_ctx *ctx);
+/* De-register before exiting: 1 when sent (its answer ends the loop), 0 when not registered. */
+int imsd_sip_deregister(struct imsd_sip_ctx *ctx);
 int imsd_sip_send_sms(struct imsd_sip_ctx *ctx, const char *dest_number, const char *text, sd_bus_message *msg);
 int imsd_sip_place_call(struct imsd_sip_ctx *ctx, const char *dest_number, uint32_t *out_call_id);
 int imsd_sip_answer_call(struct imsd_sip_ctx *ctx);

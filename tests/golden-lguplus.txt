@@ -185,3 +185,23 @@ CSeq: 2 BYE
 Content-Length: 0
 
 
+===== step 12: de-registration REGISTER
+----- <len>
+REGISTER sip:lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 3 REGISTER
+Contact: <sip:01000000000@[::1]:5060>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip
+Authorization: Digest username="450061234567890@lte-lguplus.co.kr", realm="lte-lguplus.co.kr", nonce="", uri="sip:lte-lguplus.co.kr", response=""
+Max-Forwards: 70
+Expires: 0
+Supported: path
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+User-Agent: TTA-VoLTE/1.0 SM-F711N/b2q-imsd-0.1 Device_Type/Android_Phone LUC
+Content-Length: 0
+
+
+de-registered: yes, event loop exit requested: yes
+===== step 13: after the de-registration

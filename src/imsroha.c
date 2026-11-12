@@ -231,11 +231,32 @@ static const sd_bus_vtable imsd_vtable[] = {
 	SD_BUS_VTABLE_END
 };
 
+static int on_dereg_timeout(sd_event_source *s, uint64_t usec, void *userdata)
+{
+	(void)s; (void)usec;
+	fprintf(stderr, "imsroha: no answer to the de-registration, stopping anyway\n");
+	sd_event_exit(userdata, 0);
+	return 0;
+}
+
+/*
+ * The first exit signal de-registers and waits up to 2 s for the answer
+ * (TimeoutStopSec= is 10); a second one, or nothing to de-register, stops
+ * right away.
+ */
 static int on_signal(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata)
 {
 	(void)s; (void)si;
 	sd_event *event = userdata;
+	static int stopping;
 	fprintf(stderr, "imsroha: caught exit signal, stopping...\n");
+	if (!stopping++ && imsd_sip_deregister(&sip_ctx) > 0) {
+		uint64_t now = 0;
+		sd_event_now(event, CLOCK_MONOTONIC, &now);
+		if (sd_event_add_time(event, NULL, CLOCK_MONOTONIC, now + 2000000ULL, 0,
+				      on_dereg_timeout, event) >= 0)
+			return 0;
+	}
 	sd_event_exit(event, 0);
 	return 0;
 }

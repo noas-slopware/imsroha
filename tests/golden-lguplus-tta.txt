@@ -325,3 +325,27 @@ Content-Type: application/vnd.3gpp.sms
 Content-Length: 2
 
 \x02\x05
+===== step 16: de-registration REGISTER
+----- <len> (to port-s)
+REGISTER sip:lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 5 REGISTER
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450061234567890@lte-lguplus.co.kr", realm="lte-lguplus.co.kr", nonce="", uri="sip:lte-lguplus.co.kr", response=""
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5066;port-s=5064, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5066;port-s=5064
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=6666;spi-s=7777;port-c=6103;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 0
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
+de-registered: yes, event loop exit requested: yes
+===== step 17: after the de-registration

@@ -8,7 +8,8 @@
  *
  * The scenario: REGISTER, 401 + AKA, 200 OK, MO-SMS, MO call and CANCEL,
  * MT-SMS, MT call answered and hung up by the far end; over sec-agree, a
- * challenged re-registration that moves to a new port-c and a MT-SMS after it.
+ * challenged re-registration that moves to a new port-c and a MT-SMS after it;
+ * the de-registration on the way out.
  */
 #include "../src/sip.c"
 
@@ -401,6 +402,25 @@ int main(void)
 		memcpy(mt + hl, rp, sizeof(rp));
 		to_ue(&ctx, mt, hl + sizeof(rp));
 		drain("MT-SMS over the new SAs answers");
+	}
+	/* 9. Stopping: the de-registration (Expires 0), and its 200 OK ends the loop. */
+	if (imsd_sip_deregister(&ctx) > 0) {
+		capture_last();
+		drain("de-registration REGISTER");
+		hdr("Via", via, sizeof(via)); hdr("From", from, sizeof(from)); hdr("To", to, sizeof(to));
+		hdr("Call-ID", cid, sizeof(cid)); hdr("CSeq", cseq, sizeof(cseq));
+		snprintf(resp, sizeof(resp),
+			"SIP/2.0 200 OK\r\nVia: %s\r\nFrom: %s\r\nTo: %s;tag=pcscf1\r\nCall-ID: %s\r\nCSeq: %s\r\n"
+			"Contact: <sip:x@[::1]>;expires=0\r\nContent-Length: 0\r\n\r\n",
+			via, from, to, cid, cseq);
+		to_ue_str(&ctx, resp);
+		int code = 0;
+		printf("de-registered: %s, event loop exit requested: %s\n",
+		       ctx.reg_state == IMSD_DOWN ? "yes" : "no",
+		       sd_event_get_exit_code(event, &code) >= 0 ? "yes" : "no");
+		drain("after the de-registration");
+	} else {
+		printf("golden: nothing to de-register\n");
 	}
 	if (getenv("GOLDEN_REAL_IP"))
 		/* Proof that the kernel carried it as ESP: per-SA packet counters. */

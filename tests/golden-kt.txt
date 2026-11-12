@@ -357,3 +357,27 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
 Content-Length: 0
 
 
+===== step 16: de-registration REGISTER
+----- <len> (to port-s)
+REGISTER sip:ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
+Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
+From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+To: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
+Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 5 REGISTER
+Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response=""
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5086;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5086;port-s=5084
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=6666;spi-s=7777;port-c=6103;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 0
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
+de-registered: yes, event loop exit requested: yes
+===== step 17: after the de-registration

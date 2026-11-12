@@ -683,6 +683,7 @@ static uint32_t reg_req_expires(const struct imsd_sip_ctx *ctx)
 }
 
 static void arm_reg_retry(struct imsd_sip_ctx *ctx, uint64_t delay_sec);
+static void cancel_reg_retry(struct imsd_sip_ctx *ctx);
 
 /*
  * sec-agree did not come up: drop the SAs and start over with a fresh
@@ -776,7 +777,12 @@ static int install_sas(struct imsd_sip_ctx *ctx, const char *pcscf,
 	return 0;
 }
 
-int imsd_sip_register(struct imsd_sip_ctx *ctx)
+/*
+ * A REGISTER: a registration or its refresh, or with dereg set the
+ * de-registration (Expires 0, TS 24.229 5.1.1.6), which keeps the SAs and
+ * SPIs in use and is not retried.
+ */
+static int send_register(struct imsd_sip_ctx *ctx, int dereg)
 {
 	char branch[32];
 	snprintf(branch, sizeof(branch), "z9hG4bK%08x", (unsigned)rand());
@@ -791,7 +797,9 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 	 * "PORT-C/S DUPLICATED".
 	 */
 	char sec[1200];
-	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED) {
+	if (dereg) {
+		ctx->sec.offer_port_uc = ctx->sec.port_uc;
+	} else if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED) {
 		imsroha_ipsec_new_spis(&ctx->sec);
 		ctx->sec.offer_port_uc = ctx->sec_state == IMSD_SEC_PROTECTED ?
 					 next_port_uc(ctx) : ctx->sec.port_uc;
@@ -819,14 +827,42 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 		"Content-Length: 0\r\n\r\n",
 		ctx->domain, ctx->local_ip, ctx->ua_port, branch, ctx->reg_impu, ctx->reg_from_tag, ctx->reg_impu, ctx->reg_call_id, ctx->reg_cseq++,
 		ctx->impu_user, ctx->local_ip, ctx->ua_port, contact_reg(ctx), ctx->impi, ctx->domain, ctx->domain, alg,
-		sec, reg_req_expires(ctx), sec_supported(ctx), ctx->pani, ctx->user_agent);
+		sec, dereg ? 0 : reg_req_expires(ctx), sec_supported(ctx), ctx->pani, ctx->user_agent);
 
+	if (dereg) {
+		ctx->dereg_cseq = ctx->reg_cseq - 1;
+		fprintf(stderr, "imsroha: sending de-registration REGISTER (CSeq %u)...\n", ctx->dereg_cseq);
+		return send_sip_msg(ctx, req, len);
+	}
 	/* A refresh keeps the account usable; only the first REGISTER is "registering". */
 	if (ctx->reg_state != IMSD_UP)
 		ctx->reg_state = IMSD_REGISTERING;
 	fprintf(stderr, "imsroha: sending REGISTER (CSeq %u)...\n", ctx->reg_cseq - 1);
 	schedule_reg_retry(ctx);
 	return send_sip_msg(ctx, req, len);
+}
+
+int imsd_sip_register(struct imsd_sip_ctx *ctx)
+{
+	return send_register(ctx, 0);
+}
+
+/*
+ * On the way out: a registered UE de-registers (TS 24.229 5.1.1.6), as
+ * stock does at power-off. Otherwise the S-CSCF keeps the binding until it
+ * expires, and after a reboot onto a new IMS address LG U+ still sent the
+ * calls to the old one: "the phone is off" until the binding went. 1 when
+ * the REGISTER went out and its answer ends the event loop, 0 when there
+ * is nothing to de-register.
+ */
+int imsd_sip_deregister(struct imsd_sip_ctx *ctx)
+{
+	if (ctx->reg_state != IMSD_UP || ctx->fd < 0 || ctx->dereg_cseq)
+		return 0;
+	if (ctx->reg_timer)
+		sd_event_source_set_enabled(ctx->reg_timer, SD_EVENT_OFF);
+	cancel_reg_retry(ctx);
+	return send_register(ctx, 1) < 0 ? 0 : 1;
 }
 
 static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
@@ -2306,6 +2342,18 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 			if (reason[0]) fprintf(stderr, "imsroha: Reason: %s\n", reason);
 			if (warning[0]) fprintf(stderr, "imsroha: Warning: %s\n", warning);
 			fprintf(stderr, "imsroha: full error response (%d):\n%s\n", status_code, buf);
+		}
+
+		char dcseq[64] = "";
+		if (ctx->dereg_cseq && status_code >= 200 &&
+		    find_header(buf, "CSeq", dcseq, sizeof(dcseq)) >= 0 && strstr(dcseq, "REGISTER") &&
+		    strtoul(dcseq, NULL, 10) == ctx->dereg_cseq) {
+			fprintf(stderr, "imsroha: %s\n", status_code < 300 ? "de-registered" :
+				"the de-registration was refused, the binding stays until it expires");
+			ctx->reg_state = IMSD_DOWN;
+			imsd_emit_state_changed(ctx->bus, IMSD_DOWN);
+			sd_event_exit(ctx->event, 0);
+			return 0;
 		}
 
 		if (status_code == 401) {
