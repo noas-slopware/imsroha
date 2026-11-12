@@ -23,6 +23,7 @@ struct imsroha_ipsec {
 	/* ours */
 	uint32_t spi_uc, spi_us;
 	uint16_t port_uc, port_us;
+	uint16_t offer_port_uc;  /* port-c in Security-Client: port_uc, or a new one to move to */
 	char offer_alg[64];      /* comma separated, in preference order */
 	char offer_ealg[64];
 	/* the P-CSCF's, from Security-Server */

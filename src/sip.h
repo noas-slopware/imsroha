@@ -63,6 +63,7 @@ struct imsd_sip_ctx {
 	int sec_state;
 	struct imsroha_ipsec sec;
 	int fd_c, fd_s;
+	sd_event_source *src_c; /* fd_c's, so that it can move to another port */
 	char user_agent[256];
 	char pani[160];         /* P-Access-Network-Info value */
 	char instance[96];      /* ;+sip.instance="<urn:gsma:imei:...>" for Contact, or "" */

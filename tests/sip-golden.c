@@ -7,7 +7,8 @@
  * compared byte for byte.
  *
  * The scenario: REGISTER, 401 + AKA, 200 OK, MO-SMS, MO call and CANCEL,
- * MT-SMS, MT call answered and hung up by the far end.
+ * MT-SMS, MT call answered and hung up by the far end; over sec-agree, a
+ * challenged re-registration that moves to a new port-c and a MT-SMS after it.
  */
 #include "../src/sip.c"
 
@@ -340,6 +341,67 @@ int main(void)
 		ctx.domain, ctx.domain, ctx.call_to_tag, ctx.domain);
 	to_ue_str(&ctx, resp);
 	drain("MT BYE answer");
+	/*
+	 * 8. Re-registration over the SAs, challenged: a new port-c on both
+	 * ends, port-s kept (TS 33.203 7.4). The 401 comes over the old SAs,
+	 * the authenticated REGISTER leaves from the new port_uc over the new
+	 * ones, and a MT-SMS after the 200 OK reaches port_us through them.
+	 */
+	if (ctx.sec_state == IMSD_SEC_PROTECTED) {
+		uint16_t old_uc = ctx.sec.port_uc;
+		imsd_sip_register(&ctx);
+		capture_last();
+		drain("re-registration REGISTER");
+		hdr("Via", via, sizeof(via)); hdr("From", from, sizeof(from)); hdr("To", to, sizeof(to));
+		hdr("Call-ID", cid, sizeof(cid)); hdr("CSeq", cseq, sizeof(cseq));
+		snprintf(resp, sizeof(resp),
+			"SIP/2.0 401 Unauthorized\r\nVia: %s\r\nFrom: %s\r\nTo: %s;tag=pcscf1\r\nCall-ID: %s\r\nCSeq: %s\r\n"
+			"WWW-Authenticate: Digest realm=\"%s\", nonce=\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\", algorithm=AKAv1-MD5, qop=\"auth\"\r\n"
+			"Security-Server: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=6666;spi-s=7777;port-c=%u;port-s=%u\r\n"
+			"Content-Length: 0\r\n\r\n", via, from, to, cid, cseq, ctx.domain,
+			FAKE_PORT_PC + 2, FAKE_PORT_PS);
+		/* The P-CSCF's new protected client port. */
+		close(pcscf_pc);
+		struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT,
+					  .sin6_port = htons(FAKE_PORT_PC + 2) };
+		pcscf_pc = socket(AF_INET6, SOCK_DGRAM, 0);
+		bind(pcscf_pc, (struct sockaddr *)&a, sizeof(a));
+		to_ue_str(&ctx, resp);
+		printf("port_uc %u -> %u, port_us %u\n", old_uc, ctx.sec.port_uc, ctx.sec.port_us);
+		if (getenv("GOLDEN_REAL_IP") && ctx.sec.installed) {
+			char cmd[512];
+			snprintf(cmd, sizeof(cmd),
+				 "ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport %u dport %u dir out "
+				 "tmpl src ::1 dst ::1 proto esp spi 0x%08x mode transport && "
+				 "ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport %u dport %u dir out "
+				 "tmpl src ::1 dst ::1 proto esp spi 0x%08x mode transport",
+				 ctx.sec.port_ps, ctx.sec.port_uc, ctx.sec.spi_uc,
+				 ctx.sec.port_pc, ctx.sec.port_us, ctx.sec.spi_us);
+			if (system(cmd) != 0)
+				fprintf(stderr, "golden: mirror policies failed\n");
+		}
+		capture_last();
+		drain("re-registration authenticated REGISTER");
+		hdr("Via", via, sizeof(via)); hdr("From", from, sizeof(from)); hdr("To", to, sizeof(to));
+		hdr("Call-ID", cid, sizeof(cid)); hdr("CSeq", cseq, sizeof(cseq));
+		snprintf(resp, sizeof(resp),
+			"SIP/2.0 200 OK\r\nVia: %s\r\nFrom: %s\r\nTo: %s;tag=pcscf1\r\nCall-ID: %s\r\nCSeq: %s\r\n"
+			"Service-Route: <sip:scscf.%s;lr>\r\nP-Associated-URI: <sip:01000000000@%s>\r\n"
+			"Contact: <sip:x@[::1]>;expires=3600\r\nExpires: 3600\r\nContent-Length: 0\r\n\r\n",
+			via, from, to, cid, cseq, ctx.domain, ctx.domain);
+		to_ue_str(&ctx, resp);
+		drain("after 200 OK to the re-registration");
+		hl = snprintf(mt, sizeof(mt),
+			"MESSAGE sip:01000000000@[::1] SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmt2\r\n"
+			"From: <tel:+821020921827>;tag=smsc2\r\nTo: <sip:01000000000@%s>\r\n"
+			"Call-ID: mt-sms-2@%s\r\nCSeq: 1 MESSAGE\r\n"
+			"Content-Type: application/vnd.3gpp.sms\r\nContent-Length: %zu\r\n\r\n",
+			ctx.domain, ctx.domain, sizeof(rp));
+		memcpy(mt + hl, rp, sizeof(rp));
+		to_ue(&ctx, mt, hl + sizeof(rp));
+		drain("MT-SMS over the new SAs answers");
+	}
 	if (getenv("GOLDEN_REAL_IP"))
 		/* Proof that the kernel carried it as ESP: per-SA packet counters. */
 		system("ip -s -6 xfrm state | grep -E '^\\s+proto esp|packets' 1>&2");

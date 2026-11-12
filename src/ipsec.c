@@ -39,7 +39,8 @@ int imsroha_ipsec_client_header(const struct imsroha_ipsec *s, char *out, size_t
 		for (char *se = NULL, *e = strtok_r(ealgs, ",", &se); e; e = strtok_r(NULL, ",", &se)) {
 			int w = snprintf(out + n, size - n,
 					 "%sipsec-3gpp;alg=%s;ealg=%s;spi-c=%u;spi-s=%u;port-c=%u;port-s=%u",
-					 n ? ", " : "", a, e, s->spi_uc, s->spi_us, s->port_uc, s->port_us);
+					 n ? ", " : "", a, e, s->spi_uc, s->spi_us,
+					 s->offer_port_uc ? s->offer_port_uc : s->port_uc, s->port_us);
 			if (w < 0 || (size_t)w >= size - n)
 				return -ENOSPC;
 			n += (size_t)w;

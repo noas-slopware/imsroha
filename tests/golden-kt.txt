@@ -247,3 +247,113 @@ CSeq: 2 BYE
 Content-Length: 0
 
 
+===== step 12: re-registration REGISTER
+----- <len> (to port-s)
+REGISTER sip:ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
+Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
+From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+To: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
+Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 3 REGISTER
+Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response=""
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5086;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5086;port-s=5084
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=4444;spi-s=5555;port-c=6101;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 600000
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 5082 dport 6100 dir out
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 6100 dport 5082 dir in
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 6101 dport 5084 dir in
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 5084 dport 6101 dir out
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 5086 dport 6100 dir out tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 6100 dport 5086 dir in tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 6103 dport 5084 dir in tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 5084 dport 6103 dir out tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
+port_uc 5082 -> 5086, port_us 5084
+===== step 13: re-registration authenticated REGISTER
+----- <len> (to port-s)
+REGISTER sip:ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
+Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
+From: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+To: <sip:450081234567890@ims.mnc008.mcc450.3gppnetwork.org>
+Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 4 REGISTER
+Contact: <sip:450081234567890@[::1]:5084>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450081234567890@ims.mnc008.mcc450.3gppnetwork.org", realm="ims.mnc008.mcc450.3gppnetwork.org", nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", uri="sip:ims.mnc008.mcc450.3gppnetwork.org", response="233395195145334bf9b721930bd60bc9", algorithm=AKAv1-MD5
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5086;port-s=5084, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5086;port-s=5084
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=6666;spi-s=7777;port-c=6103;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 600000
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
+===== step 14: after 200 OK to the re-registration
+----- <len> (to port-s)
+SUBSCRIBE sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org SIP/2.0
+Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
+Route: <sip:scscf.ims.mnc008.mcc450.3gppnetwork.org;lr>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+To: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
+Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 2 SUBSCRIBE
+Contact: <sip:450081234567890@[::1]:5084>
+Event: reg
+Accept: application/reginfo+xml
+Expires: 600000
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
+===== step 15: MT-SMS over the new SAs answers
+----- <len> (to port-s)
+MESSAGE tel:+821020921827 SIP/2.0
+Via: SIP/2.0/UDP [::1]:5084;branch=z9hG4bK<rand>;rport
+Route: <sip:scscf.ims.mnc008.mcc450.3gppnetwork.org;lr>
+From: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+To: <tel:+821020921827>
+Call-ID: <rand>@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 1 MESSAGE
+In-Reply-To: mt-sms-2@ims.mnc008.mcc450.3gppnetwork.org
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+P-Preferred-Identity: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Type: application/vnd.3gpp.sms
+Content-Length: 2
+
+\x02\x05
+----- <len> (to port-c)
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmt2
+From: <tel:+821020921827>;tag=smsc2
+To: <sip:01000000000@ims.mnc008.mcc450.3gppnetwork.org>;tag=<rand>
+Call-ID: mt-sms-2@ims.mnc008.mcc450.3gppnetwork.org
+CSeq: 1 MESSAGE
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500800000000000
+Content-Length: 0
+
+

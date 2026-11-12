@@ -231,3 +231,97 @@ CSeq: 2 BYE
 Content-Length: 0
 
 
+===== step 12: re-registration REGISTER
+----- <len> (to port-s)
+REGISTER sip:lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 3 REGISTER
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450061234567890@lte-lguplus.co.kr", realm="lte-lguplus.co.kr", nonce="", uri="sip:lte-lguplus.co.kr", response=""
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5066;port-s=5064, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5066;port-s=5064
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=4444;spi-s=5555;port-c=6101;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 600000
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 5062 dport 6100 dir out
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 6100 dport 5062 dir in
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 6101 dport 5064 dir in
++ ip -6 xfrm policy delete src ::1/128 dst ::1/128 proto udp sport 5064 dport 6101 dir out
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state delete src ::1 dst ::1 proto esp spi <spi>
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm state add src ::1 dst ::1 proto esp spi <spi> mode transport auth-trunc hmac(sha1) 0x101112131415161718191a1b1c1d1e1f00000000 96 enc cbc(aes) 0x000102030405060708090a0b0c0d0e0f
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 5066 dport 6100 dir out tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 6100 dport 5066 dir in tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 6103 dport 5064 dir in tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
++ ip -6 xfrm policy add src ::1/128 dst ::1/128 proto udp sport 5064 dport 6103 dir out tmpl src ::1 dst ::1 proto esp spi <spi> mode transport
+port_uc 5062 -> 5066, port_us 5064
+===== step 13: re-registration authenticated REGISTER
+----- <len> (to port-s)
+REGISTER sip:lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 4 REGISTER
+Contact: <sip:01000000000@[::1]:5064>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35209900-176148-0>"
+Authorization: Digest username="450061234567890@lte-lguplus.co.kr", realm="lte-lguplus.co.kr", nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", uri="sip:lte-lguplus.co.kr", response="50e7e1090e34791216b2c2680a4d35f1", algorithm=AKAv1-MD5
+Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=<rand>;spi-s=<rand>;port-c=5066;port-s=5064, ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=<rand>;spi-s=<rand>;port-c=5066;port-s=5064
+Security-Verify: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=6666;spi-s=7777;port-c=6103;port-s=6100
+Require: sec-agree
+Proxy-Require: sec-agree
+Max-Forwards: 70
+Expires: 600000
+Supported: path, sec-agree
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
+===== step 14: after 200 OK to the re-registration
+----- <len> (to port-s)
+SUBSCRIBE sip:01000000000@lte-lguplus.co.kr SIP/2.0
+Via: SIP/2.0/UDP [::1]:5064;branch=z9hG4bK<rand>;rport
+Route: <sip:scscf.lte-lguplus.co.kr;lr>
+From: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+To: <sip:01000000000@lte-lguplus.co.kr>
+Call-ID: <rand>@lte-lguplus.co.kr
+CSeq: 2 SUBSCRIBE
+Contact: <sip:01000000000@[::1]:5064>
+Event: reg
+Accept: application/reginfo+xml
+Expires: 600000
+Max-Forwards: 70
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+P-Preferred-Identity: <sip:01000000000@lte-lguplus.co.kr>
+User-Agent: TTA-VoLTE/4.0 SM-F711N/IMSroha-0.2.0 Device_Type/Linux_Phone LGU
+Content-Length: 0
+
+
+===== step 15: MT-SMS over the new SAs answers
+----- <len> (to port-c)
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bKmt2
+From: <tel:+821020921827>;tag=smsc2
+To: <sip:01000000000@lte-lguplus.co.kr>;tag=<rand>
+Call-ID: mt-sms-2@lte-lguplus.co.kr
+CSeq: 1 MESSAGE
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=4500600000000000
+Content-Type: application/vnd.3gpp.sms
+Content-Length: 2
+
+\x02\x05

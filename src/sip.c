@@ -730,6 +730,52 @@ static const char *sec_supported(const struct imsd_sip_ctx *ctx)
 	       "path, sec-agree" : "path";
 }
 
+/* The two protected client ports, next to the plain one: re-registrations alternate. */
+static uint16_t next_port_uc(const struct imsd_sip_ctx *ctx)
+{
+	uint16_t a = (uint16_t)(ctx->sip_port + 2), b = (uint16_t)(ctx->sip_port + 6);
+	return ctx->sec.port_uc == a ? b : a;
+}
+
+static int sip_socket(struct imsd_sip_ctx *ctx, uint16_t port, int *out, sd_event_source **src);
+
+/*
+ * The new SAs of a re-registration are on the offered port_uc: open it,
+ * install them, and only then let go of the old client socket.
+ */
+static int install_sas(struct imsd_sip_ctx *ctx, const char *pcscf,
+		       const unsigned char ik[16], const unsigned char ck[16])
+{
+	uint16_t old_port = ctx->sec.port_uc, port = ctx->sec.offer_port_uc;
+	int fd = -1, r;
+	sd_event_source *src = NULL;
+
+	if (port && port != old_port) {
+		if ((r = sip_socket(ctx, port, &fd, &src)) < 0) {
+			fprintf(stderr, "imsroha: no socket for the new protected client port %u: %s\n",
+				port, strerror(-r));
+			return r;
+		}
+		ctx->sec.port_uc = port;
+	}
+	if ((r = imsroha_ipsec_install(&ctx->sec, ctx->local_ip, pcscf, ik, ck)) < 0) {
+		if (fd >= 0) {
+			sd_event_source_disable_unref(src);
+			close(fd);
+			ctx->sec.port_uc = old_port;
+		}
+		return r;
+	}
+	if (fd >= 0) {
+		ctx->src_c = sd_event_source_disable_unref(ctx->src_c);
+		if (ctx->fd_c >= 0)
+			close(ctx->fd_c);
+		ctx->fd_c = fd;
+		ctx->src_c = src;
+	}
+	return 0;
+}
+
 int imsd_sip_register(struct imsd_sip_ctx *ctx)
 {
 	char branch[32];
@@ -738,11 +784,18 @@ int imsd_sip_register(struct imsd_sip_ctx *ctx)
 	/*
 	 * Every REGISTER offers fresh SPIs (TS 24.229 5.1.1.4.1, TS 33.203 7.4):
 	 * if the network challenges it, the 401 leads to a new SA set on them;
-	 * if it does not, the SAs in use simply carry on.
+	 * if it does not, the SAs in use simply carry on. A re-registration over
+	 * the SAs also offers a new protected client port: when the SAs change
+	 * there, port_uc and port_pc change and port_us and port_ps stay
+	 * (TS 33.203 7.4). LG U+ refuses an offer of the ports in use with 406
+	 * "PORT-C/S DUPLICATED".
 	 */
 	char sec[1200];
-	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED)
+	if (ctx->sec_state == IMSD_SEC_OFFERED || ctx->sec_state == IMSD_SEC_PROTECTED) {
 		imsroha_ipsec_new_spis(&ctx->sec);
+		ctx->sec.offer_port_uc = ctx->sec_state == IMSD_SEC_PROTECTED ?
+					 next_port_uc(ctx) : ctx->sec.port_uc;
+	}
 	sec_lines(ctx, sec, sizeof(sec));
 	/* R5 5.2.2 wanted algorithm=AKAv1-MD5 here; R6 dropped that, so: as LG U+ has it. */
 	const char *alg = "";
@@ -832,7 +885,7 @@ static int handle_401_challenge(struct imsd_sip_ctx *ctx, const char *msg)
 			   imsroha_ipsec_parse_server(&ctx->sec, ss) < 0) {
 			sec_restart(ctx, "the 401 has no Security-Server matching our offer");
 			return -EPROTO;
-		} else if (imsroha_ipsec_install(&ctx->sec, ctx->local_ip, pcscf, res.ik, res.ck) < 0) {
+		} else if (install_sas(ctx, pcscf, res.ik, res.ck) < 0) {
 			/* Most likely a kernel without XFRM_USER or INET6_ESP. */
 			sec_restart(ctx, "ip xfrm could not install the SAs (kernel without XFRM_USER/INET6_ESP?)");
 			return -EIO;
@@ -3258,7 +3311,7 @@ int imsd_sip_setup(struct imsd_sip_ctx *ctx, const struct imsd_isim_identity *id
 }
 
 /* A UDP socket on the IMS address and link, fed to on_sip_packet. */
-static int sip_socket(struct imsd_sip_ctx *ctx, uint16_t port, int *out)
+static int sip_socket(struct imsd_sip_ctx *ctx, uint16_t port, int *out, sd_event_source **src)
 {
 	int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0)
@@ -3271,7 +3324,7 @@ static int sip_socket(struct imsd_sip_ctx *ctx, uint16_t port, int *out)
 		close(fd);
 		return r;
 	}
-	int r = sd_event_add_io(ctx->event, NULL, fd, EPOLLIN, on_sip_packet, ctx);
+	int r = sd_event_add_io(ctx->event, src, fd, EPOLLIN, on_sip_packet, ctx);
 	if (r < 0) {
 		close(fd);
 		return r;
@@ -3381,8 +3434,8 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 	fprintf(stderr, "imsroha: SIP UDP socket bound to [%s]:%u\n", ctx->local_ip, ctx->sip_port);
 
 	if (ctx->sec_state == IMSD_SEC_OFFERED) {
-		if ((r = sip_socket(ctx, ctx->sec.port_uc, &ctx->fd_c)) < 0 ||
-		    (r = sip_socket(ctx, ctx->sec.port_us, &ctx->fd_s)) < 0) {
+		if ((r = sip_socket(ctx, ctx->sec.port_uc, &ctx->fd_c, &ctx->src_c)) < 0 ||
+		    (r = sip_socket(ctx, ctx->sec.port_us, &ctx->fd_s, NULL)) < 0) {
 			fprintf(stderr, "imsroha: no sockets for the protected ports %u/%u: %s\n",
 				ctx->sec.port_uc, ctx->sec.port_us, strerror(-r));
 			return r;
@@ -3394,6 +3447,7 @@ int imsd_sip_init(struct imsd_sip_ctx *ctx, sd_event *event, sd_bus *bus)
 void imsd_sip_destroy(struct imsd_sip_ctx *ctx)
 {
 	imsroha_ipsec_remove(&ctx->sec);
+	ctx->src_c = sd_event_source_disable_unref(ctx->src_c);
 	if (ctx->fd_c >= 0)
 		close(ctx->fd_c);
 	if (ctx->fd_s >= 0)
