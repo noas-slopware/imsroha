@@ -25,6 +25,15 @@ static const char *carriers_path(void)
 	return p && *p ? p : IMSROHA_CARRIERS_PATH;
 }
 
+static const char *conf_dir(void)
+{
+	const char *p = getenv("IMSROHA_CONF_DIR");
+	if (p)
+		return *p ? p : NULL;
+	p = getenv("IMSROHA_CONF");
+	return p && *p ? NULL : IMSROHA_CONF_DIR;
+}
+
 /* A missing file is not an error; a broken one is. */
 static GKeyFile *load_keyfile(const char *path, int *err)
 {
@@ -41,6 +50,60 @@ static GKeyFile *load_keyfile(const char *path, int *err)
 		return NULL;
 	}
 	return kf;
+}
+
+/* Every key of src into dst, replacing what dst had. */
+static void merge_keyfile(GKeyFile *dst, GKeyFile *src)
+{
+	gsize ng = 0;
+	char **groups = g_key_file_get_groups(src, &ng);
+	for (gsize i = 0; i < ng; i++) {
+		gsize nk = 0;
+		char **keys = g_key_file_get_keys(src, groups[i], &nk, NULL);
+		for (gsize j = 0; keys && j < nk; j++) {
+			char *v = g_key_file_get_value(src, groups[i], keys[j], NULL);
+			if (v)
+				g_key_file_set_value(dst, groups[i], keys[j], v);
+			g_free(v);
+		}
+		g_strfreev(keys);
+	}
+	g_strfreev(groups);
+}
+
+static int cmp_names(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+GKeyFile *imsroha_config_local(int *err)
+{
+	GKeyFile *merged = NULL;
+	GPtrArray *files = g_ptr_array_new_with_free_func(g_free);
+	const char *dir = conf_dir();
+	GDir *d = dir ? g_dir_open(dir, 0, NULL) : NULL;
+
+	if (d) {
+		const char *name;
+		while ((name = g_dir_read_name(d)))
+			if (g_str_has_suffix(name, ".conf") && name[0] != '.')
+				g_ptr_array_add(files, g_build_filename(dir, name, NULL));
+		g_dir_close(d);
+		g_ptr_array_sort(files, cmp_names);
+	}
+	g_ptr_array_add(files, g_strdup(conf_path()));
+
+	for (guint i = 0; i < files->len; i++) {
+		GKeyFile *kf = load_keyfile(files->pdata[i], err);
+		if (!kf)
+			continue;
+		if (!merged)
+			merged = g_key_file_new();
+		merge_keyfile(merged, kf);
+		g_key_file_free(kf);
+	}
+	g_ptr_array_free(files, TRUE);
+	return merged;
 }
 
 static void get_str(GKeyFile *kf, const char *group, const char *key, char *out, size_t size)
@@ -170,7 +233,7 @@ int imsroha_config_load_device(struct imsroha_device *dev)
 {
 	int err = 0;
 	device_defaults(dev);
-	GKeyFile *kf = load_keyfile(conf_path(), &err);
+	GKeyFile *kf = imsroha_config_local(&err);
 	if (kf) {
 		device_from(kf, dev);
 		g_key_file_free(kf);
@@ -283,7 +346,7 @@ int imsroha_config_load(struct imsroha_config *cfg, const char *mcc, const char 
 		g_key_file_free(carriers);
 
 	cfg->rcs_enabled = 0;
-	GKeyFile *local = load_keyfile(conf_path(), &err);
+	GKeyFile *local = imsroha_config_local(&err);
 	if (local) {
 		carrier_from(local, "carrier", &cfg->car);
 		get_bool(local, "rcs", "enable", &cfg->rcs_enabled);

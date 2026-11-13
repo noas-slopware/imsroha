@@ -7,12 +7,6 @@
 #include <string.h>
 #include <glib.h>
 
-static const char *conf_path(void)
-{
-	const char *p = getenv("IMSROHA_CONF");
-	return p && *p ? p : IMSROHA_CONF_PATH;
-}
-
 static const char *carriers_path(void)
 {
 	const char *p = getenv("IMSROHA_CARRIERS");
@@ -168,7 +162,7 @@ int rcs_config_load_switch(struct rcs_config *cfg)
 {
 	int err = 0;
 	defaults(cfg);
-	GKeyFile *local = load(conf_path(), &err);
+	GKeyFile *local = imsroha_config_local(&err);
 	if (local) {
 		rcs_local(local, cfg);
 		g_key_file_free(local);
@@ -192,7 +186,7 @@ int rcs_config_load(struct rcs_config *cfg, const char *mcc, const char *mnc)
 	if (carriers)
 		g_key_file_free(carriers);
 
-	GKeyFile *local = load(conf_path(), &err);
+	GKeyFile *local = imsroha_config_local(&err);
 	if (local) {
 		rcs_carrier(local, "carrier", cfg);
 		str(local, "device", "vendor", cfg->terminal_vendor, sizeof(cfg->terminal_vendor));

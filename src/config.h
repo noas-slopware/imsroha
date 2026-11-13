@@ -10,14 +10,19 @@
  *   1. built-in defaults (3GPP behaviour, nothing carrier-specific),
  *   2. the carrier profile from carriers.conf whose plmn= list holds the
  *      SIM's MCC+MNC,
- *   3. /etc/imsroha/imsroha.conf: [device] for the hardware, [carrier] for
- *      overriding any carrier key on this machine.
+ *   3. the .conf files in /usr/share/imsroha/imsroha.conf.d by name, then
+ *      /etc/imsroha/imsroha.conf: [device] for the hardware, [carrier] for
+ *      overriding any carrier key on this machine, [rcs]. The drop-ins are for
+ *      a device package (the modem's node, mux and model for one phone); a key
+ *      in /etc/imsroha/imsroha.conf wins over the same key in a drop-in.
  *
- * IMSROHA_CONF and IMSROHA_CARRIERS in the environment replace the two paths
- * (tests use them).
+ * IMSROHA_CONF, IMSROHA_CONF_DIR and IMSROHA_CARRIERS in the environment
+ * replace the three paths (tests use them). With IMSROHA_CONF set and
+ * IMSROHA_CONF_DIR not, no drop-ins are read, so a test sees only its own file.
  */
 
 #define IMSROHA_CONF_PATH "/etc/imsroha/imsroha.conf"
+#define IMSROHA_CONF_DIR "/usr/share/imsroha/imsroha.conf.d"
 #define IMSROHA_CARRIERS_PATH "/usr/share/imsroha/carriers.conf"
 #define IMSROHA_PDN_FILE "pdn" /* in the runtime directory, written by imsroha-bearer */
 
@@ -83,6 +88,11 @@ struct imsroha_config {
 
 /* Device section only: what imsroha-bearer and the VSS helper need. */
 int imsroha_config_load_device(struct imsroha_device *dev);
+
+/* The local configuration (layer 3) as one key file: the drop-ins merged in
+ * name order, then imsroha.conf, later keys winning. NULL when there is none;
+ * a file that does not parse sets *err to -EINVAL and is skipped. */
+struct _GKeyFile *imsroha_config_local(int *err);
 
 /*
  * Everything, with the carrier picked by MCC/MNC (mnc as on the SIM, 2 or 3

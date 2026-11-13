@@ -69,6 +69,11 @@ own.
 - `[rcs]`: `enable=true` turns RCS on (off by default); see `docs/rcs.md`.
 - `[carrier]`: overrides any key of the carrier profile.
 
+A device package puts its phone's `[device]` keys in a drop-in,
+`/usr/share/imsroha/imsroha.conf.d/<name>.conf`, read in name order before
+`/etc/imsroha/imsroha.conf`; a key in `/etc/imsroha/imsroha.conf` wins over the same key
+in a drop-in.
+
 `/usr/share/imsroha/carriers.conf` holds the carrier profiles, matched by the SIM's
 MCC+MNC: home domain, fallback P-CSCFs, User-Agent template, SMS over IP or not, how
 the MT-SMS RP-ACK goes back, SMSC, IPsec, payload types, Session-Expires, SIP and

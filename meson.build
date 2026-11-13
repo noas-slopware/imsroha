@@ -95,6 +95,9 @@ test('rmnet-clear', find_program('tests/rmnet-clear.sh'), args: [rmnet_clear.ful
 test('inbox-seen', executable('inbox-seen', 'tests/inbox-seen.c', 'src/inbox.c',
   include_directories: include_directories('src'), dependencies: [glib], build_by_default: false))
 test('amr-be', executable('amr-be', 'tests/amr-be.c', 'src/amr_be.c', build_by_default: false))
+test('config-dropin', executable('config-dropin', 'tests/config-dropin.c', link_with: common,
+  include_directories: include_directories('src'), dependencies: [glib],
+  c_args: '-DGOLDEN_SRCDIR="@0@"'.format(meson.current_source_dir()), build_by_default: false))
 # LG U+ with tests/lguplus-recorded.conf: byte for byte what b2q-imsd sent.
 test('sip-golden-lguplus-recorded', find_program('tests/run-golden.sh'),
   args: [golden.full_path(), meson.project_source_root() / 'tests/golden-lguplus.txt',
