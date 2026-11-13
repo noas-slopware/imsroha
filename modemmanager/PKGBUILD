@@ -41,6 +41,8 @@ makedepends=(
   git
   glib2-devel
   gobject-introspection
+  # include/meson.build runs xsltproc even with gtk_doc off (Arch gets it through gtk-doc)
+  libxslt
   meson
   systemd
 )
