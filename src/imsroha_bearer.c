@@ -268,8 +268,19 @@ static int configure_network(const char *addr, guint8 prefix_len, guint32 mtu)
 	add[n] = NULL;
 
 	const char *const up[] = { "ip", "link", "set", ifn, "mtu", mtu_str, "up", NULL };
-	/* nodad: the network assigned this address; nothing else can hold it. */
-	const char *const ad[] = { "ip", "-6", "addr", "replace", cidr, "dev", ifn, "nodad", NULL };
+	/*
+	 * nodad: the network assigned this address; nothing else can hold it.
+	 * preferred_lft 0: deprecated, so the kernel never picks it as the
+	 * source of a socket that did not ask for it (RFC 6724 rule 3). It is
+	 * a global address, and without this every unbound IPv6 connection to
+	 * the internet left from it, met the rule below and went into the IMS
+	 * PDN, which reaches only the IMS core: a Qt app (no fallback to IPv4
+	 * on a connect that hangs) waited out its timeout on every request.
+	 * Everything of ours binds to the address or the link, which a
+	 * deprecated address still serves.
+	 */
+	const char *const ad[] = { "ip", "-6", "addr", "replace", cidr, "dev", ifn, "nodad",
+		"preferred_lft", "0", NULL };
 	if (run(add) || run(up) || run(ad))
 		return -1;
 
