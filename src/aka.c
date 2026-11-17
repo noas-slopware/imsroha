@@ -627,6 +627,169 @@ static void run_ctx(struct aka_ctx *ctx)
 		g_object_unref(ctx->dev);
 }
 
+/* ---- waiting for the SIM ---- */
+
+/*
+ * Without a SIM, or before SIMamura (or the modem) has opened the primary GW
+ * provisioning session, every read fails with UimUninitialized. Rather than
+ * exit and be restarted by systemd every few seconds for as long as the tray
+ * is empty, a caller can wait here: the UIM Card Status indication says when
+ * the session's application turns ready, and until then nothing runs.
+ */
+struct sim_wait_ctx {
+	GMainLoop *loop;
+	QmiDevice *dev;
+	QmiClientUim *uim;
+	int err_code;
+	int ready;
+	int said;
+};
+
+#define SIM_GW_READY(index, cards, CARD, APP)                                                  \
+	({                                                                                     \
+		int r_ = 0;                                                                    \
+		guint slot_ = (index) >> 8, app_ = (index) & 0xff;                             \
+		if ((index) != 0xffff && (cards) && slot_ < (cards)->len) {                    \
+			CARD *c_ = &g_array_index((cards), CARD, slot_);                       \
+			if (c_->card_state == QMI_UIM_CARD_STATE_PRESENT && c_->applications && \
+			    app_ < c_->applications->len)                                      \
+				r_ = g_array_index(c_->applications, APP, app_).state ==       \
+				     QMI_UIM_CARD_APPLICATION_STATE_READY;                     \
+		}                                                                              \
+		r_;                                                                            \
+	})
+
+static void sim_wait_check(struct sim_wait_ctx *ctx, int ready)
+{
+	if (ready) {
+		ctx->ready = 1;
+		g_main_loop_quit(ctx->loop);
+	} else if (!ctx->said) {
+		fprintf(stderr, "imsroha: no ready SIM yet, waiting for one\n");
+		ctx->said = 1;
+	}
+}
+
+static void on_card_status_ind(QmiClientUim *uim, QmiIndicationUimCardStatusOutput *out, gpointer user_data)
+{
+	guint16 gw = 0xffff;
+	GArray *cards = NULL;
+
+	(void)uim;
+	if (qmi_indication_uim_card_status_output_get_card_status(out, &gw, NULL, NULL, NULL, &cards, NULL))
+		sim_wait_check(user_data, SIM_GW_READY(gw, cards, QmiIndicationUimCardStatusOutputCardStatusCardsElement,
+						       QmiIndicationUimCardStatusOutputCardStatusCardsElementApplicationsElementV2));
+}
+
+static void sim_wait_status_ready(QmiClientUim *uim, GAsyncResult *res, gpointer user_data)
+{
+	struct sim_wait_ctx *ctx = user_data;
+	GError *err = NULL;
+	QmiMessageUimGetCardStatusOutput *out = qmi_client_uim_get_card_status_finish(uim, res, &err);
+	guint16 gw = 0xffff;
+	GArray *cards = NULL;
+
+	if (!out || !qmi_message_uim_get_card_status_output_get_result(out, &err) ||
+	    !qmi_message_uim_get_card_status_output_get_card_status(out, &gw, NULL, NULL, NULL, &cards, &err)) {
+		fprintf(stderr, "imsroha: UIM card status: %s\n", err ? err->message : "unknown");
+		g_clear_error(&err);
+		if (out)
+			qmi_message_uim_get_card_status_output_unref(out);
+		ctx->err_code = -EIO;
+		g_main_loop_quit(ctx->loop);
+		return;
+	}
+	/* The indication is subscribed already: a change between the two is not missed. */
+	sim_wait_check(ctx, SIM_GW_READY(gw, cards, QmiMessageUimGetCardStatusOutputCardStatusCardsElement,
+					 QmiMessageUimGetCardStatusOutputCardStatusCardsElementApplicationsElementV2));
+	qmi_message_uim_get_card_status_output_unref(out);
+}
+
+static void sim_wait_registered(QmiClientUim *uim, GAsyncResult *res, gpointer user_data)
+{
+	struct sim_wait_ctx *ctx = user_data;
+	GError *err = NULL;
+	QmiMessageUimRegisterEventsOutput *out = qmi_client_uim_register_events_finish(uim, res, &err);
+
+	if (!out || !qmi_message_uim_register_events_output_get_result(out, &err)) {
+		fprintf(stderr, "imsroha: UIM register events: %s\n", err ? err->message : "unknown");
+		g_clear_error(&err);
+		if (out)
+			qmi_message_uim_register_events_output_unref(out);
+		ctx->err_code = -EIO;
+		g_main_loop_quit(ctx->loop);
+		return;
+	}
+	qmi_message_uim_register_events_output_unref(out);
+	qmi_client_uim_get_card_status(uim, NULL, 5, NULL, (GAsyncReadyCallback)sim_wait_status_ready, ctx);
+}
+
+static void sim_wait_client(QmiDevice *device, GAsyncResult *res, gpointer user_data)
+{
+	struct sim_wait_ctx *ctx = user_data;
+	GError *err = NULL;
+	QmiClient *cl = qmi_device_allocate_client_finish(device, res, &err);
+
+	if (!cl) {
+		fprintf(stderr, "imsroha: allocate UIM client failed: %s\n", err ? err->message : "unknown");
+		g_clear_error(&err);
+		ctx->err_code = -EIO;
+		g_main_loop_quit(ctx->loop);
+		return;
+	}
+	ctx->uim = QMI_CLIENT_UIM(cl);
+	g_signal_connect(ctx->uim, "card-status", G_CALLBACK(on_card_status_ind), ctx);
+	QmiMessageUimRegisterEventsInput *in = qmi_message_uim_register_events_input_new();
+	qmi_message_uim_register_events_input_set_event_registration_mask(
+		in, QMI_UIM_EVENT_REGISTRATION_FLAG_CARD_STATUS, NULL);
+	qmi_client_uim_register_events(ctx->uim, in, 5, NULL, (GAsyncReadyCallback)sim_wait_registered, ctx);
+	qmi_message_uim_register_events_input_unref(in);
+}
+
+static void sim_wait_open(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+	struct sim_wait_ctx *ctx = user_data;
+	GError *err = NULL;
+
+	(void)src;
+	ctx->dev = imsroha_qmi_open_finish(res, &err);
+	if (!ctx->dev) {
+		fprintf(stderr, "imsroha: opening the modem's QMI device: %s\n", err ? err->message : "unknown");
+		g_clear_error(&err);
+		ctx->err_code = -EIO;
+		g_main_loop_quit(ctx->loop);
+		return;
+	}
+	g_signal_connect_swapped(ctx->dev, QMI_DEVICE_SIGNAL_REMOVED, G_CALLBACK(g_main_loop_quit), ctx->loop);
+	qmi_device_allocate_client(ctx->dev, QMI_SERVICE_UIM, QMI_CID_NONE, 5, NULL,
+				   (GAsyncReadyCallback)sim_wait_client, ctx);
+}
+
+int imsroha_sim_wait_ready(void)
+{
+	struct sim_wait_ctx ctx = { .loop = g_main_loop_new(NULL, FALSE) };
+
+	imsroha_qmi_open(&sim_dev, QMI_DEVICE_OPEN_FLAGS_PROXY | QMI_DEVICE_OPEN_FLAGS_EXPECT_INDICATIONS,
+			 NULL, sim_wait_open, &ctx);
+	g_main_loop_run(ctx.loop);
+	g_main_loop_unref(ctx.loop);
+	if (ctx.uim) {
+		if (ctx.dev)
+			qmi_device_release_client(ctx.dev, QMI_CLIENT(ctx.uim),
+						  QMI_DEVICE_RELEASE_CLIENT_FLAGS_RELEASE_CID, 5, NULL, NULL, NULL);
+		g_object_unref(ctx.uim);
+	}
+	if (ctx.dev)
+		g_object_unref(ctx.dev);
+	if (ctx.err_code)
+		return ctx.err_code;
+	if (!ctx.ready)
+		return -ENODEV; /* the QMI device went away */
+	if (ctx.said)
+		fprintf(stderr, "imsroha: the SIM is ready\n");
+	return 0;
+}
+
 int imsd_isim_read_identity(struct imsd_isim_identity *id)
 {
 	if (!id)

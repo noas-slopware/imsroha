@@ -42,3 +42,5 @@ struct imsd_isim_identity {
 /* Reads EF_IMPI, EF_IMPU and EF_DOMAIN from the ISIM. 0 or negative errno. */
 /* Reads the identity: the ISIM's when there is one, else derived from the USIM. */
 int imsd_isim_read_identity(struct imsd_isim_identity *id);
+/* Block until the primary GW provisioning application is ready (0), or fail. */
+int imsroha_sim_wait_ready(void);

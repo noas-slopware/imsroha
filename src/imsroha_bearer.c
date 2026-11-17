@@ -14,8 +14,9 @@
  * $RUNTIME_DIRECTORY/pdn tells imsroha the interface, the address, and the
  * P-CSCFs and DNS servers the network sent in the PCO. Only then READY=1.
  *
- * Every failure exits nonzero so systemd retries it: at boot the modem answers
- * Start Network with OutOfCall until it has attached. Once up, the process
+ * Start Network waits for the modem to attach to packet service (NAS Serving
+ * System), so without a SIM the process just waits for one. Every failure
+ * exits nonzero so systemd retries it. Once up, the process
  * sleeps in the main loop and exits when the bearer goes away:
  *
  *   - WDS Packet Service Status indication reporting "disconnected",
@@ -65,6 +66,8 @@ static GMainLoop *loop;
 static QmiDevice *g_dev;
 static QmiClientWds *g_wds;
 static QmiClientWda *g_wda;
+static QmiClientNas *g_nas;
+static gulong nas_ind_id;
 static int exit_code;
 
 static int ep_type, ep_iface;
@@ -607,6 +610,116 @@ static void start_network(void)
 	qmi_message_wds_start_network_input_unref(inp);
 }
 
+/* ---- QMI: wait for packet service before Start Network ---- */
+
+/*
+ * Start Network only once the modem is attached to packet service. Without a
+ * SIM, or before it has registered, it would answer OutOfCall or no-service,
+ * and exiting for a restart then repeats forever every 15 s. Instead the NAS
+ * Serving System indication says when it attaches; until then the process
+ * waits in the main loop. The NAS client is released as soon as it attaches:
+ * its indications would otherwise wake the phone from s2idle on every change.
+ */
+static void ps_attached(void)
+{
+	if (nas_ind_id)
+		g_signal_handler_disconnect(g_nas, nas_ind_id);
+	nas_ind_id = 0;
+	qmi_device_release_client(g_dev, QMI_CLIENT(g_nas), QMI_DEVICE_RELEASE_CLIENT_FLAGS_RELEASE_CID,
+				  10, NULL, NULL, NULL);
+	g_clear_object(&g_nas);
+	sd_notify(0, "STATUS=starting the IMS PDN");
+	start_network();
+}
+
+static void on_serving_system_ind(QmiClientNas *nas, QmiIndicationNasServingSystemOutput *out,
+				  gpointer user_data)
+{
+	QmiNasAttachState ps = QMI_NAS_ATTACH_STATE_UNKNOWN;
+
+	(void)nas;
+	(void)user_data;
+	if (!g_nas || !qmi_indication_nas_serving_system_output_get_serving_system(out, NULL, NULL, &ps,
+										    NULL, NULL, NULL))
+		return;
+	if (ps == QMI_NAS_ATTACH_STATE_ATTACHED) {
+		printf("imsroha-bearer: packet service attached\n");
+		ps_attached();
+	}
+}
+
+static void on_register_indications_done(QmiClientNas *nas, GAsyncResult *res, gpointer user_data)
+{
+	GError *error = NULL;
+	QmiMessageNasRegisterIndicationsOutput *out = qmi_client_nas_register_indications_finish(nas, res, &error);
+
+	(void)user_data;
+	if (!out || !qmi_message_nas_register_indications_output_get_result(out, &error)) {
+		die("nas register_indications: %s", error->message);
+		g_error_free(error);
+	}
+	if (out)
+		qmi_message_nas_register_indications_output_unref(out);
+}
+
+static void on_get_serving_system_done(QmiClientNas *nas, GAsyncResult *res, gpointer user_data)
+{
+	GError *error = NULL;
+	QmiMessageNasGetServingSystemOutput *out = qmi_client_nas_get_serving_system_finish(nas, res, &error);
+	QmiNasRegistrationState reg = QMI_NAS_REGISTRATION_STATE_UNKNOWN;
+	QmiNasAttachState ps = QMI_NAS_ATTACH_STATE_UNKNOWN;
+
+	(void)user_data;
+	if (!out || !qmi_message_nas_get_serving_system_output_get_result(out, &error) ||
+	    !qmi_message_nas_get_serving_system_output_get_serving_system(out, &reg, NULL, &ps, NULL, NULL,
+									  &error)) {
+		die("nas get_serving_system: %s", error->message);
+		g_error_free(error);
+		if (out)
+			qmi_message_nas_get_serving_system_output_unref(out);
+		return;
+	}
+	qmi_message_nas_get_serving_system_output_unref(out);
+
+	/* The indication is already subscribed: an attach between the two is not missed. */
+	if (ps == QMI_NAS_ATTACH_STATE_ATTACHED) {
+		ps_attached();
+		return;
+	}
+	printf("imsroha-bearer: waiting for packet service (registration %s, PS %s)\n",
+	       qmi_nas_registration_state_get_string(reg), qmi_nas_attach_state_get_string(ps));
+	sd_notify(0, "STATUS=waiting for packet service (no SIM, or not registered yet)");
+}
+
+static void on_nas_ready(QmiDevice *d, GAsyncResult *res, gpointer user_data)
+{
+	GError *error = NULL;
+	QmiClient *client = qmi_device_allocate_client_finish(d, res, &error);
+
+	(void)user_data;
+	if (!client) {
+		die("allocating a NAS client: %s", error->message);
+		g_error_free(error);
+		return;
+	}
+	g_nas = QMI_CLIENT_NAS(client);
+	nas_ind_id = g_signal_connect(g_nas, "serving-system", G_CALLBACK(on_serving_system_ind), NULL);
+
+	QmiMessageNasRegisterIndicationsInput *in = qmi_message_nas_register_indications_input_new();
+	qmi_message_nas_register_indications_input_set_serving_system_events(in, TRUE, NULL);
+	qmi_client_nas_register_indications(g_nas, in, 10, NULL,
+					    (GAsyncReadyCallback)on_register_indications_done, NULL);
+	qmi_message_nas_register_indications_input_unref(in);
+	qmi_client_nas_get_serving_system(g_nas, NULL, 10, NULL,
+					  (GAsyncReadyCallback)on_get_serving_system_done, NULL);
+}
+
+static void wait_for_packet_service(void)
+{
+	qmi_device_allocate_client(g_dev, QMI_SERVICE_NAS, QMI_CID_NONE, 10, NULL,
+				   (GAsyncReadyCallback)on_nas_ready, NULL);
+}
+
 static void on_set_ip_family_done(QmiClientWds *wds, GAsyncResult *res, gpointer user_data)
 {
 	GError *error = NULL;
@@ -622,7 +735,7 @@ static void on_set_ip_family_done(QmiClientWds *wds, GAsyncResult *res, gpointer
 	if (out)
 		qmi_message_wds_set_ip_family_output_unref(out);
 
-	start_network();
+	wait_for_packet_service();
 }
 
 static void on_bind_mux_done(QmiClientWds *wds, GAsyncResult *res, gpointer user_data)

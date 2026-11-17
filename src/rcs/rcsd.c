@@ -345,7 +345,10 @@ static int read_identity(struct rcsd *r)
 	} else {
 		struct imsd_isim_identity sim;
 		imsroha_sim_set_device(&r->cfg.base.dev);
-		int e = imsd_isim_read_identity(&sim);
+		/* No SIM yet: wait for one here instead of exiting for a restart. */
+		int e = imsroha_sim_wait_ready();
+		if (e == 0)
+			e = imsd_isim_read_identity(&sim);
 		if (e < 0) {
 			fprintf(stderr, "imsroha-rcs: cannot read the SIM: %s\n", strerror(-e));
 			return e;
