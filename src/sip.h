@@ -98,6 +98,7 @@ struct imsd_sip_ctx {
 	sd_event_source *reg_timer;
 	sd_event_source *reg_retry_timer;
 	int reg_retry_count;
+	int reg_port_switched;	/* offered the other protected client port after a 406 */
 
 	/* Call state */
 	int call_state;

@@ -1074,8 +1074,44 @@ static void schedule_reg_retry(struct imsd_sip_ctx *ctx)
  * for good: after a modem reset the P-CSCF can refuse a stale binding for a
  * while and then accept a fresh one.
  */
+/*
+ * Move the protected client port to the other one before any SA is on it.
+ * A P-CSCF keeps a registration's port pair until that registration ends:
+ * after a restart (the de-registration answered or not) or a modem reset,
+ * LG U+ refuses an initial REGISTER that offers the pair the last one used
+ * with 406 "PORT-C/S DUPLICATED", for as long as the old one would have
+ * lasted (10800 s). A fresh process always starts on the first port.
+ */
+static int switch_port_uc(struct imsd_sip_ctx *ctx)
+{
+	uint16_t port = next_port_uc(ctx);
+	sd_event_source *src = NULL;
+	int fd = -1, r;
+
+	if ((r = sip_socket(ctx, port, &fd, &src)) < 0) {
+		fprintf(stderr, "imsroha: no socket for protected client port %u: %s\n", port, strerror(-r));
+		return r;
+	}
+	ctx->src_c = sd_event_source_disable_unref(ctx->src_c);
+	if (ctx->fd_c >= 0)
+		close(ctx->fd_c);
+	ctx->fd_c = fd;
+	ctx->src_c = src;
+	fprintf(stderr, "imsroha: offering protected client port %u instead of %u\n", port, ctx->sec.port_uc);
+	ctx->sec.port_uc = port;
+	return 0;
+}
+
 static void handle_register_rejected(struct imsd_sip_ctx *ctx, const char *msg, int status_code)
 {
+	if (status_code == 406 && ctx->cfg.car.ipsec && ctx->sec_state == IMSD_SEC_OFFERED &&
+	    switch_port_uc(ctx) == 0 && !ctx->reg_port_switched) {
+		/* Once at once; if both pairs are held, the back-off below alternates them. */
+		ctx->reg_port_switched = 1;
+		imsd_sip_register(ctx);
+		return;
+	}
+
 	if (status_code == 494 && ctx->cfg.car.ipsec && ctx->sec_state == IMSD_SEC_PROTECTED) {
 		/* RFC 3329 2.3.1: Security Agreement Required. Offer it again. */
 		fprintf(stderr, "imsroha: REGISTER 494, offering sec-agree again\n");
@@ -2413,6 +2449,7 @@ static int on_sip_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 				}
 				ctx->reg_state = IMSD_UP;
 				fprintf(stderr, "imsroha: registered successfully! (expires %u s)\n", ctx->reg_expires);
+				ctx->reg_port_switched = 0;
 				fprintf(stderr, "imsroha: REGISTER 200 OK headers:\n%s\n", buf);
 				if (ctx->reg_service_route[0])
 					fprintf(stderr, "imsroha: learned Service-Route: %s\n", ctx->reg_service_route);
