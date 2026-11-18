@@ -636,6 +636,14 @@ static void run_ctx(struct aka_ctx *ctx)
  * is empty, a caller can wait here: the UIM Card Status indication says when
  * the session's application turns ready, and until then nothing runs.
  */
+/*
+ * The wait ends once the SIM is ready (or something failed) and no request of
+ * it is still in flight: the card-status indication can say "ready" before
+ * the Get Card Status answer is in, and that answer's callback must not run
+ * after this context, on imsroha_sim_wait_ready()'s stack, is gone. It did,
+ * inside the ISIM read that follows, and ended that read with no identity.
+ * Every request has a 5 s timeout, so the wait always ends.
+ */
 struct sim_wait_ctx {
 	GMainLoop *loop;
 	QmiDevice *dev;
@@ -643,7 +651,14 @@ struct sim_wait_ctx {
 	int err_code;
 	int ready;
 	int said;
+	int pending;	/* requests sent and not answered yet */
 };
+
+static void sim_wait_maybe_quit(struct sim_wait_ctx *ctx)
+{
+	if ((ctx->ready || ctx->err_code) && !ctx->pending)
+		g_main_loop_quit(ctx->loop);
+}
 
 #define SIM_GW_READY(index, cards, CARD, APP)                                                  \
 	({                                                                                     \
@@ -663,7 +678,7 @@ static void sim_wait_check(struct sim_wait_ctx *ctx, int ready)
 {
 	if (ready) {
 		ctx->ready = 1;
-		g_main_loop_quit(ctx->loop);
+		sim_wait_maybe_quit(ctx);
 	} else if (!ctx->said) {
 		fprintf(stderr, "imsroha: no ready SIM yet, waiting for one\n");
 		ctx->said = 1;
@@ -689,14 +704,18 @@ static void sim_wait_status_ready(QmiClientUim *uim, GAsyncResult *res, gpointer
 	guint16 gw = 0xffff;
 	GArray *cards = NULL;
 
+	ctx->pending--;
 	if (!out || !qmi_message_uim_get_card_status_output_get_result(out, &err) ||
 	    !qmi_message_uim_get_card_status_output_get_card_status(out, &gw, NULL, NULL, NULL, &cards, &err)) {
-		fprintf(stderr, "imsroha: UIM card status: %s\n", err ? err->message : "unknown");
+		/* Moot if the indication has said "ready" meanwhile. */
+		if (!ctx->ready) {
+			fprintf(stderr, "imsroha: UIM card status: %s\n", err ? err->message : "unknown");
+			ctx->err_code = -EIO;
+		}
 		g_clear_error(&err);
 		if (out)
 			qmi_message_uim_get_card_status_output_unref(out);
-		ctx->err_code = -EIO;
-		g_main_loop_quit(ctx->loop);
+		sim_wait_maybe_quit(ctx);
 		return;
 	}
 	/* The indication is subscribed already: a change between the two is not missed. */
@@ -711,16 +730,18 @@ static void sim_wait_registered(QmiClientUim *uim, GAsyncResult *res, gpointer u
 	GError *err = NULL;
 	QmiMessageUimRegisterEventsOutput *out = qmi_client_uim_register_events_finish(uim, res, &err);
 
+	ctx->pending--;
 	if (!out || !qmi_message_uim_register_events_output_get_result(out, &err)) {
 		fprintf(stderr, "imsroha: UIM register events: %s\n", err ? err->message : "unknown");
 		g_clear_error(&err);
 		if (out)
 			qmi_message_uim_register_events_output_unref(out);
 		ctx->err_code = -EIO;
-		g_main_loop_quit(ctx->loop);
+		sim_wait_maybe_quit(ctx);
 		return;
 	}
 	qmi_message_uim_register_events_output_unref(out);
+	ctx->pending++;
 	qmi_client_uim_get_card_status(uim, NULL, 5, NULL, (GAsyncReadyCallback)sim_wait_status_ready, ctx);
 }
 
@@ -730,11 +751,12 @@ static void sim_wait_client(QmiDevice *device, GAsyncResult *res, gpointer user_
 	GError *err = NULL;
 	QmiClient *cl = qmi_device_allocate_client_finish(device, res, &err);
 
+	ctx->pending--;
 	if (!cl) {
 		fprintf(stderr, "imsroha: allocate UIM client failed: %s\n", err ? err->message : "unknown");
 		g_clear_error(&err);
 		ctx->err_code = -EIO;
-		g_main_loop_quit(ctx->loop);
+		sim_wait_maybe_quit(ctx);
 		return;
 	}
 	ctx->uim = QMI_CLIENT_UIM(cl);
@@ -742,8 +764,17 @@ static void sim_wait_client(QmiDevice *device, GAsyncResult *res, gpointer user_
 	QmiMessageUimRegisterEventsInput *in = qmi_message_uim_register_events_input_new();
 	qmi_message_uim_register_events_input_set_event_registration_mask(
 		in, QMI_UIM_EVENT_REGISTRATION_FLAG_CARD_STATUS, NULL);
+	ctx->pending++;
 	qmi_client_uim_register_events(ctx->uim, in, 5, NULL, (GAsyncReadyCallback)sim_wait_registered, ctx);
 	qmi_message_uim_register_events_input_unref(in);
+}
+
+/* The QMI device went away: requests in flight fail or time out, then the wait ends. */
+static void sim_wait_removed(struct sim_wait_ctx *ctx)
+{
+	if (!ctx->err_code)
+		ctx->err_code = -ENODEV;
+	sim_wait_maybe_quit(ctx);
 }
 
 static void sim_wait_open(GObject *src, GAsyncResult *res, gpointer user_data)
@@ -760,7 +791,8 @@ static void sim_wait_open(GObject *src, GAsyncResult *res, gpointer user_data)
 		g_main_loop_quit(ctx->loop);
 		return;
 	}
-	g_signal_connect_swapped(ctx->dev, QMI_DEVICE_SIGNAL_REMOVED, G_CALLBACK(g_main_loop_quit), ctx->loop);
+	g_signal_connect_swapped(ctx->dev, QMI_DEVICE_SIGNAL_REMOVED, G_CALLBACK(sim_wait_removed), ctx);
+	ctx->pending++;
 	qmi_device_allocate_client(ctx->dev, QMI_SERVICE_UIM, QMI_CID_NONE, 5, NULL,
 				   (GAsyncReadyCallback)sim_wait_client, ctx);
 }
@@ -773,6 +805,11 @@ int imsroha_sim_wait_ready(void)
 			 NULL, sim_wait_open, &ctx);
 	g_main_loop_run(ctx.loop);
 	g_main_loop_unref(ctx.loop);
+	/* Nothing may call back into ctx once this returns. */
+	if (ctx.uim)
+		g_signal_handlers_disconnect_by_data(ctx.uim, &ctx);
+	if (ctx.dev)
+		g_signal_handlers_disconnect_by_data(ctx.dev, &ctx);
 	if (ctx.uim) {
 		if (ctx.dev)
 			qmi_device_release_client(ctx.dev, QMI_CLIENT(ctx.uim),
