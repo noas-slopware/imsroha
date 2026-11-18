@@ -2,6 +2,8 @@
 Description=IMSroha: ungate IMS registration on Samsung modems
 Documentation=https://github.com/noas-slopware/imsroha
 Before=imsroha-bearer.service imsroha.service
+After=qmi-proxy.service
+Wants=qmi-proxy.service
 
 [Service]
 # Exits 0 at once when the modem has no Samsung VSS service (227). On a

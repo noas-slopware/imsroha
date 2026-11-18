@@ -13,30 +13,39 @@ link on rmnet_ipa0 and sets the WDA data format again. The IMS PDN goes
 down with it, and with it still up the WDA setup fails ("No more data
 format combinations supported").
 
-While rmnet_ipa0 has a link other than ModemManager's own qmapmux0.0,
-the port open query and the setup read the data format without opening
-the DPM port. If the modem already runs raw-ip with QMAP aggregation (an
-earlier instance set it up), keep it and delete only qmapmux0.0 before
-the bearer adds it again. Otherwise, as at boot when the other PDN may
+While rmnet_ipa0 has a link that is not ModemManager's own (its links are
+named qmapmux<modem id>.<n>), the port open query and the setup read the
+data format without opening the DPM port. If the modem already runs
+raw-ip with QMAP aggregation (an earlier instance set it up), keep it and
+delete only ModemManager's own links before the bearer adds one again:
+all of them, since the modem id grows each time the modem is exported
+again (a SIM inserted later, a reprobe), and a link left by an earlier
+modem object holds its mux id (the new link then fails with EBUSY, and
+mobile data stays down). Otherwise, as at boot when the other PDN may
 come up before ModemManager's first connect, open the DPM port and run
 the full setup as before.
 
 Signed-off-by: Noa Himesaka <himesaka@noa.codes>
 Assisted-by: Claude:claude-opus-5-5
 ---
- src/mm-port-qmi.c | 109 +++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 107 insertions(+), 2 deletions(-)
+ src/mm-port-qmi.c | 155 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 153 insertions(+), 2 deletions(-)
 
 diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
-index 80bde14..1e137c5 100644
+index 80bde14b..bb0e3646 100644
 --- a/src/mm-port-qmi.c
 +++ b/src/mm-port-qmi.c
-@@ -904,6 +904,46 @@ mm_port_qmi_cleanup_link (MMPortQmi           *self,
+@@ -904,6 +904,51 @@ mm_port_qmi_cleanup_link (MMPortQmi           *self,
  
  /*****************************************************************************/
  
-+/* The mux link ModemManager creates for its first bearer */
-+#define IPA_DEFAULT_LINK "qmapmux0.0"
++/*
++ * ModemManager's own mux links: "qmapmux<modem D-Bus id>.<n>" (the bearer's
++ * link prefix hint). The id grows each time the modem is exported again, a
++ * reprobe or a SIM inserted later, so links of an earlier modem object can
++ * still be there: they are ModemManager's too, and their mux ids are in use.
++ */
++#define MM_LINK_PREFIX "qmapmux"
 +
 +/*
 + * On IPA the modem's QMAP data path is shared with PDNs ModemManager does
@@ -66,7 +75,7 @@ index 80bde14..1e137c5 100644
 +
 +    while ((name = g_dir_read_name (dir))) {
 +        if (g_str_has_prefix (name, "upper_") &&
-+            g_strcmp0 (name + strlen ("upper_"), IPA_DEFAULT_LINK) != 0) {
++            !g_str_has_prefix (name + strlen ("upper_"), MM_LINK_PREFIX)) {
 +            mm_obj_dbg (self, "QMAP data path in use by %s", name + strlen ("upper_"));
 +            return TRUE;
 +        }
@@ -78,34 +87,77 @@ index 80bde14..1e137c5 100644
  typedef struct {
      QmiDevice *device;
      MMPort    *data;
-@@ -958,6 +998,26 @@ delete_all_links_ready (QmiDevice    *device,
+@@ -958,6 +1003,69 @@ delete_all_links_ready (QmiDevice    *device,
      g_object_unref (task);
  }
  
++/* ModemManager's own links on the data interface, from this modem object or an earlier one */
++static GPtrArray *
++ipa_own_links (MMPortQmi *self)
++{
++    g_autoptr(GDir)  dir = NULL;
++    const gchar     *name;
++    GPtrArray       *links;
++
++    links = g_ptr_array_new_with_free_func (g_free);
++    dir = g_dir_open (self->priv->net_sysfs_path, 0, NULL);
++    while (dir && (name = g_dir_read_name (dir))) {
++        if (g_str_has_prefix (name, "upper_" MM_LINK_PREFIX))
++            g_ptr_array_add (links, g_strdup (name + strlen ("upper_")));
++    }
++    return links;
++}
++
++static void delete_own_links_next (GTask *task);
++
 +static void
-+delete_default_link_ready (QmiDevice    *device,
-+                           GAsyncResult *res,
-+                           GTask        *task)
++delete_own_link_ready (QmiDevice    *device,
++                       GAsyncResult *res,
++                       GTask        *task)
 +{
 +    MMPortQmi *self;
++    GPtrArray *links;
 +    GError    *error = NULL;
 +
 +    self = g_task_get_source_object (task);
 +
-+    /* a previous instance may not have left one */
 +    if (!qmi_device_delete_link_finish (device, res, &error)) {
-+        mm_obj_dbg (self, "couldn't delete the default mux link: %s", error->message);
++        mm_obj_dbg (self, "couldn't delete own mux link: %s", error->message);
 +        g_clear_error (&error);
 +    }
++    links = g_object_get_data (G_OBJECT (task), "own-links");
++    g_ptr_array_remove_index (links, links->len - 1);
++    delete_own_links_next (task);
++}
 +
-+    g_task_return_boolean (task, TRUE);
-+    g_object_unref (task);
++static void
++delete_own_links_next (GTask *task)
++{
++    MMPortQmi *self;
++    GPtrArray *links;
++    QmiDevice *device;
++
++    self = g_task_get_source_object (task);
++    links = g_object_get_data (G_OBJECT (task), "own-links");
++    device = g_object_get_data (G_OBJECT (task), "own-links-device");
++    if (!links->len) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++    mm_obj_dbg (self, "deleting own mux link %s", (const gchar *) g_ptr_array_index (links, links->len - 1));
++    qmi_device_delete_link (device,
++                            g_ptr_array_index (links, links->len - 1),
++                            QMI_DEVICE_MUX_ID_UNBOUND,
++                            NULL,
++                            (GAsyncReadyCallback) delete_own_link_ready,
++                            task);
 +}
 +
  static void
  net_link_down_ready (MMPortNet    *data,
                       GAsyncResult *res,
-@@ -1004,6 +1064,21 @@ internal_reset (MMPortQmi           *self,
+@@ -1004,6 +1112,19 @@ internal_reset (MMPortQmi           *self,
      ctx->device = g_object_ref (device);
      g_task_set_task_data (task, ctx, (GDestroyNotify) internal_reset_context_free);
  
@@ -113,21 +165,19 @@ index 80bde14..1e137c5 100644
 +    if (ipa_qmap_in_use (self) &&
 +        (self->priv->llp == QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP) &&
 +        MM_PORT_QMI_DAP_IS_SUPPORTED_QMAP (self->priv->dap)) {
-+        mm_obj_dbg (self, "deleting only the default mux link in data interface '%s'",
++        mm_obj_dbg (self, "deleting only ModemManager's own mux links in data interface '%s'",
 +                    mm_port_get_device (ctx->data));
-+        qmi_device_delete_link (ctx->device,
-+                                IPA_DEFAULT_LINK,
-+                                QMI_DEVICE_MUX_ID_UNBOUND,
-+                                NULL,
-+                                (GAsyncReadyCallback) delete_default_link_ready,
-+                                task);
++        g_object_set_data_full (G_OBJECT (task), "own-links", ipa_own_links (self),
++                                (GDestroyNotify) g_ptr_array_unref);
++        g_object_set_data (G_OBJECT (task), "own-links-device", ctx->device);
++        delete_own_links_next (task);
 +        return;
 +    }
 +
      /* mhi_net has a custom default MTU set by the kernel driver */
      if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
          mtu = MHI_NET_MTU_DEFAULT;
-@@ -1290,6 +1365,7 @@ typedef struct {
+@@ -1290,6 +1411,7 @@ typedef struct {
      guint32                        wda_dl_dap_max_datagrams_current;
      guint32                        wda_dl_dap_max_size_current;
      gboolean                       wda_dap_supported;
@@ -135,7 +185,7 @@ index 80bde14..1e137c5 100644
  } InternalSetupDataFormatContext;
  
  static void
-@@ -1924,7 +2000,8 @@ internal_setup_data_format_context_step (GTask *task)
+@@ -1924,7 +2046,8 @@ internal_setup_data_format_context_step (GTask *task)
  
          case INTERNAL_SETUP_DATA_FORMAT_STEP_ALLOCATE_DPM_CLIENT:
              /* Only allocate new DPM client on first loop */
@@ -145,7 +195,7 @@ index 80bde14..1e137c5 100644
                  g_assert (!ctx->dpm);
                  qmi_device_allocate_client (ctx->device,
                                              QMI_SERVICE_DPM,
-@@ -1940,7 +2017,7 @@ internal_setup_data_format_context_step (GTask *task)
+@@ -1940,7 +2063,7 @@ internal_setup_data_format_context_step (GTask *task)
  
          case INTERNAL_SETUP_DATA_FORMAT_STEP_DPM_OPEN:
              /* Only for IPA based setups, open dpm port */
@@ -154,7 +204,7 @@ index 80bde14..1e137c5 100644
                  dpm_open_port (task);
                  return;
              }
-@@ -1973,6 +2050,32 @@ internal_setup_data_format_context_step (GTask *task)
+@@ -1973,6 +2096,32 @@ internal_setup_data_format_context_step (GTask *task)
          case INTERNAL_SETUP_DATA_FORMAT_STEP_QUERY_DONE: {
              g_autofree gchar *kernel_data_modes_str = NULL;
  
@@ -187,7 +237,7 @@ index 80bde14..1e137c5 100644
              kernel_data_modes_str = mm_port_qmi_kernel_data_mode_build_string_from_mask (ctx->kernel_data_modes_current);
              mm_obj_dbg (self, "current data format setup:");
              mm_obj_dbg (self, "    kernel data modes: %s", kernel_data_modes_str);
-@@ -2081,6 +2184,8 @@ internal_setup_data_format (MMPortQmi                      *self,
+@@ -2081,6 +2230,8 @@ internal_setup_data_format (MMPortQmi                      *self,
      if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_QRTR)
          ctx->use_endpoint = TRUE;
  
@@ -196,3 +246,6 @@ index 80bde14..1e137c5 100644
      g_task_set_task_data (task, ctx, (GDestroyNotify) internal_setup_data_format_context_free);
  
      internal_setup_data_format_context_step (task);
+-- 
+2.56.0
+

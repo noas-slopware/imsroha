@@ -66,6 +66,11 @@ executable('imsroha-audio', 'src/imsroha_audio.c',
 prefix = get_option('prefix')
 unitdir = prefix / 'lib/systemd/system'
 userunitdir = prefix / 'lib/systemd/user'
+# qmi-proxy as a unit of its own (systemd/qmi-proxy.service.in): libqmi installs it in its
+# libexecdir, /usr/lib on Arch, /usr/libexec elsewhere.
+qmi_proxy = find_program('qmi-proxy', dirs: ['/usr/libexec', '/usr/lib', '/usr/lib/libqmi'], required: true)
+configure_file(input: 'systemd/qmi-proxy.service.in', output: 'qmi-proxy.service',
+  configuration: {'QMI_PROXY': qmi_proxy.full_path()}, install_dir: unitdir)
 install_data('systemd/imsroha.service', 'systemd/imsroha-bearer.service',
   'systemd/imsroha-vss-samsung.service', install_dir: unitdir)
 install_data('systemd/ModemManager.service.d/imsroha.conf',

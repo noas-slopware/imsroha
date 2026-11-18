@@ -6,7 +6,8 @@ Documentation=https://github.com/noas-slopware/imsroha
 # this unit and propagates its stop here, so every new PDN gets a fresh
 # imsroha and a fresh REGISTER. Requisite=, not BindsTo=: starting imsroha
 # must never start the bearer, or it would cut the bearer's RestartSec= short.
-After=imsroha-bearer.service dbus.socket
+After=imsroha-bearer.service dbus.socket qmi-proxy.service
+Wants=qmi-proxy.service
 Requisite=imsroha-bearer.service
 
 [Service]

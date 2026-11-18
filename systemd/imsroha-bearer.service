@@ -6,7 +6,8 @@ Documentation=https://github.com/noas-slopware/imsroha
 # sent the ungate, so every start of this unit (boot, restarts after a modem
 # reset or a lost PDN) runs it again.
 Wants=imsroha-vss-samsung.service
-After=imsroha-vss-samsung.service
+After=imsroha-vss-samsung.service qmi-proxy.service
+Wants=qmi-proxy.service
 Before=imsroha.service
 # The modem answers Start Network with OutOfCall until it has attached, so the
 # first try at boot fails and exits nonzero. Retry every 5 s, backing off to

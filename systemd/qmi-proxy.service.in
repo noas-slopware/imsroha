@@ -1,0 +1,11 @@
+[Unit]
+Description=qmi-proxy, which shares the modem's QMI device between its clients
+# A client that finds no qmi-proxy starts one as its own child, in its own
+# service's cgroup: stopping that service then kills the proxy under every
+# other client. Restarting imsroha-rcs took ModemManager's QMI with it, and
+# the modem was reprobed (2026-11-19). Run it on its own instead, before them.
+Before=ModemManager.service
+
+[Service]
+ExecStart=@QMI_PROXY@ --no-exit
+Restart=on-failure
