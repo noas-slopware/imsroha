@@ -33,9 +33,9 @@ int main(int argc, char **argv)
 	acs_state_load(&cfg, id.imsi, &st);
 	static const char *names[] = { "active", "none", "stopped", "dormant" };
 	enum acs_outcome o = acs_run(&cfg, &id, &st, !strcmp(argv[1], "disable"), otp, NULL, NULL);
-	printf("outcome %s version %d validity %d token %s permanent %d contacted %d disable-sent %d next-run %s\n",
+	printf("outcome %s version %d validity %d token %s permanent %d contacted %d disable-sent %d next-run %s last-run %s trial %d\n",
 	       names[o], st.version, st.validity, st.token[0] ? st.token : "-", st.permanent, st.contacted,
-	       st.disable_sent, st.next_run ? "set" : "next-start");
+	       st.disable_sent, st.next_run ? "set" : "next-start", st.last_run ? "set" : "none", st.trial);
 	size_t len = 0;
 	char *xml = acs_config_load(&cfg, id.imsi, &len);
 	printf("config.xml %s\n", xml ? "stored" : "absent");

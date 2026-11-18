@@ -228,6 +228,7 @@ static GIOStream *open_and_send(const struct rcs_config *cfg, const char *host, 
 	GIOStream *s = rcs_net_connect(cfg, host, port, tls, timeout_s, cancel, &e);
 	if (!s) {
 		snprintf(out->error, sizeof(out->error), "%s", e->message);
+		out->not_sent = g_error_matches(e, RCS_NET_ERROR, RCS_NET_ERROR_NO_INTERFACE);
 		g_error_free(e);
 		*err = -ECONNREFUSED;
 		return NULL;

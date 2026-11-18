@@ -575,6 +575,24 @@ static enum acs_outcome retry_later(struct acs_state *st, const char *why)
 	return ACS_NONE;
 }
 
+/*
+ * The request could not leave the phone (the interface it is bound to, such
+ * as the CLAT's, is not there yet): the ACS was not asked. That is no run for
+ * the floor under runs nor a step on R9 6.3.1.2.3's ladder, which are there
+ * for the ACS's sake; otherwise a run made while the link is down holds back
+ * the one a 403 asks for (R9 A.5 b) by 20 minutes, the 403 repeats, and RCS
+ * stops until a restart. The next run comes with the next try that needs one
+ * (a 403, an unreachable P-CSCF), and at the latest one floor from now.
+ */
+static enum acs_outcome not_sent(struct acs_state *st, int64_t prev_last_run, const char *why)
+{
+	st->last_run = prev_last_run;
+	if (st->next_run <= now_s())
+		st->next_run = now_s() + ACS_MIN_INTERVAL;
+	fprintf(stderr, "imsroha-rcs: ACS: not asked, nothing could leave (%s)\n", why);
+	return ACS_NONE;
+}
+
 static enum acs_outcome next_start(struct acs_state *st, const char *why)
 {
 	st->next_run = 0;
@@ -623,6 +641,8 @@ enum acs_outcome acs_run(const struct rcs_config *cfg, const struct rcs_identity
 	}
 
 	/* Written before the first byte goes out, so a crash cannot hide a run. */
+	int64_t prev_last_run = st->last_run;
+	int sent = 0;	/* a request of this run has left the phone */
 	st->last_run = now_s();
 	acs_state_save(cfg, id->imsi, st);
 
@@ -632,6 +652,11 @@ enum acs_outcome acs_run(const struct rcs_config *cfg, const struct rcs_identity
 		int s = exchange(cfg, &rq, cancel, &rs);
 		acs_request_clear(&rq);
 		st->last_status = s;
+		if (s == 0 && rs.not_sent) {
+			out = not_sent(st, prev_last_run, rs.error);
+			goto done;
+		}
+		sent = 1;
 		if (s == 200) {
 			jar_order(order, &rs);
 			jar_update(jar, &rs);
@@ -668,6 +693,10 @@ https:
 	int s = exchange(cfg, &rq, cancel, &rs);
 	acs_request_clear(&rq);
 	st->last_status = s;
+	if (s == 0 && rs.not_sent && !sent && !disable) {
+		out = not_sent(st, prev_last_run, rs.error);
+		goto done;
+	}
 
 	if (disable) {
 		/* Whatever came back: the carrier has been told. Only -1 still counts. */

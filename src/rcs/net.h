@@ -5,6 +5,14 @@
 #include <gio/gio.h>
 #include "rcs_config.h"
 
+/*
+ * The connection could not be made because the interface it is bound to
+ * ([rcs] interface=, interface-ipv4=) does not exist: nothing left the phone.
+ */
+#define RCS_NET_ERROR rcs_net_error_quark()
+GQuark rcs_net_error_quark(void);
+enum { RCS_NET_ERROR_NO_INTERFACE };
+
 /* tls: 0 = plain TCP, 1 = TLS, RCS_TLS_CLIENT_CERT = TLS presenting the MSRP
  * client certificate (cert.h) when there is one. */
 #define RCS_TLS_CLIENT_CERT 2

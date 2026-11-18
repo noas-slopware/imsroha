@@ -9,14 +9,20 @@
 #include <string.h>
 #include <sys/socket.h>
 
+G_DEFINE_QUARK(rcs-net-error-quark, rcs_net_error)
+
 static int bind_device(GSocket *sock, const char *dev, GError **error)
 {
 	if (!dev || !dev[0])
 		return 0;
 	if (setsockopt(g_socket_get_fd(sock), SOL_SOCKET, SO_BINDTODEVICE, dev, (socklen_t)strlen(dev)) < 0) {
 		int e = errno;
-		g_set_error(error, G_IO_ERROR, g_io_error_from_errno(e),
-			    "cannot bind to %s: %s", dev, g_strerror(e));
+		if (e == ENODEV)
+			g_set_error(error, RCS_NET_ERROR, RCS_NET_ERROR_NO_INTERFACE,
+				    "cannot bind to %s: %s", dev, g_strerror(e));
+		else
+			g_set_error(error, G_IO_ERROR, g_io_error_from_errno(e),
+				    "cannot bind to %s: %s", dev, g_strerror(e));
 		return -1;
 	}
 	return 0;

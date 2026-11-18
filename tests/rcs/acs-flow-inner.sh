@@ -97,5 +97,22 @@ for s in netauth otp minus1 zero disable 403 503; do
 	exec 3>&-
 	stop
 done
+# The interface the ACS is reached on is not there (the CLAT before it is up):
+# nothing leaves, and it is no run for the floor or the retry ladder.
+s=nodev
+mkfifo "$t/fifo.in.$s"
+exec 3<>"$t/fifo.in.$s"
+start $s
+printf 'interface=imsroha-none0\n' > "$t/nodev.conf"
+sed '/^\[rcs\]$/r '"$t/nodev.conf" "$t/imsroha.conf" > "$t/imsroha-nodev.conf"
+IMSROHA_CONF="$t/imsroha-nodev.conf" "$bin" run > "$t/out" 2> "$t/err" || true
+echo "--- $s"; cat "$t/out" "$t/err"
+check $s "outcome none" "$t/out"
+check $s "last-run none trial 0" "$t/out"
+check $s "not asked, nothing could leave (.*cannot bind to imsroha-none0" "$t/err"
+if [ "$(count)" != 0 ]; then echo "FAIL nodev: the ACS saw a connection"; fail=1; fi
+exec 3>&-
+stop
+
 [ $fail = 0 ] && echo "acs-flow: all scenarios passed"
 exit $fail

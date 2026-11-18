@@ -19,6 +19,7 @@ struct http_response {
 	char *body;         /* NUL-terminated; len excludes the NUL */
 	size_t len;
 	char error[256];    /* why status is 0 */
+	int not_sent;       /* status 0 because the request never left: its interface is missing */
 };
 
 int http_exchange(const struct rcs_config *cfg, const char *host, uint16_t port, int tls,
