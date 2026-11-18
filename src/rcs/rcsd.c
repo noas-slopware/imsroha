@@ -213,6 +213,9 @@ static void acs_done(GObject *src, GAsyncResult *res, gpointer ud)
 	struct acs_job *j = g_task_get_task_data(G_TASK(res));
 	struct rcsd *r = j->r;
 	r->acs_running = 0;
+	/* Answered: acs_apply_vers() clears the force, and the configuration is new. */
+	if (!r->st.rcscfg_force)
+		r->refused = 0;
 
 	if (j->disable) {
 		g_main_loop_quit(r->loop);
@@ -238,8 +241,11 @@ static void acs_done(GObject *src, GAsyncResult *res, gpointer ud)
 		rcsd_set_state(r, RCSD_UNREGISTERED);
 		break;
 	case ACS_NONE:
-		/* Keep a configuration we still have (table 6-2: unreachable, 500). */
-		if (r->st.version > 0 && load_xml(r) == 0)
+		/* Keep a configuration we still have (table 6-2: unreachable, 500), but not
+		 * one the registrar has refused. */
+		if (r->refused)
+			rcsd_set_state(r, RCSD_UNREGISTERED);
+		else if (r->st.version > 0 && load_xml(r) == 0)
 			rcsd_ua_start(r);
 		else
 			rcsd_set_state(r, RCSD_UNREGISTERED);
@@ -258,9 +264,11 @@ static void acs_start(struct rcsd *r, int disable)
 		r->st.next_run = r->st.last_run + ACS_MIN_INTERVAL;
 		fprintf(stderr, "imsroha-rcs: the ACS was asked %lld s ago; not asking it again before %lld s\n",
 			(long long)(now - r->st.last_run), (long long)ACS_MIN_INTERVAL);
-		if (!r->ua && r->st.version > 0 && !r->st.disable_sent && load_xml(r) == 0)
+		if (r->refused)
+			fprintf(stderr, "imsroha-rcs: not registering with the refused configuration meanwhile\n");
+		else if (!r->ua && r->st.version > 0 && !r->st.disable_sent && load_xml(r) == 0)
 			rcsd_ua_start(r);
-		else if (!r->ua)
+		if (!r->ua)
 			rcsd_set_state(r, RCSD_UNREGISTERED);
 		arm_acs_timer(r);
 		return;
@@ -279,6 +287,24 @@ static void acs_start(struct rcsd *r, int disable)
 
 void rcsd_reconfigure(struct rcsd *r)
 {
+	acs_start(r, 0);
+}
+
+/*
+ * R9 A.5 b sends the first 403 to REGISTER to the ACS. The registrar has
+ * refused the credentials of the configuration we have, so the run asks for
+ * the configuration in full (version 0): answered with the version we hold,
+ * the ACS only says it is current, and the second 403 follows with the same
+ * credentials (2026-11-19, after the SIM had been in another phone). Until
+ * that run is answered, nothing registers with the refused configuration,
+ * also while the floor under runs holds the run back.
+ */
+void rcsd_reconfigure_refused(struct rcsd *r)
+{
+	r->refused = 1;
+	r->st.rcscfg_force = 1;
+	acs_state_save(&r->cfg, r->id.imsi, &r->st);	/* a restart meanwhile asks in full too */
+	fprintf(stderr, "imsroha-rcs: REGISTER refused: asking the ACS for the configuration in full\n");
 	acs_start(r, 0);
 }
 

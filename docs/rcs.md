@@ -272,7 +272,9 @@ validation against the system store (`[rcs] ca-file=` for a private CA).
   and the IARI `rcse.dp` in Contact), 0 is OPTIONS. IR.92 table C.3.1 cites RCC.07 A.2.5
   for the parameter and gives 2 as off; 0 and 1 are from memory of RCC.07. PUBLISH
   errors are retried as R9 table 6-3 says.
-- 403: rerun autoconfig once; a second 403 stops RCS until restart (A.5 b).
+- 403: rerun autoconfig once, in full (version 0), and register again only once the ACS has
+  answered, also while the floor under runs holds that run back; a second 403 stops RCS until
+  restart (A.5 b).
 - Re-REGISTER at 600 s before expiry or half of short expiries. The TLS connection
   stays open with kernel TCP keepalive; nothing runs on a timer while idle.
 - User-Agent: `rcs-user-agent` (stock: `TTA-RCS/2.4 <model>/<sw>

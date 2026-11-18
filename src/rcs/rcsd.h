@@ -33,6 +33,7 @@ struct rcsd {
 	enum rcsd_state state;
 	struct sipua *ua;
 	int forbidden;            /* 403s to REGISTER this run (R9 A.5 b) */
+	int refused;              /* REGISTER was refused with this configuration: none until a run */
 	int pcscf_reconfigured;   /* the P-CSCF failed and the ACS was asked once already */
 	struct ft_config ft;      /* from the stored configuration, at registration */
 	struct bot_config bot;    /* the same, for chatbots */
@@ -41,6 +42,8 @@ struct rcsd {
 const char *rcsd_state_name(enum rcsd_state s);
 void rcsd_set_state(struct rcsd *r, enum rcsd_state s);
 void rcsd_reconfigure(struct rcsd *r);
+/* A 403 to REGISTER: the configuration in full from the ACS before registering again. */
+void rcsd_reconfigure_refused(struct rcsd *r);
 /* No ACS run and no registration until imsroha-rcs restarts. */
 void rcsd_halt(struct rcsd *r);
 

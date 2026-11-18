@@ -199,15 +199,20 @@ sed -i 's|18081|18082|; s|18444|18445|' "$t/imsroha.conf"
 IMSROHA_RCS_STATE="$t/state3" dbus-run-session -- sh -c '
 	exec 8<>"$2/rcs3.pipe"
 	"$1" 2> "$2/rcs3.pipe" & d=$!
-	timeout 30 sh -c "while IFS= read -r l; do printf \"%s\n\" \"\$l\" >> \"\$0\"; case \$l in *\"second 403\"*) exit 0;; esac; done; exit 1" \
+	timeout 30 sh -c "while IFS= read -r l; do printf \"%s\n\" \"\$l\" >> \"\$0\"; case \$l in *\"refused configuration meanwhile\"*) exit 0;; esac; done; exit 1" \
 		"$2/rcs3.err" < "$2/rcs3.pipe"; rc=$?
+	# whatever it would do next with the refused configuration, it would do now
+	timeout 3 sh -c "while IFS= read -r l; do printf \"%s\n\" \"\$l\" >> \"\$0\"; done" "$2/rcs3.err" < "$2/rcs3.pipe"
 	kill -TERM $d 2>/dev/null; wait $d 2>/dev/null
-	exit $rc' sh "$rcs" "$t" || bad "403: never got to the second 403"
+	exit $rc' sh "$rcs" "$t" || bad "403: never waited for the ACS"
 n3=$(grep -c '^connect' "$t/acs3.log" || true)
 [ "$n3" = 2 ] || bad "403: the ACS was contacted $n3 times, not 2 (HTTP, HTTPS)"
-[ "$(grep -c 'event register-403' "$t/net3.log")" = 2 ] || bad "403: not exactly two 403s"
+[ "$(grep -c 'event register-403' "$t/net3.log")" = 1 ] || bad "403: not exactly one 403"
+grep -q 'asking the ACS for the configuration in full' "$t/rcs3.err" || bad "403: no full run asked for"
 grep -q 'not asking it again' "$t/rcs3.err" || bad "403: the first 403 did not meet the floor"
-echo "403 to REGISTER: two 403s, the ACS asked $n3 times in all, then nothing"
+! grep -q 'second 403' "$t/rcs3.err" || bad "403: registered again with the refused configuration"
+grep -q '^force=true' "$t/state3/"*/state || bad "403: the next run is not a full one (force)"
+echo "403 to REGISTER: one 403, then waiting for a full run (the floor holds it back)"
 
 # --- off after on: one rcs_state=-4, then nothing ---
 conf '[rcs]' 'enable=false' "ca-file=$t/ca.pem" 'msisdn=+821099999999'

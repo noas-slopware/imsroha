@@ -537,7 +537,7 @@ static void on_reg_resp(struct sipua *ua, const struct sipmsg *m, void *ud)
 			rcsd_halt(r);
 		} else {
 			rcsd_ua_stop(r);
-			rcsd_reconfigure(r);
+			rcsd_reconfigure_refused(r);
 		}
 		return;
 	}
