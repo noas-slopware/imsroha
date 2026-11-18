@@ -202,6 +202,9 @@ struct imsd_sip_ctx {
 		uint32_t ts;
 	} playout[IMSD_PLAYOUT_SLOTS];
 	int playout_started;
+	uint32_t playout_ssrc;	/* the RTP source whose timeline playout follows */
+	uint32_t playout_old_ssrc;	/* the one it followed before, now ignored */
+	int playout_has_old;
 	uint32_t playout_ts;	/* RTP timestamp of the next frame to play */
 	uint32_t playout_step;	/* RTP ticks per frame of the codec in use */
 	int playout_wb;

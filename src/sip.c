@@ -1240,17 +1240,29 @@ int imsd_sip_send_dtmf(struct imsd_sip_ctx *ctx, const char *dtmf)
 
 /* ---- downlink playout ---- */
 
-static void playout_reset(struct imsd_sip_ctx *ctx, uint32_t ts, uint32_t step, int wb)
+static void playout_reset(struct imsd_sip_ctx *ctx, uint32_t ssrc, uint32_t ts, uint32_t step, int wb)
 {
 	memset(ctx->playout, 0, sizeof(ctx->playout));
+	ctx->playout_ssrc = ssrc;
 	ctx->playout_step = step;
 	ctx->playout_wb = wb;
 	ctx->playout_ts = ts - IMSD_PLAYOUT_DELAY * step;
 	ctx->playout_started = 1;
 }
 
-/* A received speech or SID frame: keep it until its 20 ms turn. */
-static void playout_put(struct imsd_sip_ctx *ctx, uint32_t ts, int wb,
+/*
+ * A received speech or SID frame: keep it until its 20 ms turn.
+ *
+ * Playout plays the slot whose timestamp is exactly the next one on its grid,
+ * so it follows one timeline: one RTP source (RFC 3550: a new SSRC is a new
+ * timestamp base) at one frame size. When the source changes, a frame lands
+ * on a timestamp off that grid and would never be played: early media that
+ * moves from the ringback to an announcement server after the callee
+ * declines (LG U+ sends a second 183 for it) came in for seconds and was
+ * heard as silence. A new source, a codec switch, or a frame off the grid
+ * starts playout again on the new timeline.
+ */
+static void playout_put(struct imsd_sip_ctx *ctx, uint32_t ssrc, uint32_t ts, int wb,
 			const uint8_t *frame, size_t len)
 {
 	uint32_t step = wb ? 320 : 160;
@@ -1258,11 +1270,25 @@ static void playout_put(struct imsd_sip_ctx *ctx, uint32_t ts, int wb,
 
 	if (len > sizeof(ctx->playout[0].frame))
 		return;
-	if (!ctx->playout_started || step != ctx->playout_step) {
-		/* First frame of the call, or the far end switched AMR-WB/AMR-NB. */
+	/*
+	 * Stragglers from the source playout moved away from: following them
+	 * back would throw away the new timeline (and then the old one again).
+	 */
+	if (ctx->playout_started && ctx->playout_has_old && ssrc == ctx->playout_old_ssrc &&
+	    ssrc != ctx->playout_ssrc)
+		return;
+	if (ctx->playout_started && ssrc != ctx->playout_ssrc) {
+		fprintf(stderr, "imsroha: downlink RTP source changed (SSRC %08x -> %08x), playout follows it\n",
+			ctx->playout_ssrc, ssrc);
+		ctx->playout_old_ssrc = ctx->playout_ssrc;
+		ctx->playout_has_old = 1;
+	}
+	/* signed: a late frame is behind playout, and 2^32 is no multiple of the step */
+	if (!ctx->playout_started || step != ctx->playout_step || ssrc != ctx->playout_ssrc ||
+	    (int32_t)(ts - ctx->playout_ts) % (int32_t)step) {
 		if (ctx->playout_started)
 			ctx->playout_resyncs++;
-		playout_reset(ctx, ts, step, wb);
+		playout_reset(ctx, ssrc, ts, step, wb);
 	}
 	ahead = (int32_t)(ts - ctx->playout_ts);
 	if (ahead < 0) {
@@ -1272,7 +1298,7 @@ static void playout_put(struct imsd_sip_ctx *ctx, uint32_t ts, int wb,
 	if ((uint32_t)ahead / step >= IMSD_PLAYOUT_SLOTS) {
 		/* Far ahead of playout (a long stall, or a timestamp jump). */
 		ctx->playout_resyncs++;
-		playout_reset(ctx, ts, step, wb);
+		playout_reset(ctx, ssrc, ts, step, wb);
 	}
 	unsigned int i = (ts / step) % IMSD_PLAYOUT_SLOTS;
 	memcpy(ctx->playout[i].frame, frame, len);
@@ -1499,16 +1525,18 @@ static int on_rtp_packet(sd_event_source *s, int fd, uint32_t revents, void *use
 		if (ctx->codec_open && n > 13 && (is_wb || is_nb)) {
 			uint32_t ts = (uint32_t)buf[4] << 24 | (uint32_t)buf[5] << 16 |
 				      (uint32_t)buf[6] << 8 | buf[7];
+			uint32_t ssrc = (uint32_t)buf[8] << 24 | (uint32_t)buf[9] << 16 |
+					(uint32_t)buf[10] << 8 | buf[11];
 			int octet = pt_rx == ctx->call_pt_amrwb ? ctx->call_wb_octet :
 				    pt_rx == ctx->call_pt_amr ? ctx->call_nb_octet :
 				    pt_rx == ctx->cfg.car.pt_amrwb_be || pt_rx == ctx->cfg.car.pt_amr_be ? 0 : 1;
 			if (octet) {
-				playout_put(ctx, ts, is_wb, buf + 13, (size_t)(n - 13));
+				playout_put(ctx, ssrc, ts, is_wb, buf + 13, (size_t)(n - 13));
 			} else {
 				uint8_t st[64];
 				int sl = imsroha_amr_be_unpack(is_wb, buf + 12, (size_t)(n - 12), st, sizeof(st));
 				if (sl > 0)
-					playout_put(ctx, ts, is_wb, st, (size_t)sl);
+					playout_put(ctx, ssrc, ts, is_wb, st, (size_t)sl);
 			}
 		}
 	}
@@ -1593,6 +1621,7 @@ static void imsd_rtp_stop(struct imsd_sip_ctx *ctx)
 			ctx->playout_filled, ctx->playout_late, ctx->playout_resyncs);
 	}
 	ctx->playout_started = 0;
+	ctx->playout_has_old = 0;
 	ctx->playout_filled = ctx->playout_late = ctx->playout_resyncs = 0;
 }
 
